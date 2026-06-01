@@ -3,6 +3,7 @@ __pycache__/
 .DS_Store
 
 data/
+.vscode/
 *.npz
 *.wav
 *.mp3

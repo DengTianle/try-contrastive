@@ -8,10 +8,14 @@ import json
 import math
 import pickle
 import random
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+
+AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".aac"}
 
 
 def load_dali(
@@ -104,24 +108,31 @@ def find_audio_file(entry: Any, by_stem: dict[str, Path]) -> Path | None:
     if audio_path and str(audio_path).lower() != "none":
         path = Path(audio_path)
         if path.exists():
-            return path
+            return path.resolve(strict=False)
         candidates.append(path.stem)
 
     for stem in candidates:
         if stem in by_stem:
-            return by_stem[stem]
+            return by_stem[stem].resolve(strict=False)
     return None
 
 
-def audio_duration_seconds(audio_path: Path) -> float:
-    import librosa
-    import soundfile as sf
-
+def audio_duration_seconds(audio_path: Path, fallback_duration: float | None = None) -> float:
     try:
+        import soundfile as sf
+
         info = sf.info(str(audio_path))
         return float(info.frames) / float(info.samplerate)
     except Exception:
-        return float(librosa.get_duration(path=str(audio_path)))
+        try:
+            import librosa
+
+            return float(librosa.get_duration(path=str(audio_path)))
+        except Exception:
+            if fallback_duration is not None and fallback_duration > 0:
+                return float(fallback_duration)
+            raise
+
 
 def split_track_ids(
     track_ids: list[str],
@@ -151,52 +162,203 @@ def split_track_ids(
     return split_by_id
 
 
-def segment_quotas(
-    max_segments: int,
-    present_splits: set[str],
-    train_ratio: float,
-    val_ratio: float,
-) -> dict[str, int]:
-    ratios = {
-        "train": train_ratio,
-        "val": val_ratio,
-        "test": max(0.0, 1.0 - train_ratio - val_ratio),
-    }
-    total_ratio = sum(ratios[split] for split in present_splits)
-    quotas = {
-        split: max(1, int(round(max_segments * ratios[split] / total_ratio)))
-        for split in present_splits
-    }
-    while sum(quotas.values()) > max_segments:
-        largest = max(quotas, key=quotas.get)
-        quotas[largest] -= 1
-    while sum(quotas.values()) < max_segments:
-        largest = max(present_splits, key=lambda split: ratios[split])
-        quotas[largest] += 1
-    return quotas
-
-
 def stable_sample_id(dali_id: str, start_seconds: float) -> str:
     digest = hashlib.sha1(f"{dali_id}:{start_seconds:.3f}".encode("utf-8")).hexdigest()[:10]
     return f"{dali_id}_{int(round(start_seconds * 1000)):09d}_{digest}"
 
 
+def extract_dali_notes(entry: Any) -> list[dict[str, Any]]:
+    annotations = getattr(entry, "annotations", {})
+    annot = annotations.get("annot", {}) if isinstance(annotations, dict) else {}
+    notes = annot.get("notes", []) if isinstance(annot, dict) else []
+
+    valid_notes: list[dict[str, Any]] = []
+    for note in notes:
+        times = np.asarray(note.get("time", []), dtype=np.float32)
+        freqs = np.asarray(note.get("freq", []), dtype=np.float32)
+        if times.size < 2 or freqs.size < 1:
+            continue
+        if times.size != freqs.size:
+            if freqs.size == 1:
+                freqs = np.repeat(freqs, times.size)
+            else:
+                continue
+        order = np.argsort(times)
+        times = times[order]
+        freqs = freqs[order]
+        if not np.all(np.isfinite(times)) or not np.all(np.isfinite(freqs)):
+            continue
+        if float(times[-1]) <= float(times[0]):
+            continue
+        if float(np.nanmax(freqs)) <= 0.0:
+            continue
+        valid_notes.append(
+            {
+                "time": times,
+                "freq": freqs,
+                "text": str(note.get("text", "")),
+                "index": note.get("index"),
+            }
+        )
+    valid_notes.sort(key=lambda item: float(item["time"][0]))
+    return valid_notes
+
+
+def render_melody_frames(
+    notes: list[dict[str, Any]],
+    start_seconds: float,
+    segment_seconds: float,
+    frame_rate: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    num_frames = int(round(segment_seconds * frame_rate))
+    frame_times = start_seconds + (np.arange(num_frames, dtype=np.float32) + 0.5) / frame_rate
+    f0_hz = np.zeros(num_frames, dtype=np.float32)
+    voiced = np.zeros(num_frames, dtype=np.bool_)
+
+    segment_end = start_seconds + segment_seconds
+    for note in notes:
+        times = note["time"]
+        freqs = note["freq"]
+        note_start = float(times[0])
+        note_end = float(times[-1])
+        if note_end <= start_seconds or note_start >= segment_end:
+            continue
+        mask = (frame_times >= note_start) & (frame_times < note_end)
+        if not np.any(mask):
+            continue
+        values = np.interp(frame_times[mask], times, freqs).astype(np.float32)
+        valid = np.isfinite(values) & (values > 0.0)
+        if not np.any(valid):
+            continue
+        masked_indices = np.flatnonzero(mask)
+        valid_indices = masked_indices[valid]
+        f0_hz[valid_indices] = values[valid]
+        voiced[valid_indices] = True
+
+    relative_times = frame_times - start_seconds
+    return relative_times.astype(np.float32), f0_hz, voiced
+
+
+def iter_segment_starts(duration: float, segment_seconds: float, hop_seconds: float) -> list[float]:
+    last_start = duration - segment_seconds
+    if last_start < 0:
+        return []
+    count = int(math.floor(last_start / hop_seconds)) + 1
+    return [round(index * hop_seconds, 6) for index in range(count)]
+
+
+def annotation_duration_seconds(notes: list[dict[str, Any]]) -> float:
+    if not notes:
+        return 0.0
+    return max(float(note["time"][-1]) for note in notes)
+
+
+def choose_hard_negative(
+    rng: random.Random,
+    anchor: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    min_offset_seconds: float,
+) -> dict[str, Any] | None:
+    far_enough = [
+        candidate
+        for candidate in candidates
+        if candidate["sample_id"] != anchor["sample_id"]
+        and abs(candidate["start_seconds"] - anchor["start_seconds"]) >= min_offset_seconds
+    ]
+    if far_enough:
+        return rng.choice(far_enough)
+
+    any_other = [candidate for candidate in candidates if candidate["sample_id"] != anchor["sample_id"]]
+    if any_other:
+        return rng.choice(any_other)
+    return None
+
+
+def write_melody_npz(
+    melody_dir: Path,
+    sample_id: str,
+    frame_times: np.ndarray,
+    f0_hz: np.ndarray,
+    voiced: np.ndarray,
+    frame_rate: float,
+    start_seconds: float,
+    segment_seconds: float,
+) -> Path:
+    melody_path = melody_dir / f"{sample_id}.npz"
+    np.savez_compressed(
+        melody_path,
+        frame_times=frame_times,
+        f0_hz=f0_hz,
+        voiced=voiced.astype(np.uint8),
+        frame_rate=np.asarray(frame_rate, dtype=np.float32),
+        start_seconds=np.asarray(start_seconds, dtype=np.float32),
+        duration_seconds=np.asarray(segment_seconds, dtype=np.float32),
+    )
+    return melody_path.resolve(strict=False)
+
+
+def row_for_pair(
+    pair_id: str,
+    pair_type: str,
+    label: int,
+    split: str,
+    melody_segment: dict[str, Any],
+    audio_segment: dict[str, Any],
+    track_info: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "pair_id": pair_id,
+        "pair_type": pair_type,
+        "label": label,
+        "split": split,
+        "dali_id": track_info["dali_id"],
+        "artist": track_info["artist"],
+        "title": track_info["title"],
+        "audio_path": str(track_info["audio_path"]),
+        "melody_path": str(melody_segment["melody_path"]),
+        "melody_sample_id": melody_segment["sample_id"],
+        "audio_sample_id": audio_segment["sample_id"],
+        "melody_start_seconds": f"{melody_segment['start_seconds']:.6f}",
+        "melody_end_seconds": f"{melody_segment['end_seconds']:.6f}",
+        "audio_start_seconds": f"{audio_segment['start_seconds']:.6f}",
+        "audio_end_seconds": f"{audio_segment['end_seconds']:.6f}",
+        "segment_seconds": f"{melody_segment['segment_seconds']:.6f}",
+        "melody_frame_rate": f"{melody_segment['frame_rate']:.6f}",
+        "voiced_ratio": f"{melody_segment['voiced_ratio']:.6f}",
+        "negative_offset_seconds": f"{abs(audio_segment['start_seconds'] - melody_segment['start_seconds']):.6f}",
+    }
+
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=(
+            "Prepare DALI vocal-melody/audio contrastive pairs. The script writes one "
+            "canonical frame-based melody .npz per eligible segment and a manifest with "
+            "positive plus same-song hard-negative pair rows."
+        )
+    )
     parser.add_argument("--dali-data-dir", type=Path, default=Path("data/DALI_v1"))
     parser.add_argument("--audio-dir", type=Path, default=Path("data/audio"))
-    parser.add_argument("--output-dir", type=Path, default=Path("data/prepared"))
+    parser.add_argument("--output-dir", type=Path, default=Path("data/prepared/dali"))
     parser.add_argument("--gt-file", type=Path, default=None, help="Optional DALI ground-truth gzip file.")
     parser.add_argument(
         "--ground-truth-only",
         action="store_true",
         help="Use only DALI ids present in --gt-file. Useful for small aligned experiments.",
     )
-    parser.add_argument("--sample-rate", type=int, default=16000)
+    parser.add_argument("--sample-rate", type=int, default=16000, help="Target audio rate for future dataloaders.")
     parser.add_argument("--segment-seconds", type=float, default=10.0)
-    parser.add_argument("--hop-seconds", type=float, default=10.0)
-    parser.add_argument("--max-tracks", type=int, default=20)
-    parser.add_argument("--max-segments", type=int, default=200)
+    parser.add_argument("--hop-seconds", type=float, default=5.0)
+    parser.add_argument("--melody-frame-rate", type=float, default=50.0)
+    parser.add_argument("--max-tracks", type=int, default=0, help="0 means no track limit.")
+    parser.add_argument("--max-segments", type=int, default=0, help="0 means no segment limit.")
+    parser.add_argument("--negative-pairs-per-positive", type=int, default=1)
+    parser.add_argument(
+        "--min-negative-offset-seconds",
+        type=float,
+        default=None,
+        help="Minimum start-time distance for same-song hard negatives. Defaults to segment length.",
+    )
     parser.add_argument("--min-vocal-ratio", type=float, default=0.4)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--train-ratio", type=float, default=0.8)
@@ -211,17 +373,27 @@ def main() -> None:
     args.output_dir = resolve_user_path(args.output_dir)
     if args.gt_file is not None:
         args.gt_file = resolve_user_path(args.gt_file)
+    if args.min_negative_offset_seconds is None:
+        args.min_negative_offset_seconds = args.segment_seconds
+
+    if args.segment_seconds <= 0:
+        raise SystemExit("--segment-seconds must be positive")
+    if args.hop_seconds <= 0:
+        raise SystemExit("--hop-seconds must be positive")
+    if args.melody_frame_rate <= 0:
+        raise SystemExit("--melody-frame-rate must be positive")
+    if not 0.0 <= args.min_vocal_ratio <= 1.0:
+        raise SystemExit("--min-vocal-ratio must be between 0 and 1")
+    if args.train_ratio <= 0 or args.val_ratio < 0 or args.train_ratio + args.val_ratio >= 1:
+        raise SystemExit("--train-ratio and --val-ratio must leave a positive test split")
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    sample_dir = args.output_dir / "samples"
-    sample_dir.mkdir(parents=True, exist_ok=True)
+    melody_dir = args.output_dir / "melodies"
+    melody_dir.mkdir(parents=True, exist_ok=True)
 
     prepare_input_dirs(args.dali_data_dir, args.audio_dir)
     by_stem, audio_files = build_audio_index(args.audio_dir)
     validate_input_files(args.dali_data_dir, args.audio_dir, audio_files, args.gt_file)
-
-    import librosa
-    from tqdm import tqdm
 
     keep_ids = None
     if args.ground_truth_only:
@@ -231,55 +403,164 @@ def main() -> None:
 
     print("Loading DALI annotations...")
     dali_data = load_dali(args.dali_data_dir, args.gt_file, keep_ids=keep_ids)
-    print(f"Indexed {len(audio_files)} audio files.")
-    if keep_ids is not None:
-        print(f"Restricted to {len(dali_data)} ground-truth DALI entries.")
+    print(f"Loaded {len(dali_data)} DALI entries and indexed {len(audio_files)} audio files.")
 
     entries = list(dali_data.values())
     entries.sort(key=lambda entry: entry.info["id"])
     rng = random.Random(args.seed)
     rng.shuffle(entries)
 
-    usable_entries: list[tuple[str, Any, Path, list[dict[str, float]], float]] = []
-    skipped_no_audio = 0
-    skipped_no_notes = 0
-    skipped_bad_audio = 0
+    usable_tracks: list[dict[str, Any]] = []
+    skipped = Counter()
+    duration_sources = Counter()
     for entry in entries:
+        dali_id = entry.info["id"]
         audio_path = find_audio_file(entry, by_stem)
         if audio_path is None:
-            skipped_no_audio += 1
+            skipped["no_audio"] += 1
             continue
-        notes = notes_from_entry(entry)
+
+        notes = extract_dali_notes(entry)
         if not notes:
-            skipped_no_notes += 1
+            skipped["no_notes"] += 1
             continue
+
+        annotation_duration = annotation_duration_seconds(notes)
         try:
-            duration = audio_duration_seconds(audio_path)
+            duration = audio_duration_seconds(audio_path, fallback_duration=annotation_duration)
         except Exception as exc:
-            print(f"Skipping {entry.info['id']}: could not read duration for {audio_path}: {exc}")
-            skipped_bad_audio += 1
+            print(f"Skipping {dali_id}: could not read duration for {audio_path}: {exc}")
+            skipped["bad_audio"] += 1
             continue
-        usable_entries.append((entry.info["id"], entry, audio_path, notes, duration))
-        if len(usable_entries) >= args.max_tracks:
+        if abs(duration - annotation_duration) < 1e-6:
+            duration_sources["annotations"] += 1
+        else:
+            duration_sources["audio_metadata"] += 1
+
+        if duration < args.segment_seconds:
+            skipped["too_short"] += 1
+            continue
+
+        usable_tracks.append(
+            {
+                "dali_id": dali_id,
+                "entry": entry,
+                "audio_path": audio_path,
+                "notes": notes,
+                "duration": duration,
+                "artist": entry.info.get("artist", ""),
+                "title": entry.info.get("title", ""),
+            }
+        )
+        if args.max_tracks > 0 and len(usable_tracks) >= args.max_tracks:
             break
 
-    if not usable_entries:
+    if not usable_tracks:
         raise SystemExit("No usable DALI entries found. Check audio filenames and --audio-dir.")
-    print(
-        f"Found {len(usable_entries)} usable tracks "
-        f"(max_tracks={args.max_tracks}, indexed_audio_files={len(audio_files)}, "
-        f"skipped_no_audio={skipped_no_audio}, skipped_no_notes={skipped_no_notes}, "
-        f"skipped_bad_audio={skipped_bad_audio})"
-    )
 
     split_by_id = split_track_ids(
-        [dali_id for dali_id, _, _, _, _ in usable_entries],
+        [track["dali_id"] for track in usable_tracks],
         seed=args.seed,
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
     )
 
-    #deleted
+    all_segments: list[dict[str, Any]] = []
+    segments_by_track: dict[str, list[dict[str, Any]]] = {}
+    skipped_segments = Counter()
+    for track in usable_tracks:
+        track_segments: list[dict[str, Any]] = []
+        starts = iter_segment_starts(track["duration"], args.segment_seconds, args.hop_seconds)
+        for start_seconds in starts:
+            frame_times, f0_hz, voiced = render_melody_frames(
+                track["notes"],
+                start_seconds=start_seconds,
+                segment_seconds=args.segment_seconds,
+                frame_rate=args.melody_frame_rate,
+            )
+            voiced_ratio = float(np.mean(voiced)) if voiced.size else 0.0
+            if voiced_ratio < args.min_vocal_ratio:
+                skipped_segments["low_vocal_ratio"] += 1
+                continue
+
+            sample_id = stable_sample_id(track["dali_id"], start_seconds)
+            melody_path = write_melody_npz(
+                melody_dir=melody_dir,
+                sample_id=sample_id,
+                frame_times=frame_times,
+                f0_hz=f0_hz,
+                voiced=voiced,
+                frame_rate=args.melody_frame_rate,
+                start_seconds=start_seconds,
+                segment_seconds=args.segment_seconds,
+            )
+            segment = {
+                "sample_id": sample_id,
+                "dali_id": track["dali_id"],
+                "melody_path": melody_path,
+                "start_seconds": start_seconds,
+                "end_seconds": start_seconds + args.segment_seconds,
+                "segment_seconds": args.segment_seconds,
+                "frame_rate": args.melody_frame_rate,
+                "voiced_ratio": voiced_ratio,
+            }
+            track_segments.append(segment)
+            all_segments.append(segment)
+            if args.max_segments > 0 and len(all_segments) >= args.max_segments:
+                break
+
+        if track_segments:
+            segments_by_track[track["dali_id"]] = track_segments
+        if args.max_segments > 0 and len(all_segments) >= args.max_segments:
+            break
+
+    if not all_segments:
+        raise SystemExit(
+            "No eligible segments found. Try lowering --min-vocal-ratio or checking DALI/audio alignment."
+        )
+
+    track_by_id = {track["dali_id"]: track for track in usable_tracks}
+    rows: list[dict[str, Any]] = []
+    skipped_pairs = Counter()
+    for melody_segment in all_segments:
+        track = track_by_id[melody_segment["dali_id"]]
+        split = split_by_id[track["dali_id"]]
+        positive_pair_id = f"{melody_segment['sample_id']}__pos"
+        rows.append(
+            row_for_pair(
+                pair_id=positive_pair_id,
+                pair_type="positive",
+                label=1,
+                split=split,
+                melody_segment=melody_segment,
+                audio_segment=melody_segment,
+                track_info=track,
+            )
+        )
+
+        candidates = segments_by_track.get(track["dali_id"], [])
+        for negative_index in range(args.negative_pairs_per_positive):
+            negative_segment = choose_hard_negative(
+                rng=rng,
+                anchor=melody_segment,
+                candidates=candidates,
+                min_offset_seconds=args.min_negative_offset_seconds,
+            )
+            if negative_segment is None:
+                skipped_pairs["no_same_song_negative"] += 1
+                continue
+            negative_pair_id = f"{melody_segment['sample_id']}__hardneg{negative_index}"
+            rows.append(
+                row_for_pair(
+                    pair_id=negative_pair_id,
+                    pair_type="hard_negative_same_song",
+                    label=0,
+                    split=split,
+                    melody_segment=melody_segment,
+                    audio_segment=negative_segment,
+                    track_info=track,
+                )
+            )
 
     manifest_path = args.output_dir / "manifest.csv"
     with manifest_path.open("w", newline="", encoding="utf-8") as handle:
@@ -287,17 +568,43 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"Wrote {len(rows)} samples to {args.output_dir}")
-    print(f"Manifest: {manifest_path}")
-    print(f"Split quotas: {quotas}")
-    print(f"Split counts: {split_counts}")
-    unmet = {split: quotas[split] - split_counts.get(split, 0) for split in quotas if split_counts.get(split, 0) < quotas[split]}
-    if unmet:
-        print(
-            "Some split quotas were not filled because there were not enough eligible segments "
-            f"after audio matching and min_vocal_ratio filtering: {unmet}"
-        )
-    print(f"Label frames per {args.segment_seconds:g}s segment: {hubert_num_frames(segment_samples)}")
+    metadata = {
+        "source": "DALI",
+        "dali_data_dir": str(args.dali_data_dir),
+        "audio_dir": str(args.audio_dir),
+        "sample_rate": args.sample_rate,
+        "segment_seconds": args.segment_seconds,
+        "hop_seconds": args.hop_seconds,
+        "melody_frame_rate": args.melody_frame_rate,
+        "min_vocal_ratio": args.min_vocal_ratio,
+        "min_negative_offset_seconds": args.min_negative_offset_seconds,
+        "negative_pairs_per_positive": args.negative_pairs_per_positive,
+        "seed": args.seed,
+        "train_ratio": args.train_ratio,
+        "val_ratio": args.val_ratio,
+        "num_tracks": len(usable_tracks),
+        "num_segments": len(all_segments),
+        "num_pairs": len(rows),
+        "skipped_tracks": dict(skipped),
+        "duration_sources": dict(duration_sources),
+        "skipped_segments": dict(skipped_segments),
+        "skipped_pairs": dict(skipped_pairs),
+        "split_counts": dict(Counter(row["split"] for row in rows)),
+        "pair_type_counts": dict(Counter(row["pair_type"] for row in rows)),
+    }
+    metadata_path = args.output_dir / "metadata.json"
+    with metadata_path.open("w", encoding="utf-8") as handle:
+        json.dump(metadata, handle, indent=2, sort_keys=True)
+
+    print(f"Wrote {len(all_segments)} melody segments to {melody_dir}")
+    print(f"Wrote {len(rows)} contrastive pair rows to {manifest_path}")
+    print(f"Metadata: {metadata_path}")
+    print(f"Track skips: {dict(skipped)}")
+    print(f"Duration sources: {dict(duration_sources)}")
+    print(f"Segment skips: {dict(skipped_segments)}")
+    print(f"Pair skips: {dict(skipped_pairs)}")
+    print(f"Pair types: {metadata['pair_type_counts']}")
+    print(f"Splits: {metadata['split_counts']}")
 
 
 if __name__ == "__main__":
