@@ -6,6 +6,7 @@ import gzip
 import hashlib
 import json
 import math
+import os
 import pickle
 import random
 from collections import Counter
@@ -16,6 +17,8 @@ import numpy as np
 
 
 AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".aac"}
+PREPARED_AUDIO_FORMATS = {"flac", "wav"}
+SEGMENT_TIME_DECIMALS = 6
 
 
 def load_dali(
@@ -125,13 +128,39 @@ def audio_duration_seconds(audio_path: Path, fallback_duration: float | None = N
         return float(info.frames) / float(info.samplerate)
     except Exception:
         try:
+            if fallback_duration is not None and fallback_duration > 0:
+                return float(fallback_duration)
+            os.environ.setdefault("NUMBA_CACHE_DIR", str(Path.cwd() / ".numba_cache"))
             import librosa
 
             return float(librosa.get_duration(path=str(audio_path)))
         except Exception:
-            if fallback_duration is not None and fallback_duration > 0:
-                return float(fallback_duration)
             raise
+
+
+def prepare_audio_file(
+    input_path: Path,
+    output_dir: Path,
+    dali_id: str,
+    sample_rate: int,
+    audio_format: str,
+    overwrite: bool = False,
+) -> Path:
+    if audio_format not in PREPARED_AUDIO_FORMATS:
+        raise ValueError(f"Unsupported audio format: {audio_format}")
+
+    output_path = output_dir / f"{dali_id}.{audio_format}"
+    if output_path.exists() and not overwrite:
+        return output_path.resolve(strict=False)
+
+    os.environ.setdefault("NUMBA_CACHE_DIR", str((output_dir / ".numba_cache").resolve(strict=False)))
+    import librosa
+    import soundfile as sf
+
+    waveform, _ = librosa.load(str(input_path), sr=sample_rate, mono=True)
+    subtype = "PCM_16" if audio_format == "wav" else None
+    sf.write(str(output_path), waveform, sample_rate, subtype=subtype)
+    return output_path.resolve(strict=False)
 
 
 def split_track_ids(
@@ -244,7 +273,7 @@ def iter_segment_starts(duration: float, segment_seconds: float, hop_seconds: fl
     if last_start < 0:
         return []
     count = int(math.floor(last_start / hop_seconds)) + 1
-    return [round(index * hop_seconds, 6) for index in range(count)]
+    return [round(index * hop_seconds, SEGMENT_TIME_DECIMALS) for index in range(count)]
 
 
 def annotation_duration_seconds(notes: list[dict[str, Any]]) -> float:
@@ -315,6 +344,7 @@ def row_for_pair(
         "artist": track_info["artist"],
         "title": track_info["title"],
         "audio_path": str(track_info["audio_path"]),
+        "raw_audio_path": str(track_info["raw_audio_path"]),
         "melody_path": str(melody_segment["melody_path"]),
         "melody_sample_id": melody_segment["sample_id"],
         "audio_sample_id": audio_segment["sample_id"],
@@ -347,9 +377,26 @@ def parse_args() -> argparse.Namespace:
         help="Use only DALI ids present in --gt-file. Useful for small aligned experiments.",
     )
     parser.add_argument("--sample-rate", type=int, default=16000, help="Target audio rate for future dataloaders.")
+    parser.add_argument(
+        "--prepared-audio-dir",
+        type=Path,
+        default=None,
+        help="Where to write per-song mono resampled audio. Defaults to <output-dir>/audio_16k.",
+    )
+    parser.add_argument("--audio-format", choices=sorted(PREPARED_AUDIO_FORMATS), default="flac")
+    parser.add_argument(
+        "--skip-audio-prep",
+        action="store_true",
+        help="Keep manifest audio paths pointing at original files instead of writing 16 kHz per-song audio.",
+    )
+    parser.add_argument(
+        "--overwrite-audio",
+        action="store_true",
+        help="Regenerate prepared audio files even if they already exist.",
+    )
     parser.add_argument("--segment-seconds", type=float, default=10.0)
     parser.add_argument("--hop-seconds", type=float, default=5.0)
-    parser.add_argument("--melody-frame-rate", type=float, default=50.0)
+    parser.add_argument("--melody-frame-rate", type=float, default=50.0, help="Number of frames per second.")
     parser.add_argument("--max-tracks", type=int, default=0, help="0 means no track limit.")
     parser.add_argument("--max-segments", type=int, default=0, help="0 means no segment limit.")
     parser.add_argument("--negative-pairs-per-positive", type=int, default=1)
@@ -373,6 +420,9 @@ def main() -> None:
     args.output_dir = resolve_user_path(args.output_dir)
     if args.gt_file is not None:
         args.gt_file = resolve_user_path(args.gt_file)
+    if args.prepared_audio_dir is None:
+        args.prepared_audio_dir = args.output_dir / f"audio_{args.sample_rate // 1000}k"
+    args.prepared_audio_dir = resolve_user_path(args.prepared_audio_dir)
     if args.min_negative_offset_seconds is None:
         args.min_negative_offset_seconds = args.segment_seconds
 
@@ -390,6 +440,8 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     melody_dir = args.output_dir / "melodies"
     melody_dir.mkdir(parents=True, exist_ok=True)
+    if not args.skip_audio_prep:
+        args.prepared_audio_dir.mkdir(parents=True, exist_ok=True)
 
     prepare_input_dirs(args.dali_data_dir, args.audio_dir)
     by_stem, audio_files = build_audio_index(args.audio_dir)
@@ -413,6 +465,7 @@ def main() -> None:
     usable_tracks: list[dict[str, Any]] = []
     skipped = Counter()
     duration_sources = Counter()
+    prepared_audio_count = 0
     for entry in entries:
         dali_id = entry.info["id"]
         audio_path = find_audio_file(entry, by_stem)
@@ -441,11 +494,30 @@ def main() -> None:
             skipped["too_short"] += 1
             continue
 
+        prepared_audio_path = audio_path
+        if not args.skip_audio_prep:
+            try:
+                prepared_audio_path = prepare_audio_file(
+                    input_path=audio_path,
+                    output_dir=args.prepared_audio_dir,
+                    dali_id=dali_id,
+                    sample_rate=args.sample_rate,
+                    audio_format=args.audio_format,
+                    overwrite=args.overwrite_audio,
+                )
+                prepared_audio_count += 1
+                duration = audio_duration_seconds(prepared_audio_path, fallback_duration=duration)
+            except Exception as exc:
+                print(f"Skipping {dali_id}: could not prepare 16 kHz audio for {audio_path}: {exc}")
+                skipped["audio_prep_failed"] += 1
+                continue
+
         usable_tracks.append(
             {
                 "dali_id": dali_id,
                 "entry": entry,
-                "audio_path": audio_path,
+                "raw_audio_path": audio_path,
+                "audio_path": prepared_audio_path,
                 "notes": notes,
                 "duration": duration,
                 "artist": entry.info.get("artist", ""),
@@ -572,6 +644,9 @@ def main() -> None:
         "source": "DALI",
         "dali_data_dir": str(args.dali_data_dir),
         "audio_dir": str(args.audio_dir),
+        "prepared_audio_dir": str(args.prepared_audio_dir),
+        "audio_format": args.audio_format,
+        "skip_audio_prep": args.skip_audio_prep,
         "sample_rate": args.sample_rate,
         "segment_seconds": args.segment_seconds,
         "hop_seconds": args.hop_seconds,
@@ -585,6 +660,7 @@ def main() -> None:
         "num_tracks": len(usable_tracks),
         "num_segments": len(all_segments),
         "num_pairs": len(rows),
+        "num_prepared_audio_files": prepared_audio_count,
         "skipped_tracks": dict(skipped),
         "duration_sources": dict(duration_sources),
         "skipped_segments": dict(skipped_segments),
@@ -597,6 +673,8 @@ def main() -> None:
         json.dump(metadata, handle, indent=2, sort_keys=True)
 
     print(f"Wrote {len(all_segments)} melody segments to {melody_dir}")
+    if not args.skip_audio_prep:
+        print(f"Wrote/reused {prepared_audio_count} prepared audio files in {args.prepared_audio_dir}")
     print(f"Wrote {len(rows)} contrastive pair rows to {manifest_path}")
     print(f"Metadata: {metadata_path}")
     print(f"Track skips: {dict(skipped)}")
