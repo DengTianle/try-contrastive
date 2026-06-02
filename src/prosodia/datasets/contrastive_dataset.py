@@ -141,6 +141,90 @@ class ContrastivePairDataset(Dataset[dict[str, Any]]):
         }
 
 
+class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
+    """Grouped view for InfoNCE training.
+
+    Each item contains one melody anchor, one positive audio segment, and zero or
+    more same-anchor negative audio segments. The positive candidate is always at
+    index 0, so the training target is 0 for every grouped item.
+    """
+
+    def __init__(
+        self,
+        manifest_path: str | Path,
+        split: str | None = None,
+        audio_config: AudioConfig | None = None,
+        melody_config: MelodyConfig | None = None,
+        max_negatives: int | None = None,
+        transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> None:
+        self.pair_dataset = ContrastivePairDataset(
+            manifest_path=manifest_path,
+            split=split,
+            audio_config=audio_config,
+            melody_config=melody_config,
+            transform=None,
+        )
+        self.transform = transform
+
+        groups: dict[str, dict[str, Any]] = {}
+        for row_index, row in enumerate(self.pair_dataset.rows):
+            key = row["melody_sample_id"]
+            group = groups.setdefault(key, {"positive": None, "negatives": []})
+            if int(row["label"]) == 1:
+                group["positive"] = row_index
+            else:
+                group["negatives"].append(row_index)
+
+        self.groups: list[dict[str, Any]] = []
+        for melody_sample_id, group in groups.items():
+            if group["positive"] is None:
+                continue
+            negative_indices = group["negatives"]
+            if max_negatives is not None:
+                negative_indices = negative_indices[:max_negatives]
+            self.groups.append(
+                {
+                    "melody_sample_id": melody_sample_id,
+                    "positive": group["positive"],
+                    "negatives": negative_indices,
+                }
+            )
+
+    def __len__(self) -> int:
+        return len(self.groups)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        group = self.groups[index]
+        positive = self.pair_dataset[group["positive"]]
+        negatives = [self.pair_dataset[row_index] for row_index in group["negatives"]]
+        candidates = [positive, *negatives]
+
+        item: dict[str, Any] = {
+            "melody_features": positive["melody_features"],
+            "melody_f0_hz": positive["melody_f0_hz"],
+            "melody_voiced": positive["melody_voiced"],
+            "melody_frame_times": positive["melody_frame_times"],
+            "melody_attention_mask": torch.ones(
+                positive["melody_features"].shape[0],
+                dtype=torch.bool,
+            ),
+            "candidate_input_values": torch.stack([candidate["input_values"] for candidate in candidates]),
+            "candidate_audio_attention_mask": torch.stack(
+                [candidate["audio_attention_mask"] for candidate in candidates]
+            ),
+            "candidate_mask": torch.ones(len(candidates), dtype=torch.bool),
+            "target": torch.tensor(0, dtype=torch.long),
+            "melody_sample_id": group["melody_sample_id"],
+            "candidate_pair_ids": [candidate["pair_id"] for candidate in candidates],
+            "candidate_pair_types": [candidate["pair_type"] for candidate in candidates],
+            "metadata": [candidate["metadata"] for candidate in candidates],
+        }
+        if self.transform is not None:
+            item = self.transform(item)
+        return item
+
+
 def contrastive_pair_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     tensor_keys = {
         "input_values",
@@ -158,3 +242,42 @@ def contrastive_pair_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     for key in ("pair_type", "pair_id", "dali_id", "metadata"):
         collated[key] = [item[key] for item in batch]
     return collated
+
+
+def grouped_contrastive_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
+    max_candidates = max(item["candidate_input_values"].shape[0] for item in batch)
+    batch_size = len(batch)
+    sample_count = batch[0]["candidate_input_values"].shape[-1]
+
+    candidate_input_values = torch.zeros(batch_size, max_candidates, sample_count)
+    candidate_audio_attention_mask = torch.zeros(
+        batch_size,
+        max_candidates,
+        sample_count,
+        dtype=torch.bool,
+    )
+    candidate_mask = torch.zeros(batch_size, max_candidates, dtype=torch.bool)
+
+    for batch_index, item in enumerate(batch):
+        num_candidates = item["candidate_input_values"].shape[0]
+        candidate_input_values[batch_index, :num_candidates] = item["candidate_input_values"]
+        candidate_audio_attention_mask[batch_index, :num_candidates] = item[
+            "candidate_audio_attention_mask"
+        ]
+        candidate_mask[batch_index, :num_candidates] = item["candidate_mask"]
+
+    return {
+        "melody_features": torch.stack([item["melody_features"] for item in batch]),
+        "melody_attention_mask": torch.stack([item["melody_attention_mask"] for item in batch]),
+        "melody_f0_hz": torch.stack([item["melody_f0_hz"] for item in batch]),
+        "melody_voiced": torch.stack([item["melody_voiced"] for item in batch]),
+        "melody_frame_times": torch.stack([item["melody_frame_times"] for item in batch]),
+        "candidate_input_values": candidate_input_values,
+        "candidate_audio_attention_mask": candidate_audio_attention_mask,
+        "candidate_mask": candidate_mask,
+        "target": torch.stack([item["target"] for item in batch]),
+        "melody_sample_id": [item["melody_sample_id"] for item in batch],
+        "candidate_pair_ids": [item["candidate_pair_ids"] for item in batch],
+        "candidate_pair_types": [item["candidate_pair_types"] for item in batch],
+        "metadata": [item["metadata"] for item in batch],
+    }
