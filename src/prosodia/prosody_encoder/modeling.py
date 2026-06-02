@@ -33,6 +33,15 @@ class HubertEncoder(nn.Module):
             nn.Linear(hidden_size, projection_dim),
         )
         self.set_hubert_trainable(not freeze_hubert)
+        
+        # Memory optimization: Always freeze the CNN feature extractor, which uses huge amounts of memory 
+        # and rarely needs fine-tuning for downstream tasks.
+        if hasattr(self.hubert, "freeze_feature_encoder"):
+            self.hubert.freeze_feature_encoder()
+            
+        # Memory optimization: Enable gradient checkpointing for the transformer layers to trade computation for memory.
+        if not freeze_hubert and hasattr(self.hubert, "gradient_checkpointing_enable"):
+            self.hubert.gradient_checkpointing_enable()
 
     def set_hubert_trainable(self, trainable: bool) -> None:
         for parameter in self.hubert.parameters():

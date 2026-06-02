@@ -330,6 +330,7 @@ def row_for_segment(
     segment: dict[str, Any],
     split: str,
     track_info: dict[str, Any],
+    manifest_dir: Path,
 ) -> dict[str, Any]:
     return {
         "sample_id": segment["sample_id"],
@@ -337,15 +338,21 @@ def row_for_segment(
         "dali_id": track_info["dali_id"],
         "artist": track_info["artist"],
         "title": track_info["title"],
-        "audio_path": str(track_info["audio_path"]),
-        "raw_audio_path": str(track_info["raw_audio_path"]),
-        "melody_path": str(segment["melody_path"]),
+        "audio_path": manifest_relative_path(track_info["audio_path"], manifest_dir),
+        "raw_audio_path": manifest_relative_path(track_info["raw_audio_path"], manifest_dir),
+        "melody_path": manifest_relative_path(segment["melody_path"], manifest_dir),
         "start_seconds": f"{segment['start_seconds']:.6f}",
         "end_seconds": f"{segment['end_seconds']:.6f}",
         "segment_seconds": f"{segment['segment_seconds']:.6f}",
         "melody_frame_rate": f"{segment['frame_rate']:.6f}",
         "voiced_ratio": f"{segment['voiced_ratio']:.6f}",
     }
+
+
+def manifest_relative_path(path: str | Path, manifest_dir: Path) -> str:
+    path = Path(path).expanduser().resolve(strict=False)
+    manifest_dir = Path(manifest_dir).expanduser().resolve(strict=False)
+    return Path(os.path.relpath(path, manifest_dir)).as_posix()
 
 
 def parse_args() -> argparse.Namespace:
@@ -564,23 +571,31 @@ def main() -> None:
         )
 
     track_by_id = {track["dali_id"]: track for track in usable_tracks}
+    segment_manifest_path = args.output_dir / "segments_manifest.csv"
     segment_rows: list[dict[str, Any]] = []
     for segment in all_segments:
         track = track_by_id[segment["dali_id"]]
         split = split_by_id[track["dali_id"]]
-        segment_rows.append(row_for_segment(segment=segment, split=split, track_info=track))
+        segment_rows.append(
+            row_for_segment(
+                segment=segment,
+                split=split,
+                track_info=track,
+                manifest_dir=segment_manifest_path.parent,
+            )
+        )
 
-    segment_manifest_path = args.output_dir / "segments_manifest.csv"
     with segment_manifest_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(segment_rows[0].keys()))
         writer.writeheader()
         writer.writerows(segment_rows)
 
+    metadata_path = args.output_dir / "metadata.json"
     metadata = {
         "source": "DALI",
-        "dali_data_dir": str(args.dali_data_dir),
-        "audio_dir": str(args.audio_dir),
-        "prepared_audio_dir": str(args.prepared_audio_dir),
+        "dali_data_dir": manifest_relative_path(args.dali_data_dir, metadata_path.parent),
+        "audio_dir": manifest_relative_path(args.audio_dir, metadata_path.parent),
+        "prepared_audio_dir": manifest_relative_path(args.prepared_audio_dir, metadata_path.parent),
         "audio_format": args.audio_format,
         "skip_audio_prep": args.skip_audio_prep,
         "sample_rate": args.sample_rate,
@@ -600,7 +615,6 @@ def main() -> None:
         "skipped_segments": dict(skipped_segments),
         "split_counts": dict(Counter(row["split"] for row in segment_rows)),
     }
-    metadata_path = args.output_dir / "metadata.json"
     with metadata_path.open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2, sort_keys=True)
 

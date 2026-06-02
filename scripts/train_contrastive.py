@@ -164,13 +164,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hubert-model-name", default="facebook/hubert-base-ls960")
     parser.add_argument("--projection-dim", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.07)
-    parser.add_argument("--freeze-hubert", action="store_true")
+    parser.add_argument("--freeze-hubert", action="store_true") #false unless present
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--max-negatives", type=int, default=None)
+    parser.add_argument("--max-negatives", type=int, default=7, help="Limit negatives per anchor to avoid OOM.")
     parser.add_argument(
         "--min-negative-offset-seconds",
         type=float,

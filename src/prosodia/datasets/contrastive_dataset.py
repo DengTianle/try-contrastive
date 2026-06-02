@@ -37,6 +37,12 @@ def audio_sample_id(row: dict[str, str]) -> str:
     return row["sample_id"]
 
 
+def resolve_manifest_path(path: str, manifest_dir: Path) -> str:
+    path_str = str(path).lstrip("\\/")
+    resolved = manifest_dir / path_str
+    return str(resolved.resolve(strict=False))
+
+
 def load_melody(path: str | Path, melody_config: MelodyConfig) -> dict[str, torch.Tensor]:
     with np.load(path) as melody:
         f0_hz = melody["f0_hz"].astype(np.float32)
@@ -85,6 +91,7 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self.manifest_path = Path(manifest_path).expanduser().resolve(strict=False)
+        self.manifest_dir = self.manifest_path.parent
         self.audio_config = audio_config or AudioConfig()
         self.melody_config = melody_config or MelodyConfig()
         self.min_negative_offset_seconds = min_negative_offset_seconds
@@ -93,12 +100,20 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
 
         with self.manifest_path.open(newline="", encoding="utf-8") as handle:
             rows = list(csv.DictReader(handle))
+        rows = [self._resolve_row_paths(row) for row in rows]
 
         if split is not None:
             rows = [row for row in rows if row["split"] == split]
         self.rows = rows
 
         self.groups = self._build_groups_from_segment_rows(rows, max_negatives=max_negatives)
+
+    def _resolve_row_paths(self, row: dict[str, str]) -> dict[str, str]:
+        resolved = dict(row)
+        for key in ("audio_path", "raw_audio_path", "melody_path"):
+            if resolved.get(key):
+                resolved[key] = resolve_manifest_path(resolved[key], self.manifest_dir)
+        return resolved
 
     def _build_groups_from_segment_rows(
         self,
