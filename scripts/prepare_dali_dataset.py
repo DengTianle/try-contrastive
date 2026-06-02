@@ -18,7 +18,7 @@ import numpy as np
 
 AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".aac"}
 PREPARED_AUDIO_FORMATS = {"flac", "wav"}
-SEGMENT_TIME_DECIMALS = 6
+SEGMENT_TIME_DECIMALS = 6 #6dp
 
 
 def load_dali(
@@ -138,6 +138,20 @@ def audio_duration_seconds(audio_path: Path, fallback_duration: float | None = N
             raise
 
 
+def prepared_audio_is_valid(audio_path: Path, sample_rate: int, audio_format: str) -> bool:
+    if not audio_path.exists():
+        return False
+    if audio_path.suffix.lower() != f".{audio_format}":
+        return False
+    try:
+        import soundfile as sf
+
+        info = sf.info(str(audio_path))
+    except Exception:
+        return False
+    return info.samplerate == sample_rate and info.channels == 1
+
+
 def prepare_audio_file(
     input_path: Path,
     output_dir: Path,
@@ -150,7 +164,14 @@ def prepare_audio_file(
         raise ValueError(f"Unsupported audio format: {audio_format}")
 
     output_path = output_dir / f"{dali_id}.{audio_format}"
-    if output_path.exists() and not overwrite:
+    if (
+        not overwrite
+        and prepared_audio_is_valid(
+            output_path,
+            sample_rate=sample_rate,
+            audio_format=audio_format,
+        )
+    ):
         return output_path.resolve(strict=False)
 
     os.environ.setdefault("NUMBA_CACHE_DIR", str((output_dir / ".numba_cache").resolve(strict=False)))

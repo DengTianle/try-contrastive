@@ -17,7 +17,7 @@ class HubertEncoder(nn.Module):
         super().__init__()
         from transformers import AutoModel
 
-        if pooling not in {"mean", "cls"}:
+        if pooling != "mean":
             raise ValueError(f"Unsupported pooling: {pooling}")
 
         self.model_name = model_name
@@ -43,9 +43,6 @@ class HubertEncoder(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
-        if self.pooling == "cls":
-            return hidden_states[:, 0]
-
         if attention_mask is None:
             return hidden_states.mean(dim=1)
 
