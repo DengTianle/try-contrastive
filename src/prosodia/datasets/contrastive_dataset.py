@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import csv
+import hashlib
+import random
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -83,7 +86,7 @@ class ContrastivePairDataset(Dataset[dict[str, Any]]):
         import soundfile as sf
 
         audio_path = Path(row["audio_path"])
-        start_seconds = float(row["audio_start_seconds"])
+        start_seconds = audio_start_seconds(row)
         segment_seconds = float(row["segment_seconds"])
         expected_samples = int(round(segment_seconds * self.audio_config.sample_rate))
 
@@ -119,26 +122,49 @@ class ContrastivePairDataset(Dataset[dict[str, Any]]):
         return torch.from_numpy(audio_array.copy())
 
     def _load_melody(self, row: dict[str, str]) -> dict[str, torch.Tensor]:
-        with np.load(row["melody_path"]) as melody:
-            f0_hz = melody["f0_hz"].astype(np.float32)
-            voiced = melody["voiced"].astype(bool)
-            frame_times = melody["frame_times"].astype(np.float32)
+        return load_melody(row["melody_path"], self.melody_config)
 
-        log_f0 = np.zeros_like(f0_hz, dtype=np.float32)
-        valid = voiced & np.isfinite(f0_hz) & (f0_hz > 0.0)
-        log_f0[valid] = np.log2(f0_hz[valid] / self.melody_config.log_f0_reference_hz)
 
-        feature_parts = [log_f0[:, None]]
-        if self.melody_config.include_voiced_feature:
-            feature_parts.append(voiced.astype(np.float32)[:, None])
-        features = np.concatenate(feature_parts, axis=1).astype(np.float32)
+def audio_start_seconds(row: dict[str, str]) -> float:
+    if "audio_start_seconds" in row:
+        return float(row["audio_start_seconds"])
+    return float(row["start_seconds"])
 
-        return {
-            "features": torch.from_numpy(features),
-            "f0_hz": torch.from_numpy(f0_hz),
-            "voiced": torch.from_numpy(voiced),
-            "frame_times": torch.from_numpy(frame_times),
-        }
+
+def melody_sample_id(row: dict[str, str]) -> str:
+    return row.get("melody_sample_id") or row["sample_id"]
+
+
+def audio_sample_id(row: dict[str, str]) -> str:
+    return row.get("audio_sample_id") or row["sample_id"]
+
+
+def load_melody(path: str | Path, melody_config: MelodyConfig) -> dict[str, torch.Tensor]:
+    with np.load(path) as melody:
+        f0_hz = melody["f0_hz"].astype(np.float32)
+        voiced = melody["voiced"].astype(bool)
+        frame_times = melody["frame_times"].astype(np.float32)
+
+    log_f0 = np.zeros_like(f0_hz, dtype=np.float32)
+    valid = voiced & np.isfinite(f0_hz) & (f0_hz > 0.0)
+    log_f0[valid] = np.log2(f0_hz[valid] / melody_config.log_f0_reference_hz)
+
+    feature_parts = [log_f0[:, None]]
+    if melody_config.include_voiced_feature:
+        feature_parts.append(voiced.astype(np.float32)[:, None])
+    features = np.concatenate(feature_parts, axis=1).astype(np.float32)
+
+    return {
+        "features": torch.from_numpy(features),
+        "f0_hz": torch.from_numpy(f0_hz),
+        "voiced": torch.from_numpy(voiced),
+        "frame_times": torch.from_numpy(frame_times),
+    }
+
+
+def stable_row_rng(seed: int, row_id: str) -> random.Random:
+    digest = hashlib.sha1(f"{seed}:{row_id}".encode("utf-8")).hexdigest()
+    return random.Random(int(digest[:16], 16))
 
 
 class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
@@ -156,73 +182,224 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         audio_config: AudioConfig | None = None,
         melody_config: MelodyConfig | None = None,
         max_negatives: int | None = None,
+        min_negative_offset_seconds: float | None = None,
+        seed: int = 13,
         transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
-        self.pair_dataset = ContrastivePairDataset(
-            manifest_path=manifest_path,
-            split=split,
-            audio_config=audio_config,
-            melody_config=melody_config,
-            transform=None,
-        )
+        self.manifest_path = Path(manifest_path).expanduser().resolve(strict=False)
+        self.audio_config = audio_config or AudioConfig()
+        self.melody_config = melody_config or MelodyConfig()
+        self.min_negative_offset_seconds = min_negative_offset_seconds
+        self.seed = seed
         self.transform = transform
 
+        with self.manifest_path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+
+        if split is not None:
+            rows = [row for row in rows if row["split"] == split]
+        self.rows = rows
+
+        fieldnames = set(rows[0]) if rows else set()
+        self.manifest_kind = "pair" if {"pair_type", "label", "melody_sample_id"} <= fieldnames else "segment"
+        if self.manifest_kind == "pair":
+            self.groups = self._build_groups_from_pair_rows(rows, max_negatives=max_negatives)
+        else:
+            self.groups = self._build_groups_from_segment_rows(rows, max_negatives=max_negatives)
+
+    def _build_groups_from_pair_rows(
+        self,
+        rows: list[dict[str, str]],
+        max_negatives: int | None,
+    ) -> list[dict[str, Any]]:
         groups: dict[str, dict[str, Any]] = {}
-        for row_index, row in enumerate(self.pair_dataset.rows):
-            key = row["melody_sample_id"]
+        for row in rows:
+            key = melody_sample_id(row)
             group = groups.setdefault(key, {"positive": None, "negatives": []})
             if int(row["label"]) == 1:
-                group["positive"] = row_index
+                group["positive"] = row
             else:
-                group["negatives"].append(row_index)
+                group["negatives"].append(row)
 
-        self.groups: list[dict[str, Any]] = []
-        for melody_sample_id, group in groups.items():
+        built_groups: list[dict[str, Any]] = []
+        for group_melody_sample_id, group in groups.items():
             if group["positive"] is None:
                 continue
-            negative_indices = group["negatives"]
+            negative_rows = group["negatives"]
             if max_negatives is not None:
-                negative_indices = negative_indices[:max_negatives]
-            self.groups.append(
+                negative_rows = negative_rows[:max_negatives]
+            built_groups.append(
                 {
-                    "melody_sample_id": melody_sample_id,
+                    "melody_sample_id": group_melody_sample_id,
                     "positive": group["positive"],
-                    "negatives": negative_indices,
+                    "negatives": negative_rows,
                 }
             )
+        return built_groups
+
+    def _build_groups_from_segment_rows(
+        self,
+        rows: list[dict[str, str]],
+        max_negatives: int | None,
+    ) -> list[dict[str, Any]]:
+        rows_by_song: dict[str, list[dict[str, str]]] = defaultdict(list)
+        for row in rows:
+            rows_by_song[row["dali_id"]].append(row)
+
+        built_groups: list[dict[str, Any]] = []
+        for song_rows in rows_by_song.values():
+            song_rows.sort(key=lambda row: (audio_start_seconds(row), audio_sample_id(row)))
+            for anchor in song_rows:
+                min_offset = self.min_negative_offset_seconds
+                if min_offset is None:
+                    min_offset = float(anchor["segment_seconds"])
+                negatives = [
+                    candidate
+                    for candidate in song_rows
+                    if audio_sample_id(candidate) != audio_sample_id(anchor)
+                    and abs(audio_start_seconds(candidate) - audio_start_seconds(anchor)) >= min_offset
+                ]
+                if max_negatives is not None and len(negatives) > max_negatives:
+                    rng = stable_row_rng(self.seed, audio_sample_id(anchor))
+                    negatives = list(negatives)
+                    rng.shuffle(negatives)
+                    negatives = sorted(
+                        negatives[:max_negatives],
+                        key=lambda row: (audio_start_seconds(row), audio_sample_id(row)),
+                    )
+                built_groups.append(
+                    {
+                        "melody_sample_id": melody_sample_id(anchor),
+                        "positive": anchor,
+                        "negatives": negatives,
+                    }
+                )
+        return built_groups
 
     def __len__(self) -> int:
         return len(self.groups)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         group = self.groups[index]
-        positive = self.pair_dataset[group["positive"]]
-        negatives = [self.pair_dataset[row_index] for row_index in group["negatives"]]
-        candidates = [positive, *negatives]
+        positive = group["positive"]
+        candidate_rows = [positive, *group["negatives"]]
+        melody = load_melody(positive["melody_path"], self.melody_config)
+        candidate_audio = self._load_candidate_audio(candidate_rows)
+        pair_ids = self._candidate_pair_ids(positive, candidate_rows)
+        pair_types = self._candidate_pair_types(candidate_rows)
 
         item: dict[str, Any] = {
-            "melody_features": positive["melody_features"],
-            "melody_f0_hz": positive["melody_f0_hz"],
-            "melody_voiced": positive["melody_voiced"],
-            "melody_frame_times": positive["melody_frame_times"],
+            "melody_features": melody["features"],
+            "melody_f0_hz": melody["f0_hz"],
+            "melody_voiced": melody["voiced"],
+            "melody_frame_times": melody["frame_times"],
             "melody_attention_mask": torch.ones(
-                positive["melody_features"].shape[0],
+                melody["features"].shape[0],
                 dtype=torch.bool,
             ),
-            "candidate_input_values": torch.stack([candidate["input_values"] for candidate in candidates]),
+            "candidate_input_values": torch.stack(candidate_audio),
             "candidate_audio_attention_mask": torch.stack(
-                [candidate["audio_attention_mask"] for candidate in candidates]
+                [torch.ones_like(audio, dtype=torch.bool) for audio in candidate_audio]
             ),
-            "candidate_mask": torch.ones(len(candidates), dtype=torch.bool),
+            "candidate_mask": torch.ones(len(candidate_rows), dtype=torch.bool),
             "target": torch.tensor(0, dtype=torch.long),
             "melody_sample_id": group["melody_sample_id"],
-            "candidate_pair_ids": [candidate["pair_id"] for candidate in candidates],
-            "candidate_pair_types": [candidate["pair_type"] for candidate in candidates],
-            "metadata": [candidate["metadata"] for candidate in candidates],
+            "candidate_pair_ids": pair_ids,
+            "candidate_pair_types": pair_types,
+            "metadata": candidate_rows,
         }
         if self.transform is not None:
             item = self.transform(item)
         return item
+
+    def _candidate_pair_ids(
+        self,
+        positive: dict[str, str],
+        candidate_rows: list[dict[str, str]],
+    ) -> list[str]:
+        if self.manifest_kind == "pair":
+            return [row["pair_id"] for row in candidate_rows]
+        anchor_id = melody_sample_id(positive)
+        return [
+            f"{anchor_id}__pos",
+            *[
+                f"{anchor_id}__same_song_neg{index}"
+                for index in range(len(candidate_rows) - 1)
+            ],
+        ]
+
+    def _candidate_pair_types(self, candidate_rows: list[dict[str, str]]) -> list[str]:
+        if self.manifest_kind == "pair":
+            return [row["pair_type"] for row in candidate_rows]
+        return ["positive", *["hard_negative_same_song"] * (len(candidate_rows) - 1)]
+
+    def _load_candidate_audio(self, candidate_rows: list[dict[str, str]]) -> list[torch.Tensor]:
+        import soundfile as sf
+
+        loaded_by_path: dict[str, tuple[np.ndarray, int]] = {}
+        for audio_path, path_rows in self._rows_by_audio_path(candidate_rows).items():
+            info = sf.info(audio_path)
+            if info.samplerate != self.audio_config.sample_rate:
+                raise ValueError(
+                    f"Expected {self.audio_config.sample_rate} Hz prepared audio, "
+                    f"got {info.samplerate} Hz: {audio_path}"
+                )
+
+            starts = [int(round(audio_start_seconds(row) * info.samplerate)) for row in path_rows]
+            ends = [
+                start + int(round(float(row["segment_seconds"]) * info.samplerate))
+                for start, row in zip(starts, path_rows)
+            ]
+            read_start = max(min(starts), 0)
+            read_end = max(ends)
+            audio, _ = sf.read(
+                audio_path,
+                start=read_start,
+                frames=max(read_end - read_start, 0),
+                dtype="float32",
+                always_2d=False,
+            )
+            audio_array = np.asarray(audio, dtype=np.float32)
+            if audio_array.ndim == 2:
+                audio_array = np.mean(audio_array, axis=1, dtype=np.float32)
+            loaded_by_path[audio_path] = (audio_array, read_start)
+
+        return [
+            self._crop_loaded_audio(row, *loaded_by_path[str(Path(row["audio_path"]))])
+            for row in candidate_rows
+        ]
+
+    def _rows_by_audio_path(
+        self,
+        rows: list[dict[str, str]],
+    ) -> dict[str, list[dict[str, str]]]:
+        rows_by_path: dict[str, list[dict[str, str]]] = defaultdict(list)
+        for row in rows:
+            rows_by_path[str(Path(row["audio_path"]))].append(row)
+        return rows_by_path
+
+    def _crop_loaded_audio(
+        self,
+        row: dict[str, str],
+        audio_array: np.ndarray,
+        read_start_sample: int,
+    ) -> torch.Tensor:
+        start_sample = int(round(audio_start_seconds(row) * self.audio_config.sample_rate))
+        expected_samples = int(round(float(row["segment_seconds"]) * self.audio_config.sample_rate))
+        offset = max(start_sample - read_start_sample, 0)
+        crop = audio_array[offset : offset + expected_samples]
+
+        if crop.shape[0] < expected_samples:
+            crop = np.pad(crop, (0, expected_samples - crop.shape[0]))
+        elif crop.shape[0] > expected_samples:
+            crop = crop[:expected_samples]
+
+        if self.audio_config.normalize_peak:
+            peak = float(np.max(np.abs(crop))) if crop.size else 0.0
+            if peak > 0:
+                crop = crop / peak
+
+        return torch.from_numpy(crop.astype(np.float32, copy=True))
 
 
 def contrastive_pair_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:

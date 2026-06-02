@@ -171,6 +171,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-negatives", type=int, default=None)
+    parser.add_argument(
+        "--min-negative-offset-seconds",
+        type=float,
+        default=None,
+        help=(
+            "Minimum same-song negative offset when --manifest points to a segment manifest. "
+            "Defaults to the anchor segment length."
+        ),
+    )
     parser.add_argument("--train-split", default="train")
     parser.add_argument("--val-split", default="val")
     parser.add_argument("--no-val", action="store_true")
@@ -199,6 +208,8 @@ def main() -> None:
         manifest_path=args.manifest,
         split=args.train_split,
         max_negatives=args.max_negatives,
+        min_negative_offset_seconds=args.min_negative_offset_seconds,
+        seed=args.seed,
     )
     if len(train_dataset) == 0:
         raise SystemExit(f"No grouped training examples found for split={args.train_split}")
@@ -217,6 +228,8 @@ def main() -> None:
             manifest_path=args.manifest,
             split=args.val_split,
             max_negatives=args.max_negatives,
+            min_negative_offset_seconds=args.min_negative_offset_seconds,
+            seed=args.seed,
         )
         if len(val_dataset) > 0:
             val_loader = DataLoader(

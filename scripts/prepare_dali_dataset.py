@@ -380,6 +380,28 @@ def row_for_pair(
     }
 
 
+def row_for_segment(
+    segment: dict[str, Any],
+    split: str,
+    track_info: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "sample_id": segment["sample_id"],
+        "split": split,
+        "dali_id": track_info["dali_id"],
+        "artist": track_info["artist"],
+        "title": track_info["title"],
+        "audio_path": str(track_info["audio_path"]),
+        "raw_audio_path": str(track_info["raw_audio_path"]),
+        "melody_path": str(segment["melody_path"]),
+        "start_seconds": f"{segment['start_seconds']:.6f}",
+        "end_seconds": f"{segment['end_seconds']:.6f}",
+        "segment_seconds": f"{segment['segment_seconds']:.6f}",
+        "melody_frame_rate": f"{segment['frame_rate']:.6f}",
+        "voiced_ratio": f"{segment['voiced_ratio']:.6f}",
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -613,6 +635,12 @@ def main() -> None:
         )
 
     track_by_id = {track["dali_id"]: track for track in usable_tracks}
+    segment_rows: list[dict[str, Any]] = []
+    for segment in all_segments:
+        track = track_by_id[segment["dali_id"]]
+        split = split_by_id[track["dali_id"]]
+        segment_rows.append(row_for_segment(segment=segment, split=split, track_info=track))
+
     rows: list[dict[str, Any]] = []
     skipped_pairs = Counter()
     for melody_segment in all_segments:
@@ -655,6 +683,12 @@ def main() -> None:
                 )
             )
 
+    segment_manifest_path = args.output_dir / "segments_manifest.csv"
+    with segment_manifest_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(segment_rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(segment_rows)
+
     manifest_path = args.output_dir / "manifest.csv"
     with manifest_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
@@ -680,6 +714,7 @@ def main() -> None:
         "val_ratio": args.val_ratio,
         "num_tracks": len(usable_tracks),
         "num_segments": len(all_segments),
+        "num_segment_rows": len(segment_rows),
         "num_pairs": len(rows),
         "num_prepared_audio_files": prepared_audio_count,
         "skipped_tracks": dict(skipped),
@@ -696,6 +731,7 @@ def main() -> None:
     print(f"Wrote {len(all_segments)} melody segments to {melody_dir}")
     if not args.skip_audio_prep:
         print(f"Wrote/reused {prepared_audio_count} prepared audio files in {args.prepared_audio_dir}")
+    print(f"Wrote {len(segment_rows)} segment rows to {segment_manifest_path}")
     print(f"Wrote {len(rows)} contrastive pair rows to {manifest_path}")
     print(f"Metadata: {metadata_path}")
     print(f"Track skips: {dict(skipped)}")
