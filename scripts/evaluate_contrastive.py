@@ -228,9 +228,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--manifest", type=Path, default=Path("data/prepared/dali/segments_manifest.csv"))
     parser.add_argument("--split", default="test")
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--max-negatives", type=int, default=None)
+    parser.add_argument("--max-negatives", type=int, default=4)
     parser.add_argument(
         "--min-negative-offset-seconds",
         type=float,
@@ -238,7 +238,7 @@ def parse_args() -> argparse.Namespace:
         help="Minimum same-song negative offset for segment manifests. Defaults to the segment length.",
     )
     parser.add_argument("--temperature", type=float, default=None)
-    parser.add_argument("--recall-k", type=parse_recall_k, default=parse_recall_k("1,2,5,10"))
+    parser.add_argument("--recall-k", type=parse_recall_k, default=parse_recall_k("1,2,3,5"))
     parser.add_argument("--device", default="auto")
     parser.add_argument("--amp", action="store_true", help="Use CUDA mixed precision.")
     parser.add_argument("--output-json", type=Path, default=None)
@@ -257,7 +257,7 @@ def main() -> None:
 
     device = choose_device(args.device)
     use_amp = args.amp and device.type == "cuda"
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     checkpoint_args = checkpoint.get("args", {})
     temperature = args.temperature
     if temperature is None:
