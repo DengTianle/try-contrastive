@@ -25,118 +25,16 @@ class MelodyConfig:
     include_voiced_feature: bool = True
 
 
-class ContrastivePairDataset(Dataset[dict[str, Any]]):
-    """Dataset for prepared melody/audio contrastive pairs.
-
-    Expected manifest columns come from scripts/prepare_dali_dataset.py. Audio files
-    should already be mono and resampled by prep; this class crops and pads only.
-    Melody tensors are frame-aligned fixed-length arrays saved as .npz.
-    """
-
-    def __init__(
-        self,
-        manifest_path: str | Path,
-        split: str | None = None,
-        pair_types: set[str] | None = None,
-        audio_config: AudioConfig | None = None,
-        melody_config: MelodyConfig | None = None,
-        transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
-    ) -> None:
-        self.manifest_path = Path(manifest_path).expanduser().resolve(strict=False)
-        self.audio_config = audio_config or AudioConfig()
-        self.melody_config = melody_config or MelodyConfig()
-        self.transform = transform
-
-        with self.manifest_path.open(newline="", encoding="utf-8") as handle:
-            rows = list(csv.DictReader(handle))
-
-        if split is not None:
-            rows = [row for row in rows if row["split"] == split]
-        if pair_types is not None:
-            rows = [row for row in rows if row["pair_type"] in pair_types]
-
-        self.rows = rows
-
-    def __len__(self) -> int:
-        return len(self.rows)
-
-    def __getitem__(self, index: int) -> dict[str, Any]:
-        row = self.rows[index]
-        waveform = self._load_audio_crop(row)
-        melody = self._load_melody(row)
-
-        item: dict[str, Any] = {
-            "input_values": waveform,
-            "audio_attention_mask": torch.ones_like(waveform, dtype=torch.bool),
-            "melody_features": melody["features"],
-            "melody_f0_hz": melody["f0_hz"],
-            "melody_voiced": melody["voiced"],
-            "melody_frame_times": melody["frame_times"],
-            "label": torch.tensor(int(row["label"]), dtype=torch.long),
-            "pair_type": row["pair_type"],
-            "pair_id": row["pair_id"],
-            "dali_id": row["dali_id"],
-            "metadata": row,
-        }
-        if self.transform is not None:
-            item = self.transform(item)
-        return item
-
-    def _load_audio_crop(self, row: dict[str, str]) -> torch.Tensor:
-        import soundfile as sf
-
-        audio_path = Path(row["audio_path"])
-        start_seconds = audio_start_seconds(row)
-        segment_seconds = float(row["segment_seconds"])
-        expected_samples = int(round(segment_seconds * self.audio_config.sample_rate))
-
-        info = sf.info(str(audio_path))
-        if info.samplerate != self.audio_config.sample_rate:
-            raise ValueError(
-                f"Expected {self.audio_config.sample_rate} Hz prepared audio, "
-                f"got {info.samplerate} Hz: {audio_path}"
-            )
-
-        start_sample = int(round(start_seconds * info.samplerate))
-        audio, _ = sf.read(
-            str(audio_path),
-            start=start_sample,
-            frames=expected_samples,
-            dtype="float32",
-            always_2d=False,
-        )
-        audio_array = np.asarray(audio, dtype=np.float32)
-        if audio_array.ndim == 2:
-            audio_array = np.mean(audio_array, axis=1, dtype=np.float32)
-
-        if audio_array.shape[0] < expected_samples:
-            audio_array = np.pad(audio_array, (0, expected_samples - audio_array.shape[0]))
-        elif audio_array.shape[0] > expected_samples:
-            audio_array = audio_array[:expected_samples]
-
-        if self.audio_config.normalize_peak:
-            peak = float(np.max(np.abs(audio_array))) if audio_array.size else 0.0
-            if peak > 0:
-                audio_array = audio_array / peak
-
-        return torch.from_numpy(audio_array.copy())
-
-    def _load_melody(self, row: dict[str, str]) -> dict[str, torch.Tensor]:
-        return load_melody(row["melody_path"], self.melody_config)
-
-
 def audio_start_seconds(row: dict[str, str]) -> float:
-    if "audio_start_seconds" in row:
-        return float(row["audio_start_seconds"])
     return float(row["start_seconds"])
 
 
 def melody_sample_id(row: dict[str, str]) -> str:
-    return row.get("melody_sample_id") or row["sample_id"]
+    return row["sample_id"]
 
 
 def audio_sample_id(row: dict[str, str]) -> str:
-    return row.get("audio_sample_id") or row["sample_id"]
+    return row["sample_id"]
 
 
 def load_melody(path: str | Path, melody_config: MelodyConfig) -> dict[str, torch.Tensor]:
@@ -200,42 +98,7 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
             rows = [row for row in rows if row["split"] == split]
         self.rows = rows
 
-        fieldnames = set(rows[0]) if rows else set()
-        self.manifest_kind = "pair" if {"pair_type", "label", "melody_sample_id"} <= fieldnames else "segment"
-        if self.manifest_kind == "pair":
-            self.groups = self._build_groups_from_pair_rows(rows, max_negatives=max_negatives)
-        else:
-            self.groups = self._build_groups_from_segment_rows(rows, max_negatives=max_negatives)
-
-    def _build_groups_from_pair_rows(
-        self,
-        rows: list[dict[str, str]],
-        max_negatives: int | None,
-    ) -> list[dict[str, Any]]:
-        groups: dict[str, dict[str, Any]] = {}
-        for row in rows:
-            key = melody_sample_id(row)
-            group = groups.setdefault(key, {"positive": None, "negatives": []})
-            if int(row["label"]) == 1:
-                group["positive"] = row
-            else:
-                group["negatives"].append(row)
-
-        built_groups: list[dict[str, Any]] = []
-        for group_melody_sample_id, group in groups.items():
-            if group["positive"] is None:
-                continue
-            negative_rows = group["negatives"]
-            if max_negatives is not None:
-                negative_rows = negative_rows[:max_negatives]
-            built_groups.append(
-                {
-                    "melody_sample_id": group_melody_sample_id,
-                    "positive": group["positive"],
-                    "negatives": negative_rows,
-                }
-            )
-        return built_groups
+        self.groups = self._build_groups_from_segment_rows(rows, max_negatives=max_negatives)
 
     def _build_groups_from_segment_rows(
         self,
@@ -285,8 +148,8 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         candidate_rows = [positive, *group["negatives"]]
         melody = load_melody(positive["melody_path"], self.melody_config)
         candidate_audio = self._load_candidate_audio(candidate_rows)
-        pair_ids = self._candidate_pair_ids(positive, candidate_rows)
-        pair_types = self._candidate_pair_types(candidate_rows)
+        candidate_ids = self._candidate_ids(positive, candidate_rows)
+        candidate_types = self._candidate_types(candidate_rows)
 
         item: dict[str, Any] = {
             "melody_features": melody["features"],
@@ -304,21 +167,19 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
             "candidate_mask": torch.ones(len(candidate_rows), dtype=torch.bool),
             "target": torch.tensor(0, dtype=torch.long),
             "melody_sample_id": group["melody_sample_id"],
-            "candidate_pair_ids": pair_ids,
-            "candidate_pair_types": pair_types,
+            "candidate_ids": candidate_ids,
+            "candidate_types": candidate_types,
             "metadata": candidate_rows,
         }
         if self.transform is not None:
             item = self.transform(item)
         return item
 
-    def _candidate_pair_ids(
+    def _candidate_ids(
         self,
         positive: dict[str, str],
         candidate_rows: list[dict[str, str]],
     ) -> list[str]:
-        if self.manifest_kind == "pair":
-            return [row["pair_id"] for row in candidate_rows]
         anchor_id = melody_sample_id(positive)
         return [
             f"{anchor_id}__pos",
@@ -328,9 +189,7 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
             ],
         ]
 
-    def _candidate_pair_types(self, candidate_rows: list[dict[str, str]]) -> list[str]:
-        if self.manifest_kind == "pair":
-            return [row["pair_type"] for row in candidate_rows]
+    def _candidate_types(self, candidate_rows: list[dict[str, str]]) -> list[str]:
         return ["positive", *["hard_negative_same_song"] * (len(candidate_rows) - 1)]
 
     def _load_candidate_audio(self, candidate_rows: list[dict[str, str]]) -> list[torch.Tensor]:
@@ -401,26 +260,6 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
 
         return torch.from_numpy(crop.astype(np.float32, copy=True))
 
-
-def contrastive_pair_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    tensor_keys = {
-        "input_values",
-        "audio_attention_mask",
-        "melody_features",
-        "melody_f0_hz",
-        "melody_voiced",
-        "melody_frame_times",
-        "label",
-    }
-    collated: dict[str, Any] = {}
-    for key in tensor_keys:
-        collated[key] = torch.stack([item[key] for item in batch])
-
-    for key in ("pair_type", "pair_id", "dali_id", "metadata"):
-        collated[key] = [item[key] for item in batch]
-    return collated
-
-
 def grouped_contrastive_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     max_candidates = max(item["candidate_input_values"].shape[0] for item in batch)
     batch_size = len(batch)
@@ -454,7 +293,7 @@ def grouped_contrastive_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "candidate_mask": candidate_mask,
         "target": torch.stack([item["target"] for item in batch]),
         "melody_sample_id": [item["melody_sample_id"] for item in batch],
-        "candidate_pair_ids": [item["candidate_pair_ids"] for item in batch],
-        "candidate_pair_types": [item["candidate_pair_types"] for item in batch],
+        "candidate_ids": [item["candidate_ids"] for item in batch],
+        "candidate_types": [item["candidate_types"] for item in batch],
         "metadata": [item["metadata"] for item in batch],
     }

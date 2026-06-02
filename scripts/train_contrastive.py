@@ -159,7 +159,7 @@ def save_checkpoint(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train melody/audio contrastive encoders.")
-    parser.add_argument("--manifest", type=Path, default=Path("data/prepared/dali/manifest.csv"))
+    parser.add_argument("--manifest", type=Path, default=Path("data/prepared/dali/segments_manifest.csv"))
     parser.add_argument("--output-dir", type=Path, default=Path("checkpoints/contrastive"))
     parser.add_argument("--hubert-model-name", default="facebook/hubert-base-ls960")
     parser.add_argument("--projection-dim", type=int, default=256)

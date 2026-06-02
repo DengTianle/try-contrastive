@@ -55,26 +55,20 @@ def checkpoint_arg(checkpoint_args: dict[str, Any], name: str, default: Any) -> 
     return default if value is None else value
 
 
-def build_model(args: argparse.Namespace, checkpoint_args: dict[str, Any]) -> MelodyAudioContrastiveModel:
+def build_model(checkpoint_args: dict[str, Any]) -> MelodyAudioContrastiveModel:
     return MelodyAudioContrastiveModel(
-        hubert_model_name=args.hubert_model_name
-        or checkpoint_arg(checkpoint_args, "hubert_model_name", "facebook/hubert-base-ls960"),
-        projection_dim=args.projection_dim
-        or checkpoint_arg(checkpoint_args, "projection_dim", 256),
-        freeze_hubert=args.freeze_hubert
-        if args.freeze_hubert is not None
-        else checkpoint_arg(checkpoint_args, "freeze_hubert", False),
-        melody_d_model=args.melody_d_model
-        or checkpoint_arg(checkpoint_args, "melody_d_model", 256),
-        melody_num_layers=args.melody_num_layers
-        or checkpoint_arg(checkpoint_args, "melody_num_layers", 4),
-        melody_num_heads=args.melody_num_heads
-        or checkpoint_arg(checkpoint_args, "melody_num_heads", 4),
-        melody_dim_feedforward=args.melody_dim_feedforward
-        or checkpoint_arg(checkpoint_args, "melody_dim_feedforward", 1024),
-        dropout=args.dropout
-        if args.dropout is not None
-        else checkpoint_arg(checkpoint_args, "dropout", 0.1),
+        hubert_model_name=checkpoint_arg(
+            checkpoint_args,
+            "hubert_model_name",
+            "facebook/hubert-base-ls960",
+        ),
+        projection_dim=checkpoint_arg(checkpoint_args, "projection_dim", 256),
+        freeze_hubert=checkpoint_arg(checkpoint_args, "freeze_hubert", False),
+        melody_d_model=checkpoint_arg(checkpoint_args, "melody_d_model", 256),
+        melody_num_layers=checkpoint_arg(checkpoint_args, "melody_num_layers", 4),
+        melody_num_heads=checkpoint_arg(checkpoint_args, "melody_num_heads", 4),
+        melody_dim_feedforward=checkpoint_arg(checkpoint_args, "melody_dim_feedforward", 1024),
+        dropout=checkpoint_arg(checkpoint_args, "dropout", 0.1),
     )
 
 
@@ -192,13 +186,13 @@ def prediction_rows(
                 "positive_score": float(logits_cpu[batch_index, 0]),
                 "top_score": float(logits_cpu[batch_index, top_index]) if top_index >= 0 else "",
                 "top_candidate_index": top_index,
-                "top_pair_id": batch["candidate_pair_ids"][batch_index][top_index]
+                "top_candidate_id": batch["candidate_ids"][batch_index][top_index]
                 if top_index >= 0
                 else "",
-                "top_pair_type": batch["candidate_pair_types"][batch_index][top_index]
+                "top_candidate_type": batch["candidate_types"][batch_index][top_index]
                 if top_index >= 0
                 else "",
-                "positive_pair_id": batch["candidate_pair_ids"][batch_index][0],
+                "positive_candidate_id": batch["candidate_ids"][batch_index][0],
                 "correct_top1": bool(int(ranks_cpu[batch_index]) == 1),
                 "valid_mask": " ".join(
                     "1" if bool(value) else "0" for value in candidate_mask_cpu[batch_index].tolist()
@@ -217,9 +211,9 @@ def write_predictions(path: Path, rows: list[dict[str, Any]]) -> None:
         "positive_score",
         "top_score",
         "top_candidate_index",
-        "top_pair_id",
-        "top_pair_type",
-        "positive_pair_id",
+        "top_candidate_id",
+        "top_candidate_type",
+        "positive_candidate_id",
         "correct_top1",
         "valid_mask",
     ]
@@ -249,15 +243,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--amp", action="store_true", help="Use CUDA mixed precision.")
     parser.add_argument("--output-json", type=Path, default=None)
     parser.add_argument("--predictions-csv", type=Path, default=None)
-
-    parser.add_argument("--hubert-model-name", default=None)
-    parser.add_argument("--projection-dim", type=int, default=None)
-    parser.add_argument("--freeze-hubert", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--melody-d-model", type=int, default=None)
-    parser.add_argument("--melody-num-layers", type=int, default=None)
-    parser.add_argument("--melody-num-heads", type=int, default=None)
-    parser.add_argument("--melody-dim-feedforward", type=int, default=None)
-    parser.add_argument("--dropout", type=float, default=None)
     return parser.parse_args()
 
 
@@ -296,7 +281,7 @@ def main() -> None:
         collate_fn=grouped_contrastive_collate,
     )
 
-    model = build_model(args, checkpoint_args).to(device)
+    model = build_model(checkpoint_args).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
     metrics, predictions = evaluate_retrieval(
@@ -312,7 +297,6 @@ def main() -> None:
         "checkpoint": str(args.checkpoint),
         "manifest": str(args.manifest),
         "split": args.split,
-        "manifest_kind": dataset.manifest_kind,
         "max_negatives": args.max_negatives,
         "temperature": float(temperature),
         "metrics": metrics,
