@@ -72,10 +72,14 @@ def build_model(checkpoint_args: dict[str, Any]) -> MelodyAudioContrastiveModel:
     )
 
 
-def positive_ranks(logits: torch.Tensor, candidate_mask: torch.Tensor) -> torch.Tensor:
+def positive_ranks(
+    logits: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    targets: torch.Tensor,
+) -> torch.Tensor:
     valid_logits = logits.masked_fill(~candidate_mask.to(dtype=torch.bool), torch.finfo(logits.dtype).min)
-    positive_scores = valid_logits[:, 0]
-    return (valid_logits > positive_scores[:, None]).sum(dim=-1) + 1
+    positive_scores = valid_logits.gather(1, targets.to(logits.device, dtype=torch.long).unsqueeze(1)).squeeze(1)
+    return (valid_logits >= positive_scores[:, None]).sum(dim=-1)
 
 
 @torch.no_grad()
@@ -94,6 +98,7 @@ def evaluate_retrieval(
     total_rank = 0.0
     total_reciprocal_rank = 0.0
     total_candidates = 0.0
+    total_top1 = 0
     recall_hits = {k: 0 for k in recall_k}
     all_ranks: list[int] = []
     predictions: list[dict[str, Any]] = []
@@ -111,15 +116,19 @@ def evaluate_retrieval(
                 melody_embeddings=melody_embeddings,
                 candidate_audio_embeddings=audio_embeddings,
                 candidate_mask=batch["candidate_mask"],
+                targets=batch["target"],
                 temperature=temperature,
             )
 
-        ranks = positive_ranks(logits, batch["candidate_mask"])
+        ranks = positive_ranks(logits, batch["candidate_mask"], batch["target"])
         candidate_counts = batch["candidate_mask"].sum(dim=-1)
         batch_size = ranks.shape[0]
+        top_indices = logits.argmax(dim=-1)
+        targets = batch["target"].to(device=top_indices.device, dtype=torch.long)
 
         total_loss += float(loss.detach().cpu()) * batch_size
         total_examples += batch_size
+        total_top1 += int((top_indices == targets).sum().detach().cpu())
         total_rank += float(ranks.sum().detach().cpu())
         total_reciprocal_rank += float((1.0 / ranks.float()).sum().detach().cpu())
         total_candidates += float(candidate_counts.sum().detach().cpu())
@@ -149,7 +158,7 @@ def evaluate_retrieval(
 
     metrics: dict[str, float] = {
         "loss": total_loss / total_examples,
-        "top1_accuracy": recall_hits.get(1, 0) / total_examples,
+        "top1_accuracy": total_top1 / total_examples,
         "mrr": total_reciprocal_rank / total_examples,
         "mean_rank": total_rank / total_examples,
         "median_rank": median_rank,
@@ -157,7 +166,9 @@ def evaluate_retrieval(
         "num_examples": float(total_examples),
     }
     for k in recall_k:
-        metrics[f"recall@{k}"] = recall_hits[k] / total_examples
+        metrics[f"recall@{k}"] = (
+            total_top1 / total_examples if k == 1 else recall_hits[k] / total_examples
+        )
     return metrics, predictions
 
 
@@ -170,12 +181,14 @@ def prediction_rows(
     rows: list[dict[str, Any]] = []
     logits_cpu = logits.detach().cpu()
     ranks_cpu = ranks.detach().cpu().tolist()
+    targets_cpu = batch["target"].detach().cpu().tolist()
     candidate_counts_cpu = candidate_counts.detach().cpu().tolist()
     candidate_mask_cpu = batch["candidate_mask"].detach().cpu()
 
     for batch_index, melody_sample_id in enumerate(batch["melody_sample_id"]):
         valid_count = int(candidate_counts_cpu[batch_index])
         valid_logits = logits_cpu[batch_index, :valid_count]
+        target_index = int(targets_cpu[batch_index])
         order = torch.argsort(valid_logits, descending=True).tolist()
         top_index = int(order[0]) if order else -1
         rows.append(
@@ -183,7 +196,7 @@ def prediction_rows(
                 "melody_sample_id": melody_sample_id,
                 "rank": int(ranks_cpu[batch_index]),
                 "num_candidates": valid_count,
-                "positive_score": float(logits_cpu[batch_index, 0]),
+                "positive_score": float(logits_cpu[batch_index, target_index]),
                 "top_score": float(logits_cpu[batch_index, top_index]) if top_index >= 0 else "",
                 "top_candidate_index": top_index,
                 "top_candidate_id": batch["candidate_ids"][batch_index][top_index]
@@ -192,8 +205,8 @@ def prediction_rows(
                 "top_candidate_type": batch["candidate_types"][batch_index][top_index]
                 if top_index >= 0
                 else "",
-                "positive_candidate_id": batch["candidate_ids"][batch_index][0],
-                "correct_top1": bool(int(ranks_cpu[batch_index]) == 1),
+                "positive_candidate_id": batch["candidate_ids"][batch_index][target_index],
+                "correct_top1": bool(top_index == target_index),
                 "valid_mask": " ".join(
                     "1" if bool(value) else "0" for value in candidate_mask_cpu[batch_index].tolist()
                 ),

@@ -27,6 +27,7 @@ class HubertEncoder(nn.Module):
         hidden_size = self.hubert.config.hidden_size
         self.dropout = nn.Dropout(dropout)
         self.projection = nn.Sequential(
+            #nn.LayerNorm(hidden_size),
             nn.Linear(hidden_size, hidden_size),
             nn.GELU(),
             nn.Dropout(dropout),

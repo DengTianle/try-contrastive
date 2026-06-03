@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
+from collections import defaultdict
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
@@ -16,7 +19,12 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from prosodia.datasets import GroupedContrastiveDataset, grouped_contrastive_collate
-from prosodia.training import MelodyAudioContrastiveModel, grouped_info_nce_loss
+from prosodia.training import (
+    MelodyAudioContrastiveModel,
+    global_in_batch_info_nce_loss,
+    grouped_info_nce_loss,
+    positive_audio_embeddings,
+)
 
 
 def resolve_user_path(path: Path) -> Path:
@@ -46,19 +54,69 @@ def choose_device(requested: str) -> torch.device:
     return torch.device("cpu")
 
 
+class DifferentSongBatchSampler(Sampler[list[int]]):
+    """Yield batches with at most one segment per song while possible."""
+
+    def __init__(
+        self,
+        dataset: GroupedContrastiveDataset,
+        batch_size: int,
+        seed: int,
+        drop_last: bool = False,
+    ) -> None:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.seed = seed
+        self.drop_last = drop_last
+        self.epoch = 0
+
+    def __iter__(self) -> Iterator[list[int]]:
+        rng = random.Random(self.seed + self.epoch)
+        self.epoch += 1
+
+        indices_by_song: dict[str, list[int]] = defaultdict(list)
+        for index, group in enumerate(self.dataset.groups):
+            indices_by_song[group["positive"]["dali_id"]].append(index)
+        for indices in indices_by_song.values():
+            rng.shuffle(indices)
+
+        active_songs = [song for song, indices in indices_by_song.items() if indices]
+        while active_songs:
+            rng.shuffle(active_songs)
+            chosen_songs = active_songs[: self.batch_size]
+            if self.drop_last and len(chosen_songs) < self.batch_size:
+                break
+
+            batch = [indices_by_song[song].pop() for song in chosen_songs]
+            active_songs = [song for song in active_songs if indices_by_song[song]]
+            yield batch
+
+    def __len__(self) -> int:
+        if self.drop_last:
+            return len(self.dataset) // self.batch_size
+        return (len(self.dataset) + self.batch_size - 1) // self.batch_size
+
+
 def train_one_epoch(
     model: MelodyAudioContrastiveModel,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     temperature: float,
+    global_loss_weight: float,
     grad_clip_norm: float | None,
     use_amp: bool,
 ) -> dict[str, float]:
     model.train()
     total_loss = 0.0
+    total_hard_loss = 0.0
+    total_global_loss = 0.0
     total_correct = 0
+    total_global_correct = 0
     total_examples = 0
+    total_global_examples = 0
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     for batch in loader:
@@ -72,12 +130,27 @@ def train_one_epoch(
                 candidate_input_values=batch["candidate_input_values"],
                 candidate_audio_attention_mask=batch["candidate_audio_attention_mask"],
             )
-            loss, logits = grouped_info_nce_loss(
+            hard_loss, hard_logits = grouped_info_nce_loss(
                 melody_embeddings=melody_embeddings,
                 candidate_audio_embeddings=audio_embeddings,
                 candidate_mask=batch["candidate_mask"],
+                targets=batch["target"],
                 temperature=temperature,
             )
+            global_loss = hard_loss.new_zeros(())
+            global_logits = None
+            batch_size = batch["melody_features"].shape[0]
+            if global_loss_weight > 0.0 and batch_size > 1:
+                batch_positive_audio_embeddings = positive_audio_embeddings(
+                    candidate_audio_embeddings=audio_embeddings,
+                    targets=batch["target"],
+                )
+                global_loss, global_logits = global_in_batch_info_nce_loss(
+                    melody_embeddings=melody_embeddings,
+                    positive_audio_embeddings=batch_positive_audio_embeddings,
+                    temperature=temperature,
+                )
+            loss = hard_loss + global_loss_weight * global_loss
 
         scaler.scale(loss).backward()
         if grad_clip_norm is not None:
@@ -86,14 +159,25 @@ def train_one_epoch(
         scaler.step(optimizer)
         scaler.update()
 
-        batch_size = batch["melody_features"].shape[0]
+        targets = batch["target"].to(dtype=torch.long)
         total_loss += float(loss.detach().cpu()) * batch_size
-        total_correct += int((logits.argmax(dim=-1) == 0).sum().detach().cpu())
+        total_hard_loss += float(hard_loss.detach().cpu()) * batch_size
+        total_correct += int((hard_logits.argmax(dim=-1) == targets).sum().detach().cpu())
+        if global_logits is not None:
+            total_global_loss += float(global_loss.detach().cpu()) * batch_size
+            global_targets = torch.arange(batch_size, device=global_logits.device)
+            total_global_correct += int(
+                (global_logits.argmax(dim=-1) == global_targets).sum().detach().cpu()
+            )
+            total_global_examples += batch_size
         total_examples += batch_size
 
     return {
         "loss": total_loss / max(total_examples, 1),
+        "hard_loss": total_hard_loss / max(total_examples, 1),
+        "global_loss": total_global_loss / max(total_global_examples, 1),
         "accuracy": total_correct / max(total_examples, 1),
+        "global_accuracy": total_global_correct / max(total_global_examples, 1),
     }
 
 
@@ -123,12 +207,14 @@ def evaluate(
                 melody_embeddings=melody_embeddings,
                 candidate_audio_embeddings=audio_embeddings,
                 candidate_mask=batch["candidate_mask"],
+                targets=batch["target"],
                 temperature=temperature,
             )
 
         batch_size = batch["melody_features"].shape[0]
+        targets = batch["target"].to(dtype=torch.long)
         total_loss += float(loss.detach().cpu()) * batch_size
-        total_correct += int((logits.argmax(dim=-1) == 0).sum().detach().cpu())
+        total_correct += int((logits.argmax(dim=-1) == targets).sum().detach().cpu())
         total_examples += batch_size
 
     return {
@@ -164,13 +250,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hubert-model-name", default="facebook/hubert-base-ls960")
     parser.add_argument("--projection-dim", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.07)
-    parser.add_argument("--freeze-hubert", action="store_true") #false unless present
+    parser.add_argument("--freeze-hubert", action="store_true")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-2)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-negatives", type=int, default=7, help="Limit negatives per anchor to avoid OOM.")
+    parser.add_argument(
+        "--disable-song-balanced-batches",
+        action="store_true",
+        help="Use ordinary shuffled batches instead of enforcing different songs per training batch.",
+    )
+    parser.add_argument(
+        "--global-loss-weight",
+        type=float,
+        default=0.5,
+        help="Weight for the global in-batch positive-audio loss added to the hard grouped loss.",
+    )
+    parser.add_argument(
+        "--no-in-batch-negatives",
+        action="store_true",
+        help="Deprecated alias for --global-loss-weight=0.0.",
+    )
     parser.add_argument(
         "--min-negative-offset-seconds",
         type=float,
@@ -199,6 +301,10 @@ def main() -> None:
     args = parse_args()
     args.manifest = resolve_user_path(args.manifest)
     args.output_dir = resolve_user_path(args.output_dir)
+    if args.global_loss_weight < 0.0:
+        raise SystemExit("--global-loss-weight must be non-negative")
+    if args.no_in_batch_negatives:
+        args.global_loss_weight = 0.0
 
     torch.manual_seed(args.seed)
     device = choose_device(args.device)
@@ -214,13 +320,25 @@ def main() -> None:
     if len(train_dataset) == 0:
         raise SystemExit(f"No grouped training examples found for split={args.train_split}")
 
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        collate_fn=grouped_contrastive_collate,
-    )
+    if args.global_loss_weight > 0.0 and not args.disable_song_balanced_batches:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_sampler=DifferentSongBatchSampler(
+                dataset=train_dataset,
+                batch_size=args.batch_size,
+                seed=args.seed,
+            ),
+            num_workers=args.num_workers,
+            collate_fn=grouped_contrastive_collate,
+        )
+    else:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            collate_fn=grouped_contrastive_collate,
+        )
 
     val_loader = None
     if not args.no_val:
@@ -269,6 +387,7 @@ def main() -> None:
             optimizer=optimizer,
             device=device,
             temperature=args.temperature,
+            global_loss_weight=args.global_loss_weight,
             grad_clip_norm=args.grad_clip_norm,
             use_amp=use_amp,
         )
@@ -277,8 +396,12 @@ def main() -> None:
         message = (
             f"epoch={epoch} "
             f"train_loss={train_metrics['loss']:.4f} "
+            f"train_hard_loss={train_metrics['hard_loss']:.4f} "
+            f"train_global_loss={train_metrics['global_loss']:.4f} "
             f"train_acc={train_metrics['accuracy']:.4f}"
         )
+        if args.global_loss_weight > 0.0:
+            message += f" train_global_acc={train_metrics['global_accuracy']:.4f}"
 
         if val_loader is not None:
             val_metrics = evaluate(

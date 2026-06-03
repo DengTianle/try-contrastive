@@ -161,10 +161,17 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         group = self.groups[index]
         positive = group["positive"]
         candidate_rows = [positive, *group["negatives"]]
+        target = 0
+        if len(candidate_rows) > 1:
+            order = list(range(len(candidate_rows)))
+            rng = stable_row_rng(self.seed, f"{group['melody_sample_id']}:candidate_order")
+            rng.shuffle(order)
+            target = order.index(0)
+            candidate_rows = [candidate_rows[index] for index in order]
         melody = load_melody(positive["melody_path"], self.melody_config)
         candidate_audio = self._load_candidate_audio(candidate_rows)
         candidate_ids = self._candidate_ids(positive, candidate_rows)
-        candidate_types = self._candidate_types(candidate_rows)
+        candidate_types = self._candidate_types(positive, candidate_rows)
 
         item: dict[str, Any] = {
             "melody_features": melody["features"],
@@ -180,7 +187,7 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
                 [torch.ones_like(audio, dtype=torch.bool) for audio in candidate_audio]
             ),
             "candidate_mask": torch.ones(len(candidate_rows), dtype=torch.bool),
-            "target": torch.tensor(0, dtype=torch.long),
+            "target": torch.tensor(target, dtype=torch.long),
             "melody_sample_id": group["melody_sample_id"],
             "candidate_ids": candidate_ids,
             "candidate_types": candidate_types,
@@ -197,15 +204,23 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
     ) -> list[str]:
         anchor_id = melody_sample_id(positive)
         return [
-            f"{anchor_id}__pos",
-            *[
-                f"{anchor_id}__same_song_neg{index}"
-                for index in range(len(candidate_rows) - 1)
-            ],
+            f"{anchor_id}__pos"
+            if audio_sample_id(candidate) == audio_sample_id(positive)
+            else f"{anchor_id}__same_song_neg{index}"
+            for index, candidate in enumerate(candidate_rows)
         ]
 
-    def _candidate_types(self, candidate_rows: list[dict[str, str]]) -> list[str]:
-        return ["positive", *["hard_negative_same_song"] * (len(candidate_rows) - 1)]
+    def _candidate_types(
+        self,
+        positive: dict[str, str],
+        candidate_rows: list[dict[str, str]],
+    ) -> list[str]:
+        return [
+            "positive"
+            if audio_sample_id(candidate) == audio_sample_id(positive)
+            else "hard_negative_same_song"
+            for candidate in candidate_rows
+        ]
 
     def _load_candidate_audio(self, candidate_rows: list[dict[str, str]]) -> list[torch.Tensor]:
         import soundfile as sf

@@ -79,6 +79,7 @@ class MelodyTransformerEncoder(nn.Module):
         )
         self.output_norm = nn.LayerNorm(d_model)
         self.projection = nn.Sequential(
+            #nn.LayerNorm(d_model),
             nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.Dropout(dropout),
