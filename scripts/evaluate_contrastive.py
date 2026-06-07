@@ -16,7 +16,12 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from prosodia.datasets import GroupedContrastiveDataset, grouped_contrastive_collate
-from prosodia.training import MelodyAudioContrastiveModel, grouped_info_nce_loss
+from prosodia.training import (
+    MelodyAudioContrastiveModel,
+    build_contrastive_model_from_checkpoint_args,
+    checkpoint_arg,
+    grouped_info_nce_loss,
+)
 
 
 def resolve_user_path(path: Path) -> Path:
@@ -48,28 +53,6 @@ def parse_recall_k(value: str) -> list[int]:
     if not recall_k or any(k <= 0 for k in recall_k):
         raise argparse.ArgumentTypeError("--recall-k must contain positive integers")
     return recall_k
-
-
-def checkpoint_arg(checkpoint_args: dict[str, Any], name: str, default: Any) -> Any:
-    value = checkpoint_args.get(name, default)
-    return default if value is None else value
-
-
-def build_model(checkpoint_args: dict[str, Any]) -> MelodyAudioContrastiveModel:
-    return MelodyAudioContrastiveModel(
-        hubert_model_name=checkpoint_arg(
-            checkpoint_args,
-            "hubert_model_name",
-            "facebook/hubert-base-ls960",
-        ),
-        projection_dim=checkpoint_arg(checkpoint_args, "projection_dim", 256),
-        freeze_hubert=checkpoint_arg(checkpoint_args, "freeze_hubert", False),
-        melody_d_model=checkpoint_arg(checkpoint_args, "melody_d_model", 256),
-        melody_num_layers=checkpoint_arg(checkpoint_args, "melody_num_layers", 4),
-        melody_num_heads=checkpoint_arg(checkpoint_args, "melody_num_heads", 4),
-        melody_dim_feedforward=checkpoint_arg(checkpoint_args, "melody_dim_feedforward", 1024),
-        dropout=checkpoint_arg(checkpoint_args, "dropout", 0.1),
-    )
 
 
 def positive_ranks(
@@ -294,7 +277,7 @@ def main() -> None:
         collate_fn=grouped_contrastive_collate,
     )
 
-    model = build_model(checkpoint_args).to(device)
+    model = build_contrastive_model_from_checkpoint_args(checkpoint_args).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
     metrics, predictions = evaluate_retrieval(
