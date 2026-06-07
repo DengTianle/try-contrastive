@@ -27,6 +27,12 @@ from prosodia.training import (
 )
 
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:  # pragma: no cover - convenience fallback for minimal environments.
+    tqdm = None
+
+
 def resolve_user_path(path: Path) -> Path:
     expanded = path.expanduser()
     if not expanded.is_absolute():
@@ -52,6 +58,39 @@ def choose_device(requested: str) -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+class RandomMelodyTransposition:
+    """Randomly shift voiced melody pitch by a uniform number of semitones."""
+
+    def __init__(self, max_semitones: float) -> None:
+        if max_semitones < 0:
+            raise ValueError("max_semitones must be non-negative")
+        self.max_semitones = max_semitones
+
+    def __call__(self, item: dict[str, Any]) -> dict[str, Any]:
+        if self.max_semitones <= 0.0:
+            return item
+
+        semitones = float(torch.empty(()).uniform_(-self.max_semitones, self.max_semitones))
+        log2_shift = semitones / 12.0
+        voiced = item["melody_voiced"].to(dtype=torch.bool)
+
+        melody_features = item["melody_features"].clone()
+        melody_features[voiced, 0] += log2_shift
+        item["melody_features"] = melody_features
+
+        f0_hz = item["melody_f0_hz"].clone()
+        f0_hz[voiced] *= 2.0 ** log2_shift
+        item["melody_f0_hz"] = f0_hz
+        item["melody_transposition_semitones"] = torch.tensor(semitones, dtype=torch.float32)
+        return item
+
+
+def maybe_progress(iterable: Any, enabled: bool, **kwargs: Any) -> Any:
+    if enabled and tqdm is not None:
+        return tqdm(iterable, **kwargs)
+    return iterable
 
 
 class DifferentSongBatchSampler(Sampler[list[int]]):
@@ -108,6 +147,8 @@ def train_one_epoch(
     global_loss_weight: float,
     grad_clip_norm: float | None,
     use_amp: bool,
+    progress: bool,
+    desc: str,
 ) -> dict[str, float]:
     model.train()
     total_loss = 0.0
@@ -119,7 +160,8 @@ def train_one_epoch(
     total_global_examples = 0
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    for batch in loader:
+    progress_bar = maybe_progress(loader, enabled=progress, desc=desc, leave=False)
+    for batch in progress_bar:
         batch = move_batch_to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
 
@@ -171,6 +213,12 @@ def train_one_epoch(
             )
             total_global_examples += batch_size
         total_examples += batch_size
+        if tqdm is not None and hasattr(progress_bar, "set_postfix"):
+            progress_bar.set_postfix(
+                loss=total_loss / max(total_examples, 1),
+                hard=total_hard_loss / max(total_examples, 1),
+                acc=total_correct / max(total_examples, 1),
+            )
 
     return {
         "loss": total_loss / max(total_examples, 1),
@@ -188,13 +236,16 @@ def evaluate(
     device: torch.device,
     temperature: float,
     use_amp: bool,
+    progress: bool,
+    desc: str,
 ) -> dict[str, float]:
     model.eval()
     total_loss = 0.0
     total_correct = 0
     total_examples = 0
 
-    for batch in loader:
+    progress_bar = maybe_progress(loader, enabled=progress, desc=desc, leave=False)
+    for batch in progress_bar:
         batch = move_batch_to_device(batch, device)
         with torch.amp.autocast("cuda", enabled=use_amp):
             melody_embeddings, audio_embeddings = model(
@@ -216,6 +267,11 @@ def evaluate(
         total_loss += float(loss.detach().cpu()) * batch_size
         total_correct += int((logits.argmax(dim=-1) == targets).sum().detach().cpu())
         total_examples += batch_size
+        if tqdm is not None and hasattr(progress_bar, "set_postfix"):
+            progress_bar.set_postfix(
+                loss=total_loss / max(total_examples, 1),
+                acc=total_correct / max(total_examples, 1),
+            )
 
     return {
         "loss": total_loss / max(total_examples, 1),
@@ -293,6 +349,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--melody-num-heads", type=int, default=4)
     parser.add_argument("--melody-dim-feedforward", type=int, default=1024)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument(
+        "--melody-transpose-semitones",
+        type=float,
+        default=1.0,
+        help=(
+            "Training-only melody augmentation. Randomly shift voiced melody log-F0 "
+            "within +/- this many semitones. 0 disables it."
+        ),
+    )
+    parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
     parser.add_argument("--seed", type=int, default=13)
     return parser.parse_args()
 
@@ -305,10 +371,21 @@ def main() -> None:
         raise SystemExit("--global-loss-weight must be non-negative")
     if args.no_in_batch_negatives:
         args.global_loss_weight = 0.0
+    if args.melody_transpose_semitones < 0.0:
+        raise SystemExit("--melody-transpose-semitones must be non-negative")
 
     torch.manual_seed(args.seed)
     device = choose_device(args.device)
     use_amp = args.amp and device.type == "cuda"
+    progress = not args.no_progress
+    if progress and tqdm is None:
+        print("tqdm is not installed; continuing without progress bars.")
+
+    train_transform = None
+    if args.melody_transpose_semitones > 0.0:
+        train_transform = RandomMelodyTransposition(
+            max_semitones=args.melody_transpose_semitones,
+        )
 
     train_dataset = GroupedContrastiveDataset(
         manifest_path=args.manifest,
@@ -316,6 +393,7 @@ def main() -> None:
         max_negatives=args.max_negatives,
         min_negative_offset_seconds=args.min_negative_offset_seconds,
         seed=args.seed,
+        transform=train_transform,
     )
     if len(train_dataset) == 0:
         raise SystemExit(f"No grouped training examples found for split={args.train_split}")
@@ -390,6 +468,8 @@ def main() -> None:
             global_loss_weight=args.global_loss_weight,
             grad_clip_norm=args.grad_clip_norm,
             use_amp=use_amp,
+            progress=progress,
+            desc=f"train epoch {epoch}/{args.epochs}",
         )
 
         metrics: dict[str, Any] = {"train": train_metrics}
@@ -410,6 +490,8 @@ def main() -> None:
                 device=device,
                 temperature=args.temperature,
                 use_amp=use_amp,
+                progress=progress,
+                desc=f"val epoch {epoch}/{args.epochs}",
             )
             metrics["val"] = val_metrics
             message += f" val_loss={val_metrics['loss']:.4f} val_acc={val_metrics['accuracy']:.4f}"
