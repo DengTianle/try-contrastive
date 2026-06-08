@@ -390,7 +390,7 @@ def parse_args() -> argparse.Namespace:
         help="Regenerate prepared audio files even if they already exist.",
     )
     parser.add_argument("--segment-seconds", type=float, default=10.0)
-    parser.add_argument("--hop-seconds", type=float, default=5.0)
+    parser.add_argument("--hop-seconds", type=float, default=10.0)
     parser.add_argument("--melody-frame-rate", type=float, default=50.0, help="Number of frames per second.")
     parser.add_argument("--max-tracks", type=int, default=0, help="0 means no track limit.")
     parser.add_argument("--max-segments", type=int, default=0, help="0 means no segment limit.")

@@ -174,21 +174,39 @@ def prediction_rows(
         target_index = int(targets_cpu[batch_index])
         order = torch.argsort(valid_logits, descending=True).tolist()
         top_index = int(order[0]) if order else -1
+        top_row = batch["metadata"][batch_index][top_index] if top_index >= 0 else {}
+        positive_row = batch["metadata"][batch_index][target_index]
+        top_start = float(top_row["start_seconds"]) if top_row else ""
+        positive_start = float(positive_row["start_seconds"])
         rows.append(
             {
                 "melody_sample_id": melody_sample_id,
+                "melody_start_seconds": positive_start,
+                "melody_end_seconds": float(positive_row["end_seconds"]),
                 "rank": int(ranks_cpu[batch_index]),
                 "num_candidates": valid_count,
                 "positive_score": float(logits_cpu[batch_index, target_index]),
                 "top_score": float(logits_cpu[batch_index, top_index]) if top_index >= 0 else "",
+                "top_score_margin": float(
+                    logits_cpu[batch_index, top_index] - logits_cpu[batch_index, target_index]
+                )
+                if top_index >= 0
+                else "",
                 "top_candidate_index": top_index,
                 "top_candidate_id": batch["candidate_ids"][batch_index][top_index]
                 if top_index >= 0
                 else "",
+                "top_candidate_sample_id": top_row.get("sample_id", ""),
+                "top_candidate_start_seconds": top_start,
+                "top_candidate_end_seconds": float(top_row["end_seconds"]) if top_row else "",
+                "top_candidate_offset_seconds": top_start - positive_start if top_row else "",
                 "top_candidate_type": batch["candidate_types"][batch_index][top_index]
                 if top_index >= 0
                 else "",
                 "positive_candidate_id": batch["candidate_ids"][batch_index][target_index],
+                "positive_candidate_sample_id": positive_row["sample_id"],
+                "positive_candidate_start_seconds": positive_start,
+                "positive_candidate_end_seconds": float(positive_row["end_seconds"]),
                 "correct_top1": bool(top_index == target_index),
                 "valid_mask": " ".join(
                     "1" if bool(value) else "0" for value in candidate_mask_cpu[batch_index].tolist()
@@ -202,14 +220,24 @@ def write_predictions(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "melody_sample_id",
+        "melody_start_seconds",
+        "melody_end_seconds",
         "rank",
         "num_candidates",
         "positive_score",
         "top_score",
+        "top_score_margin",
         "top_candidate_index",
         "top_candidate_id",
+        "top_candidate_sample_id",
+        "top_candidate_start_seconds",
+        "top_candidate_end_seconds",
+        "top_candidate_offset_seconds",
         "top_candidate_type",
         "positive_candidate_id",
+        "positive_candidate_sample_id",
+        "positive_candidate_start_seconds",
+        "positive_candidate_end_seconds",
         "correct_top1",
         "valid_mask",
     ]
