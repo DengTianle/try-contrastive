@@ -34,19 +34,28 @@ class HubertEncoder(nn.Module):
             nn.Linear(hidden_size, projection_dim),
         )
         self.set_hubert_trainable(not freeze_hubert)
-        
-        # Memory optimization: Always freeze the CNN feature extractor, which uses huge amounts of memory 
+
+        # Memory optimization: Always freeze the CNN feature extractor, which uses huge amounts of memory
         # and rarely needs fine-tuning for downstream tasks.
         if hasattr(self.hubert, "freeze_feature_encoder"):
             self.hubert.freeze_feature_encoder()
-            
+
         # Memory optimization: Enable gradient checkpointing for the transformer layers to trade computation for memory.
         #if not freeze_hubert and hasattr(self.hubert, "gradient_checkpointing_enable"):
         #    self.hubert.gradient_checkpointing_enable()
 
     def set_hubert_trainable(self, trainable: bool) -> None:
+        self.hubert_trainable = trainable
         for parameter in self.hubert.parameters():
             parameter.requires_grad = trainable
+        if not trainable:
+            self.hubert.eval()
+
+    def train(self, mode: bool = True) -> "HubertEncoder":
+        super().train(mode)
+        if not self.hubert_trainable:
+            self.hubert.eval()
+        return self
 
     def _pool_hidden_states(
         self,
@@ -71,7 +80,11 @@ class HubertEncoder(nn.Module):
         attention_mask: torch.Tensor | None = None,
         normalize: bool = True,
     ) -> torch.Tensor:
-        outputs = self.hubert(input_values=input_values, attention_mask=attention_mask)
+        if self.hubert_trainable:
+            outputs = self.hubert(input_values=input_values, attention_mask=attention_mask)
+        else:
+            with torch.no_grad():
+                outputs = self.hubert(input_values=input_values, attention_mask=attention_mask)
         hidden_states = self.dropout(outputs.last_hidden_state)
         pooled = self._pool_hidden_states(hidden_states, attention_mask)
         embeddings = self.projection(pooled)
