@@ -17,3 +17,5 @@ Then initialize the contrastive melody tower from the pretraining checkpoint:
 conda run -n try-contrastive python scripts/train_contrastive.py \
   --melody-pretrained-checkpoint checkpoints/melody_pretrain/best.pt
 ```
+
+The contrastive melody projection head is initialized from scratch by default.
