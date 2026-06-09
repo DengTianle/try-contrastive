@@ -87,3 +87,26 @@ def global_in_batch_info_nce_loss(
     targets = torch.arange(logits.shape[0], dtype=torch.long, device=logits.device)
     loss = F.cross_entropy(logits, targets)
     return loss, logits
+
+
+def symmetric_global_in_batch_info_nce_loss(
+    melody_embeddings: torch.Tensor,
+    positive_audio_embeddings: torch.Tensor,
+    temperature: float = 0.07,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute bidirectional melody/audio InfoNCE across the minibatch."""
+
+    melody_to_audio_loss, melody_to_audio_logits = global_in_batch_info_nce_loss(
+        melody_embeddings=melody_embeddings,
+        positive_audio_embeddings=positive_audio_embeddings,
+        temperature=temperature,
+    )
+    audio_to_melody_logits = melody_to_audio_logits.T
+    targets = torch.arange(
+        audio_to_melody_logits.shape[0],
+        dtype=torch.long,
+        device=audio_to_melody_logits.device,
+    )
+    audio_to_melody_loss = F.cross_entropy(audio_to_melody_logits, targets)
+    loss = 0.5 * (melody_to_audio_loss + audio_to_melody_loss)
+    return loss, melody_to_audio_logits, audio_to_melody_logits

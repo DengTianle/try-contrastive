@@ -24,6 +24,7 @@ from prosodia.training import (
     global_in_batch_info_nce_loss,
     grouped_info_nce_loss,
     positive_audio_embeddings,
+    symmetric_global_in_batch_info_nce_loss,
 )
 
 
@@ -145,6 +146,7 @@ def train_one_epoch(
     device: torch.device,
     temperature: float,
     global_loss_weight: float,
+    symmetric_global_loss: bool,
     grad_clip_norm: float | None,
     use_amp: bool,
     progress: bool,
@@ -156,6 +158,7 @@ def train_one_epoch(
     total_global_loss = 0.0
     total_correct = 0
     total_global_correct = 0
+    total_global_audio_correct = 0
     total_examples = 0
     total_global_examples = 0
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
@@ -181,17 +184,27 @@ def train_one_epoch(
             )
             global_loss = hard_loss.new_zeros(())
             global_logits = None
+            global_audio_logits = None
             batch_size = batch["melody_features"].shape[0]
             if global_loss_weight > 0.0 and batch_size > 1:
                 batch_positive_audio_embeddings = positive_audio_embeddings(
                     candidate_audio_embeddings=audio_embeddings,
                     targets=batch["target"],
                 )
-                global_loss, global_logits = global_in_batch_info_nce_loss(
-                    melody_embeddings=melody_embeddings,
-                    positive_audio_embeddings=batch_positive_audio_embeddings,
-                    temperature=temperature,
-                )
+                if symmetric_global_loss:
+                    global_loss, global_logits, global_audio_logits = (
+                        symmetric_global_in_batch_info_nce_loss(
+                            melody_embeddings=melody_embeddings,
+                            positive_audio_embeddings=batch_positive_audio_embeddings,
+                            temperature=temperature,
+                        )
+                    )
+                else:
+                    global_loss, global_logits = global_in_batch_info_nce_loss(
+                        melody_embeddings=melody_embeddings,
+                        positive_audio_embeddings=batch_positive_audio_embeddings,
+                        temperature=temperature,
+                    )
             loss = hard_loss + global_loss_weight * global_loss
 
         scaler.scale(loss).backward()
@@ -211,6 +224,10 @@ def train_one_epoch(
             total_global_correct += int(
                 (global_logits.argmax(dim=-1) == global_targets).sum().detach().cpu()
             )
+            if global_audio_logits is not None:
+                total_global_audio_correct += int(
+                    (global_audio_logits.argmax(dim=-1) == global_targets).sum().detach().cpu()
+                )
             total_global_examples += batch_size
         total_examples += batch_size
         if tqdm is not None and hasattr(progress_bar, "set_postfix"):
@@ -226,6 +243,7 @@ def train_one_epoch(
         "global_loss": total_global_loss / max(total_global_examples, 1),
         "accuracy": total_correct / max(total_examples, 1),
         "global_accuracy": total_global_correct / max(total_global_examples, 1),
+        "global_audio_accuracy": total_global_audio_correct / max(total_global_examples, 1),
     }
 
 
@@ -378,6 +396,14 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=0.5,
         help="Weight for the global in-batch positive-audio loss added to the hard grouped loss.",
+    )
+    parser.add_argument(
+        "--symmetric-global-loss",
+        action="store_true",
+        help=(
+            "Make the global in-batch loss bidirectional by adding audio-to-melody "
+            "classification over the same minibatch positives."
+        ),
     )
     parser.add_argument(
         "--no-in-batch-negatives",
@@ -552,6 +578,7 @@ def main() -> None:
             device=device,
             temperature=args.temperature,
             global_loss_weight=args.global_loss_weight,
+            symmetric_global_loss=args.symmetric_global_loss,
             grad_clip_norm=args.grad_clip_norm,
             use_amp=use_amp,
             progress=progress,
@@ -568,6 +595,10 @@ def main() -> None:
         )
         if args.global_loss_weight > 0.0:
             message += f" train_global_acc={train_metrics['global_accuracy']:.4f}"
+            if args.symmetric_global_loss:
+                message += (
+                    f" train_global_audio_acc={train_metrics['global_audio_accuracy']:.4f}"
+                )
 
         if val_loader is not None:
             val_metrics = evaluate(
