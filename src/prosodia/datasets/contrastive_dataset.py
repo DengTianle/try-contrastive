@@ -290,6 +290,88 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
 
         return torch.from_numpy(crop.astype(np.float32, copy=True))
 
+
+class MelodyOnlyDataset(Dataset[dict[str, Any]]):
+    """Manifest-backed melody segments without loading paired audio."""
+
+    def __init__(
+        self,
+        manifest_path: str | Path,
+        split: str | None = None,
+        melody_config: MelodyConfig | None = None,
+        transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+    ) -> None:
+        self.manifest_path = Path(manifest_path).expanduser().resolve(strict=False)
+        self.manifest_dir = self.manifest_path.parent
+        self.melody_config = melody_config or MelodyConfig()
+        self.transform = transform
+
+        with self.manifest_path.open(newline="", encoding="utf-8") as handle:
+            rows = list(csv.DictReader(handle))
+        rows = [self._resolve_row_paths(row) for row in rows]
+        if split is not None:
+            rows = [row for row in rows if row["split"] == split]
+        self.rows = rows
+
+    def _resolve_row_paths(self, row: dict[str, str]) -> dict[str, str]:
+        resolved = dict(row)
+        if resolved.get("melody_path"):
+            resolved["melody_path"] = resolve_manifest_path(resolved["melody_path"], self.manifest_dir)
+        return resolved
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        row = self.rows[index]
+        melody = load_melody(row["melody_path"], self.melody_config)
+        item: dict[str, Any] = {
+            "melody_features": melody["features"],
+            "melody_f0_hz": melody["f0_hz"],
+            "melody_voiced": melody["voiced"],
+            "melody_frame_times": melody["frame_times"],
+            "melody_attention_mask": torch.ones(
+                melody["features"].shape[0],
+                dtype=torch.bool,
+            ),
+            "melody_sample_id": melody_sample_id(row),
+            "metadata": row,
+        }
+        if self.transform is not None:
+            item = self.transform(item)
+        return item
+
+
+def melody_only_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
+    max_frames = max(item["melody_features"].shape[0] for item in batch)
+    batch_size = len(batch)
+    feature_dim = batch[0]["melody_features"].shape[-1]
+
+    melody_features = torch.zeros(batch_size, max_frames, feature_dim)
+    melody_f0_hz = torch.zeros(batch_size, max_frames)
+    melody_voiced = torch.zeros(batch_size, max_frames, dtype=torch.bool)
+    melody_frame_times = torch.zeros(batch_size, max_frames)
+    melody_attention_mask = torch.zeros(batch_size, max_frames, dtype=torch.bool)
+
+    for batch_index, item in enumerate(batch):
+        frame_count = item["melody_features"].shape[0]
+        melody_features[batch_index, :frame_count] = item["melody_features"]
+        melody_f0_hz[batch_index, :frame_count] = item["melody_f0_hz"]
+        melody_voiced[batch_index, :frame_count] = item["melody_voiced"]
+        melody_frame_times[batch_index, :frame_count] = item["melody_frame_times"]
+        melody_attention_mask[batch_index, :frame_count] = item["melody_attention_mask"]
+
+    return {
+        "melody_features": melody_features,
+        "melody_f0_hz": melody_f0_hz,
+        "melody_voiced": melody_voiced,
+        "melody_frame_times": melody_frame_times,
+        "melody_attention_mask": melody_attention_mask,
+        "melody_sample_id": [item["melody_sample_id"] for item in batch],
+        "metadata": [item["metadata"] for item in batch],
+    }
+
+
 def grouped_contrastive_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     max_candidates = max(item["candidate_input_values"].shape[0] for item in batch)
     batch_size = len(batch)

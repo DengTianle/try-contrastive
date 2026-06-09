@@ -299,6 +299,44 @@ def save_checkpoint(
     torch.save(checkpoint, output_dir / name)
 
 
+def melody_encoder_state_from_checkpoint(checkpoint: dict[str, Any]) -> dict[str, torch.Tensor]:
+    if "melody_encoder_state_dict" in checkpoint:
+        return checkpoint["melody_encoder_state_dict"]
+
+    model_state = checkpoint.get("model_state_dict")
+    if not isinstance(model_state, dict):
+        raise ValueError(
+            "Checkpoint must contain either melody_encoder_state_dict or model_state_dict"
+        )
+
+    encoder_prefixes = ("encoder.", "melody_encoder.")
+    for prefix in encoder_prefixes:
+        prefix_state = {
+            key.removeprefix(prefix): value
+            for key, value in model_state.items()
+            if key.startswith(prefix)
+        }
+        if prefix_state:
+            return prefix_state
+
+    raise ValueError("Could not find melody encoder weights in checkpoint")
+
+
+def load_pretrained_melody_encoder(
+    model: MelodyAudioContrastiveModel,
+    checkpoint_path: Path,
+    strict: bool,
+) -> None:
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    state_dict = melody_encoder_state_from_checkpoint(checkpoint)
+    incompatible = model.melody_encoder.load_state_dict(state_dict, strict=strict)
+    if incompatible.missing_keys:
+        print(f"Missing melody pretrain keys: {incompatible.missing_keys}")
+    if incompatible.unexpected_keys:
+        print(f"Unexpected melody pretrain keys: {incompatible.unexpected_keys}")
+    print(f"Loaded melody encoder pretrain from {checkpoint_path}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train melody/audio contrastive encoders.")
     parser.add_argument("--manifest", type=Path, default=Path("data/prepared/dali/segments_manifest.csv"))
@@ -350,6 +388,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--melody-dim-feedforward", type=int, default=1024)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument(
+        "--melody-pretrained-checkpoint",
+        type=Path,
+        default=None,
+        help=(
+            "Optional checkpoint from scripts/pretrain_melody_encoder.py. "
+            "Only the melody encoder weights are loaded."
+        ),
+    )
+    parser.add_argument(
+        "--melody-pretrained-strict",
+        action="store_true",
+        help="Require an exact key match when loading --melody-pretrained-checkpoint.",
+    )
+    parser.add_argument(
         "--melody-transpose-semitones",
         type=float,
         default=1.0,
@@ -367,6 +419,8 @@ def main() -> None:
     args = parse_args()
     args.manifest = resolve_user_path(args.manifest)
     args.output_dir = resolve_user_path(args.output_dir)
+    if args.melody_pretrained_checkpoint is not None:
+        args.melody_pretrained_checkpoint = resolve_user_path(args.melody_pretrained_checkpoint)
     if args.global_loss_weight < 0.0:
         raise SystemExit("--global-loss-weight must be non-negative")
     if args.no_in_batch_negatives:
@@ -446,6 +500,12 @@ def main() -> None:
         melody_dim_feedforward=args.melody_dim_feedforward,
         dropout=args.dropout,
     ).to(device)
+    if args.melody_pretrained_checkpoint is not None:
+        load_pretrained_melody_encoder(
+            model=model,
+            checkpoint_path=args.melody_pretrained_checkpoint,
+            strict=args.melody_pretrained_strict,
+        )
 
     optimizer = AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
