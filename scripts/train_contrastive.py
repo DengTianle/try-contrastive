@@ -94,6 +94,129 @@ def maybe_progress(iterable: Any, enabled: bool, **kwargs: Any) -> Any:
     return iterable
 
 
+def masked_rms(audio: torch.Tensor, mask: torch.Tensor, keepdim: bool = False) -> torch.Tensor:
+    mask_float = mask.to(device=audio.device, dtype=audio.dtype)
+    summed = (audio.square() * mask_float).sum(dim=-1, keepdim=keepdim)
+    count = mask_float.sum(dim=-1, keepdim=keepdim).clamp_min(1.0)
+    return (summed / count).clamp_min(1e-12).sqrt()
+
+
+def apply_random_audio_gain(
+    audio: torch.Tensor,
+    valid_mask: torch.Tensor,
+    max_abs_gain_db: float,
+) -> torch.Tensor:
+    if max_abs_gain_db <= 0.0:
+        return audio
+
+    gain_db = torch.empty(
+        *audio.shape[:2],
+        1,
+        device=audio.device,
+        dtype=audio.dtype,
+    ).uniform_(-max_abs_gain_db, max_abs_gain_db)
+    gain = torch.pow(audio.new_tensor(10.0), gain_db / 20.0)
+    augmented = audio * torch.where(valid_mask.unsqueeze(-1), gain, torch.ones_like(gain))
+    return augmented.clamp(-1.0, 1.0)
+
+
+def add_soft_audio_noise(
+    audio: torch.Tensor,
+    sample_mask: torch.Tensor,
+    valid_mask: torch.Tensor,
+    snr_db: float | None,
+) -> torch.Tensor:
+    if snr_db is None:
+        return audio
+
+    rms = masked_rms(audio, sample_mask, keepdim=True)
+    noise = torch.randn_like(audio) * sample_mask.to(dtype=audio.dtype)
+    noise_rms = masked_rms(noise, sample_mask, keepdim=True)
+    noise_scale = rms * (10.0 ** (-snr_db / 20.0)) / noise_rms
+    augmented = audio + noise * noise_scale
+    augmented = torch.where(valid_mask.unsqueeze(-1), augmented, audio)
+    return augmented.clamp(-1.0, 1.0)
+
+
+def add_quiet_background_mix(
+    audio: torch.Tensor,
+    sample_mask: torch.Tensor,
+    valid_mask: torch.Tensor,
+    probability: float,
+    snr_db: float,
+) -> torch.Tensor:
+    if probability <= 0.0:
+        return audio
+
+    batch_size, num_candidates, num_samples = audio.shape
+    flat_audio = audio.reshape(batch_size * num_candidates, num_samples)
+    flat_mask = sample_mask.reshape(batch_size * num_candidates, num_samples)
+    flat_valid = valid_mask.reshape(batch_size * num_candidates)
+    valid_indices = torch.nonzero(flat_valid, as_tuple=False).squeeze(-1)
+    if valid_indices.numel() < 2:
+        return audio
+
+    apply_mask = torch.rand(valid_indices.shape, device=audio.device) < probability
+    target_indices = valid_indices[apply_mask]
+    if target_indices.numel() == 0:
+        return audio
+
+    donor_positions = torch.randint(
+        low=0,
+        high=valid_indices.numel() - 1,
+        size=target_indices.shape,
+        device=audio.device,
+    )
+    donor_indices = valid_indices[donor_positions]
+    donor_indices = torch.where(
+        donor_indices >= target_indices,
+        valid_indices[donor_positions + 1],
+        donor_indices,
+    )
+
+    targets = flat_audio[target_indices]
+    target_masks = flat_mask[target_indices]
+    donors = flat_audio[donor_indices] * target_masks.to(dtype=audio.dtype)
+    target_rms = masked_rms(targets, target_masks, keepdim=True)
+    donor_rms = masked_rms(donors, target_masks, keepdim=True)
+    donor_scale = target_rms * (10.0 ** (-snr_db / 20.0)) / donor_rms
+
+    augmented = flat_audio.clone()
+    augmented[target_indices] = targets + donors * donor_scale
+    return augmented.reshape_as(audio).clamp(-1.0, 1.0)
+
+
+def augment_candidate_audio(
+    candidate_input_values: torch.Tensor,
+    candidate_audio_attention_mask: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    gain_db: float,
+    noise_snr_db: float | None,
+    background_mix_prob: float,
+    background_mix_snr_db: float,
+) -> torch.Tensor:
+    sample_mask = candidate_audio_attention_mask.to(dtype=torch.bool)
+    valid_mask = candidate_mask.to(dtype=torch.bool)
+    augmented = apply_random_audio_gain(
+        audio=candidate_input_values,
+        valid_mask=valid_mask,
+        max_abs_gain_db=gain_db,
+    )
+    augmented = add_soft_audio_noise(
+        audio=augmented,
+        sample_mask=sample_mask,
+        valid_mask=valid_mask,
+        snr_db=noise_snr_db,
+    )
+    return add_quiet_background_mix(
+        audio=augmented,
+        sample_mask=sample_mask,
+        valid_mask=valid_mask,
+        probability=background_mix_prob,
+        snr_db=background_mix_snr_db,
+    )
+
+
 class DifferentSongBatchSampler(Sampler[list[int]]):
     """Yield batches with at most one segment per song while possible."""
 
@@ -147,6 +270,10 @@ def train_one_epoch(
     temperature: float,
     global_loss_weight: float,
     symmetric_global_loss: bool,
+    audio_gain_db: float,
+    audio_noise_snr_db: float | None,
+    audio_background_mix_prob: float,
+    audio_background_mix_snr_db: float,
     grad_clip_norm: float | None,
     use_amp: bool,
     progress: bool,
@@ -169,10 +296,19 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         with torch.amp.autocast("cuda", enabled=use_amp):
+            candidate_input_values = augment_candidate_audio(
+                candidate_input_values=batch["candidate_input_values"],
+                candidate_audio_attention_mask=batch["candidate_audio_attention_mask"],
+                candidate_mask=batch["candidate_mask"],
+                gain_db=audio_gain_db,
+                noise_snr_db=audio_noise_snr_db,
+                background_mix_prob=audio_background_mix_prob,
+                background_mix_snr_db=audio_background_mix_snr_db,
+            )
             melody_embeddings, audio_embeddings = model(
                 melody_features=batch["melody_features"],
                 melody_attention_mask=batch["melody_attention_mask"],
-                candidate_input_values=batch["candidate_input_values"],
+                candidate_input_values=candidate_input_values,
                 candidate_audio_attention_mask=batch["candidate_audio_attention_mask"],
             )
             hard_loss, hard_logits = grouped_info_nce_loss(
@@ -455,10 +591,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--melody-transpose-semitones",
         type=float,
-        default=1.0,
+        default=0.0,
         help=(
             "Training-only melody augmentation. Randomly shift voiced melody log-F0 "
             "within +/- this many semitones. 0 disables it."
+        ),
+    )
+    parser.add_argument(
+        "--audio-gain-db",
+        type=float,
+        default=0.0,
+        help=(
+            "Training-only audio augmentation. Randomly scale each candidate waveform "
+            "within +/- this many dB. 0 disables it; try 3."
+        ),
+    )
+    parser.add_argument(
+        "--audio-noise-snr-db",
+        type=float,
+        default=None,
+        help=(
+            "Training-only audio augmentation. Add white noise at this SNR in dB. "
+            "Higher is softer; try 35, or 30 for a stronger setting. Omit to disable."
+        ),
+    )
+    parser.add_argument(
+        "--audio-background-mix-prob",
+        type=float,
+        default=0.0,
+        help=(
+            "Training-only audio augmentation. Probability of mixing a random in-batch "
+            "candidate quietly underneath each candidate. 0 disables it; try 0.25."
+        ),
+    )
+    parser.add_argument(
+        "--audio-background-mix-snr-db",
+        type=float,
+        default=35.0,
+        help=(
+            "SNR for --audio-background-mix-prob in dB. Higher is softer; "
+            "35 is deliberately quiet, 30 is stronger."
         ),
     )
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
@@ -478,6 +650,14 @@ def main() -> None:
         args.global_loss_weight = 0.0
     if args.melody_transpose_semitones < 0.0:
         raise SystemExit("--melody-transpose-semitones must be non-negative")
+    if args.audio_gain_db < 0.0:
+        raise SystemExit("--audio-gain-db must be non-negative")
+    if args.audio_noise_snr_db is not None and args.audio_noise_snr_db <= 0.0:
+        raise SystemExit("--audio-noise-snr-db must be positive")
+    if not 0.0 <= args.audio_background_mix_prob <= 1.0:
+        raise SystemExit("--audio-background-mix-prob must be in [0, 1]")
+    if args.audio_background_mix_snr_db <= 0.0:
+        raise SystemExit("--audio-background-mix-snr-db must be positive")
 
     torch.manual_seed(args.seed)
     device = choose_device(args.device)
@@ -579,6 +759,10 @@ def main() -> None:
             temperature=args.temperature,
             global_loss_weight=args.global_loss_weight,
             symmetric_global_loss=args.symmetric_global_loss,
+            audio_gain_db=args.audio_gain_db,
+            audio_noise_snr_db=args.audio_noise_snr_db,
+            audio_background_mix_prob=args.audio_background_mix_prob,
+            audio_background_mix_snr_db=args.audio_background_mix_snr_db,
             grad_clip_norm=args.grad_clip_norm,
             use_amp=use_amp,
             progress=progress,
