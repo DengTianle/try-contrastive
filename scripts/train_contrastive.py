@@ -396,6 +396,11 @@ def evaluate(
     model.eval()
     total_loss = 0.0
     total_correct = 0
+    total_rank = 0.0
+    total_reciprocal_rank = 0.0
+    total_recall_at_2 = 0
+    total_recall_at_3 = 0
+    total_recall_at_5 = 0
     total_examples = 0
 
     progress_bar = maybe_progress(loader, enabled=progress, desc=desc, leave=False)
@@ -418,8 +423,15 @@ def evaluate(
 
         batch_size = batch["melody_features"].shape[0]
         targets = batch["target"].to(dtype=torch.long)
+        target_logits = logits.gather(dim=1, index=targets[:, None])
+        ranks = (logits >= target_logits).sum(dim=1)
         total_loss += float(loss.detach().cpu()) * batch_size
         total_correct += int((logits.argmax(dim=-1) == targets).sum().detach().cpu())
+        total_rank += float(ranks.sum().detach().cpu())
+        total_reciprocal_rank += float((1.0 / ranks.to(dtype=torch.float32)).sum().detach().cpu())
+        total_recall_at_2 += int((ranks <= 2).sum().detach().cpu())
+        total_recall_at_3 += int((ranks <= 3).sum().detach().cpu())
+        total_recall_at_5 += int((ranks <= 5).sum().detach().cpu())
         total_examples += batch_size
         if tqdm is not None and hasattr(progress_bar, "set_postfix"):
             progress_bar.set_postfix(
@@ -430,6 +442,12 @@ def evaluate(
     return {
         "loss": total_loss / max(total_examples, 1),
         "accuracy": total_correct / max(total_examples, 1),
+        "mean_rank": total_rank / max(total_examples, 1),
+        "mrr": total_reciprocal_rank / max(total_examples, 1),
+        "recall_at_1": total_correct / max(total_examples, 1),
+        "recall_at_2": total_recall_at_2 / max(total_examples, 1),
+        "recall_at_3": total_recall_at_3 / max(total_examples, 1),
+        "recall_at_5": total_recall_at_5 / max(total_examples, 1),
     }
 
 
@@ -451,6 +469,18 @@ def save_checkpoint(
         "metrics": metrics,
     }
     torch.save(checkpoint, output_dir / name)
+
+
+def checkpoint_metric_direction(metric_name: str) -> str:
+    if metric_name in {"loss", "mean_rank"}:
+        return "min"
+    return "max"
+
+
+def is_better_checkpoint(metric_name: str, value: float, best_value: float) -> bool:
+    if checkpoint_metric_direction(metric_name) == "min":
+        return value < best_value
+    return value > best_value
 
 
 def melody_encoder_state_from_checkpoint(checkpoint: dict[str, Any]) -> dict[str, torch.Tensor]:
@@ -558,6 +588,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-split", default="train")
     parser.add_argument("--val-split", default="val")
     parser.add_argument("--no-val", action="store_true")
+    parser.add_argument(
+        "--best-checkpoint-metric",
+        choices=[
+            "loss",
+            "accuracy",
+            "mrr",
+            "mean_rank",
+            "recall_at_1",
+            "recall_at_2",
+            "recall_at_3",
+            "recall_at_5",
+        ],
+        default="mrr",
+        help=(
+            "Validation metric used to save best.pt. Defaults to mrr because it is "
+            "less noisy than top-1 on small validation sets while still rewarding rank."
+        ),
+    )
     parser.add_argument("--device", default="auto")
     parser.add_argument("--amp", action="store_true", help="Use CUDA mixed precision.")
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
@@ -749,7 +797,9 @@ def main() -> None:
     with (args.output_dir / "config.json").open("w", encoding="utf-8") as handle:
         json.dump(vars(args), handle, indent=2, sort_keys=True, default=str)
 
-    best_val_loss = float("inf")
+    best_metric_name = args.best_checkpoint_metric
+    best_metric_direction = checkpoint_metric_direction(best_metric_name)
+    best_metric_value = float("inf") if best_metric_direction == "min" else -float("inf")
     for epoch in range(1, args.epochs + 1):
         train_metrics = train_one_epoch(
             model=model,
@@ -795,9 +845,25 @@ def main() -> None:
                 desc=f"val epoch {epoch}/{args.epochs}",
             )
             metrics["val"] = val_metrics
-            message += f" val_loss={val_metrics['loss']:.4f} val_acc={val_metrics['accuracy']:.4f}"
-            if val_metrics["loss"] < best_val_loss:
-                best_val_loss = val_metrics["loss"]
+            message += (
+                f" val_loss={val_metrics['loss']:.4f} "
+                f"val_acc={val_metrics['accuracy']:.4f} "
+                f"val_mrr={val_metrics['mrr']:.4f} "
+                f"val_mean_rank={val_metrics['mean_rank']:.2f} "
+                f"val_r@2={val_metrics['recall_at_2']:.4f}"
+            )
+            selected_metric_value = val_metrics[best_metric_name]
+            if is_better_checkpoint(
+                metric_name=best_metric_name,
+                value=selected_metric_value,
+                best_value=best_metric_value,
+            ):
+                best_metric_value = selected_metric_value
+                metrics["best_checkpoint"] = {
+                    "metric": best_metric_name,
+                    "direction": best_metric_direction,
+                    "value": best_metric_value,
+                }
                 save_checkpoint(args.output_dir, "best.pt", model, optimizer, epoch, args, metrics)
 
         print(message)
