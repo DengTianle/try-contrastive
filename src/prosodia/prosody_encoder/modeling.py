@@ -41,8 +41,8 @@ class HubertEncoder(nn.Module):
             self.hubert.freeze_feature_encoder()
 
         # Memory optimization: Enable gradient checkpointing for the transformer layers to trade computation for memory.
-        #if not freeze_hubert and hasattr(self.hubert, "gradient_checkpointing_enable"):
-        #    self.hubert.gradient_checkpointing_enable()
+        if not freeze_hubert and hasattr(self.hubert, "gradient_checkpointing_enable"):
+            self.hubert.gradient_checkpointing_enable()
 
     def set_hubert_trainable(self, trainable: bool) -> None:
         self.hubert_trainable = trainable

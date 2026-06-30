@@ -3,6 +3,7 @@ __pycache__/
 .DS_Store
 
 data/
+checkpoints/
 .vscode/
 *.npz
 *.wav
@@ -11,3 +12,5 @@ data/
 *.pt
 *.csv
 
+test_load.py
+results_10Jun.txt

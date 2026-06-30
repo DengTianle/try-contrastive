@@ -1,0 +1,397 @@
+30 songs:
+"max_negatives": 7,
+  "metrics": {
+    "loss": 2.100698240190035,
+    "mean_candidates": 8.0,
+    "mean_rank": 3.6904761904761907,
+    "median_rank": 3.5,
+    "mrr": 0.41309524114642826,
+    "num_examples": 42.0,
+    "recall@1": 0.19047619047619047,
+    "recall@2": 0.3333333333333333,
+    "recall@3": 0.5,
+    "recall@5": 0.7857142857142857,
+    "top1_accuracy": 0.19047619047619047
+  },
+  "split": "test",
+  "temperature": 0.07
+"metrics": {
+    "alignment_margin_mean": 0.22966782748699188,
+    "audio_dim": 256.0,
+    "audio_effective_rank": 4.899561834608059,
+    "audio_feature_std_mean": 0.04444694519042969,
+    "audio_feature_std_min": 0.01937004178762436,
+    "audio_mean_pairwise_cosine": 0.4079034924507141,
+    "audio_norm_mean": 1.0,
+    "audio_norm_std": 3.316096197636398e-08,
+    "audio_num_examples": 42.0,
+    "audio_participation_ratio": 2.3306407928466797,
+    "audio_pitch_probe_baseline_mae_semitones": 1.067172226152922,
+    "audio_pitch_probe_mae_semitones": 3.631121359373394,
+    "audio_pitch_probe_r2": -8.245449814383548,
+    "audio_pitch_probe_split": "grouped_by_song",
+    "audio_pitch_probe_test_examples": 19.0,
+    "audio_pitch_probe_train_examples": 23.0,
+    "audio_std_pairwise_cosine": 0.3892967700958252,
+    "audio_top_singular_variance_fraction": 0.6434821486473083,
+    "cross_song_negative_cosine_mean": 0.27003902196884155,
+    "melody_dim": 256.0,
+    "melody_effective_rank": 4.228018147809511,
+    "melody_feature_std_mean": 0.040417999029159546,
+    "melody_feature_std_min": 0.01111592072993517,
+    "melody_mean_pairwise_cosine": 0.5136918425559998,
+    "melody_norm_mean": 1.0,
+    "melody_norm_std": 3.316096197636398e-08,
+    "melody_num_examples": 42.0,
+    "melody_participation_ratio": 2.946833848953247,
+    "melody_pitch_probe_baseline_mae_semitones": 1.067172226152922,
+    "melody_pitch_probe_mae_semitones": 0.4750644156807347,
+    "melody_pitch_probe_r2": 0.7697032532437321,
+    "melody_pitch_probe_split": "grouped_by_song",
+    "melody_pitch_probe_test_examples": 19.0,
+    "melody_pitch_probe_train_examples": 23.0,
+    "melody_std_pairwise_cosine": 0.34380629658699036,
+    "melody_top_singular_variance_fraction": 0.5231272578239441,
+    "modality_centroid_cosine": 0.6536619663238525,
+    "modality_centroid_l2_distance": 0.5759918689727783,
+    "modality_probe_accuracy": 1.0,
+    "modality_probe_chance": 0.5,
+    "num_examples": 42.0,
+    "num_songs": 3.0,
+    "pitch_label_mean_semitones_from_a4": 4.132127764679137,
+    "pitch_label_std_semitones": 2.1040760300757926,
+    "positive_cosine_mean": 0.49970677495002747,
+    "positive_cosine_std": 0.1359090954065323,
+    "positive_vs_cross_song_auc": 0.822562358276644
+  },
+  "split": "test"
+
+
+50 songs:
+
+epoch=1 train_loss=3.0337 train_hard_loss=2.0341 train_global_loss=1.9993 train_acc=0.1962 train_global_acc=0.2041 val_loss=1.8386 val_acc=0.2051
+epoch=2 train_loss=2.7988 train_hard_loss=1.8955 train_global_loss=1.8151 train_acc=0.2245 train_global_acc=0.2571 val_loss=1.7020 val_acc=0.2308
+epoch=3 train_loss=2.6204 train_hard_loss=1.7835 train_global_loss=1.6764 train_acc=0.2700 train_global_acc=0.3129 val_loss=1.7677 val_acc=0.2564
+epoch=4 train_loss=2.4700 train_hard_loss=1.6852 train_global_loss=1.5695 train_acc=0.3234 train_global_acc=0.3705 val_loss=1.5983 val_acc=0.2949
+epoch=5 train_loss=2.3764 train_hard_loss=1.6369 train_global_loss=1.4836 train_acc=0.3203 train_global_acc=0.3811 val_loss=1.5587 val_acc=0.3205
+epoch=6 train_loss=2.2271 train_hard_loss=1.5486 train_global_loss=1.3656 train_acc=0.3736 train_global_acc=0.4376 val_loss=1.6294 val_acc=0.3590
+epoch=7 train_loss=2.1329 train_hard_loss=1.4803 train_global_loss=1.3052 train_acc=0.4144 train_global_acc=0.4961 val_loss=1.6108 val_acc=0.4103
+epoch=8 train_loss=2.0010 train_hard_loss=1.3989 train_global_loss=1.2060 train_acc=0.4443 train_global_acc=0.5236 val_loss=1.6236 val_acc=0.3718
+epoch=9 train_loss=1.9827 train_hard_loss=1.4045 train_global_loss=1.1562 train_acc=0.4568 train_global_acc=0.5479 val_loss=1.5415 val_acc=0.3077
+epoch=10 train_loss=1.7455 train_hard_loss=1.2490 train_global_loss=0.9978 train_acc=0.4976 train_global_acc=0.6057 val_loss=1.7027 val_acc=0.3462
+epoch=11 train_loss=1.6609 train_hard_loss=1.1882 train_global_loss=0.9483 train_acc=0.5557 train_global_acc=0.6205 val_loss=1.6844 val_acc=0.3462
+epoch=12 train_loss=1.6296 train_hard_loss=1.1731 train_global_loss=0.9129 train_acc=0.5338 train_global_acc=0.6374 val_loss=1.8054 val_acc=0.3462
+
+Epoch 12: 
+"max_negatives": 7,
+  "metrics": {
+    "loss": 2.1105368586554043,
+    "mean_candidates": 8.0,
+    "mean_rank": 2.8550724637681157,
+    "median_rank": 2.0,
+    "mrr": 0.5452035903066829,
+    "num_examples": 69.0,
+    "recall@1": 0.3333333333333333,
+    "recall@2": 0.5362318840579711,
+    "recall@3": 0.6376811594202898,
+    "recall@5": 0.8985507246376812,
+    "top1_accuracy": 0.3333333333333333
+  },
+  "split": "test",
+  "temperature": 0.07
+
+"alignment_margin_mean": 0.29138240218162537,
+    "audio_dim": 256.0,
+    "audio_effective_rank": 7.1885970873457286,
+    "audio_feature_std_mean": 0.0468483492732048,
+    "audio_feature_std_min": 0.021414630115032196,
+    "audio_mean_pairwise_cosine": 0.36712703108787537,
+    "audio_norm_mean": 1.0,
+    "audio_norm_std": 3.4412757088375656e-08,
+    "audio_num_examples": 69.0,
+    "audio_participation_ratio": 3.0396528244018555,
+    "audio_pitch_probe_baseline_mae_semitones": 6.616596870952183,
+    "audio_pitch_probe_mae_semitones": 6.326391710175408,
+    "audio_pitch_probe_r2": -13.080925736817406,
+    "audio_pitch_probe_split": "grouped_by_song",
+    "audio_pitch_probe_test_examples": 9.0,
+    "audio_pitch_probe_train_examples": 60.0,
+    "audio_std_pairwise_cosine": 0.37559571862220764,
+    "audio_top_singular_variance_fraction": 0.5577511787414551,
+    "cross_song_negative_cosine_mean": 0.09042149782180786,
+    "melody_dim": 256.0,
+    "melody_effective_rank": 8.15195309137541,
+    "melody_feature_std_mean": 0.0534047856926918,
+    "melody_feature_std_min": 0.024003393948078156,
+    "melody_mean_pairwise_cosine": 0.2022973895072937,
+    "melody_norm_mean": 1.0,
+    "melody_norm_std": 3.2090060386735786e-08,
+    "melody_num_examples": 69.0,
+    "melody_participation_ratio": 5.501354217529297,
+    "melody_pitch_probe_baseline_mae_semitones": 6.616596870952183,
+    "melody_pitch_probe_mae_semitones": 0.7453614605797662,
+    "melody_pitch_probe_r2": 0.7700531058042083,
+    "melody_pitch_probe_split": "grouped_by_song",
+    "melody_pitch_probe_test_examples": 9.0,
+    "melody_pitch_probe_train_examples": 60.0,
+    "melody_std_pairwise_cosine": 0.3333876430988312,
+    "melody_top_singular_variance_fraction": 0.28673604130744934,
+    "modality_centroid_cosine": 0.500832200050354,
+    "modality_centroid_l2_distance": 0.5531768202781677,
+    "modality_probe_accuracy": 1.0,
+    "modality_probe_chance": 0.5,
+    "num_examples": 69.0,
+    "num_songs": 5.0,
+    "pitch_label_mean_semitones_from_a4": -0.2912957928534867,
+    "pitch_label_std_semitones": 4.278447747703134,
+    "positive_cosine_mean": 0.38180387020111084,
+    "positive_cosine_std": 0.16858254373073578,
+    "positive_vs_cross_song_auc": 0.8304977945809703
+  },
+  "split": "test"
+
+No pretrain:
+epoch=1 train_loss=3.1790 train_hard_loss=2.1280 train_global_loss=2.1021 train_acc=0.1381 train_global_acc=0.1366 val_loss=2.0047 val_acc=0.2179
+epoch=2 train_loss=2.9528 train_hard_loss=1.9814 train_global_loss=1.9519 train_acc=0.2072 train_global_acc=0.2192 val_loss=1.8249 val_acc=0.2308
+epoch=3 train_loss=2.8974 train_hard_loss=1.9473 train_global_loss=1.9032 train_acc=0.1837 train_global_acc=0.2390 val_loss=1.9008 val_acc=0.2564
+epoch=4 train_loss=2.7916 train_hard_loss=1.8937 train_global_loss=1.7958 train_acc=0.2104 train_global_acc=0.2794 val_loss=1.8535 val_acc=0.1923
+epoch=5 train_loss=2.7877 train_hard_loss=1.8924 train_global_loss=1.7963 train_acc=0.2261 train_global_acc=0.2787 val_loss=1.8895 val_acc=0.2436
+epoch=6 train_loss=2.7082 train_hard_loss=1.8665 train_global_loss=1.6942 train_acc=0.2496 train_global_acc=0.3112 val_loss=1.9082 val_acc=0.2179
+epoch=7 train_loss=2.6710 train_hard_loss=1.8371 train_global_loss=1.6677 train_acc=0.2433 train_global_acc=0.3438 val_loss=1.8440 val_acc=0.2564
+epoch=8 train_loss=2.5853 train_hard_loss=1.8083 train_global_loss=1.5564 train_acc=0.2684 train_global_acc=0.4104 val_loss=1.9828 val_acc=0.2179
+epoch=9 train_loss=2.4919 train_hard_loss=1.7663 train_global_loss=1.4513 train_acc=0.2998 train_global_acc=0.4396 val_loss=1.9499 val_acc=0.2179
+epoch=10 train_loss=2.4305 train_hard_loss=1.7325 train_global_loss=1.4025 train_acc=0.2920 train_global_acc=0.4322 val_loss=1.9486 val_acc=0.2436
+epoch=11 train_loss=2.3330 train_hard_loss=1.6803 train_global_loss=1.3096 train_acc=0.3532 train_global_acc=0.4661 val_loss=1.9240 val_acc=0.2692
+epoch=12 train_loss=2.2788 train_hard_loss=1.6463 train_global_loss=1.2650 train_acc=0.3312 train_global_acc=0.5102 val_loss=2.1179 val_acc=0.2436
+
+  "max_negatives": 7,
+  "metrics": {
+    "loss": 2.006599003854005,
+    "mean_candidates": 8.0,
+    "mean_rank": 3.5217391304347827,
+    "median_rank": 3.0,
+    "mrr": 0.4561421700577805,
+    "num_examples": 69.0,
+    "recall@1": 0.2463768115942029,
+    "recall@2": 0.37681159420289856,
+    "recall@3": 0.5652173913043478,
+    "recall@5": 0.8260869565217391,
+    "top1_accuracy": 0.2463768115942029
+  },
+  "split": "test",
+  "temperature": 0.07
+"metrics": {
+    "alignment_margin_mean": 0.01775071769952774,
+    "audio_dim": 256.0,
+    "audio_effective_rank": 14.244133375707658,
+    "audio_feature_std_mean": 0.0256878100335598,
+    "audio_feature_std_min": 0.014554533176124096,
+    "audio_mean_pairwise_cosine": 0.8198288083076477,
+    "audio_norm_mean": 1.0,
+    "audio_norm_std": 4.1840323206088215e-08,
+    "audio_num_examples": 69.0,
+    "audio_participation_ratio": 7.577719688415527,
+    "audio_pitch_probe_baseline_mae_semitones": 6.616596870952183,
+    "audio_pitch_probe_mae_semitones": 6.331948810153538,
+    "audio_pitch_probe_r2": -10.661917685223747,
+    "audio_pitch_probe_split": "grouped_by_song",
+    "audio_pitch_probe_test_examples": 9.0,
+    "audio_pitch_probe_train_examples": 60.0,
+    "audio_std_pairwise_cosine": 0.08213590830564499,
+    "audio_top_singular_variance_fraction": 0.26885029673576355,
+    "cross_song_negative_cosine_mean": 0.35870110988616943,
+    "melody_dim": 256.0,
+    "melody_effective_rank": 4.941528064817447,
+    "melody_feature_std_mean": 0.04771449416875839,
+    "melody_feature_std_min": 0.019542312249541283,
+    "melody_mean_pairwise_cosine": 0.3367261588573456,
+    "melody_norm_mean": 1.0,
+    "melody_norm_std": 3.864155218025189e-08,
+    "melody_num_examples": 69.0,
+    "melody_participation_ratio": 3.87904691696167,
+    "melody_pitch_probe_baseline_mae_semitones": 6.616596870952183,
+    "melody_pitch_probe_mae_semitones": 0.7419145637088351,
+    "melody_pitch_probe_r2": 0.7651005171110797,
+    "melody_pitch_probe_split": "grouped_by_song",
+    "melody_pitch_probe_test_examples": 9.0,
+    "melody_pitch_probe_train_examples": 60.0,
+    "melody_std_pairwise_cosine": 0.3455119729042053,
+    "melody_top_singular_variance_fraction": 0.34190571308135986,
+    "modality_centroid_cosine": 0.6480315923690796,
+    "modality_centroid_l2_distance": 0.690696120262146,
+    "modality_probe_accuracy": 1.0,
+    "modality_probe_chance": 0.5,
+    "num_examples": 69.0,
+    "num_songs": 5.0,
+    "pitch_label_mean_semitones_from_a4": -0.2912957928534867,
+    "pitch_label_std_semitones": 4.278447747703134,
+    "positive_cosine_mean": 0.3764518201351166,
+    "positive_cosine_std": 0.1380668580532074,
+    "positive_vs_cross_song_auc": 0.534761604704894
+  },
+  "split": "test"
+
+
+No extraction:
+epoch=1 train_loss=3.1340 train_hard_loss=2.0991 train_global_loss=2.0698 train_acc=0.1601 train_global_acc=0.1680 val_loss=2.0021 val_acc=0.1795
+epoch=2 train_loss=2.9740 train_hard_loss=1.9930 train_global_loss=1.9712 train_acc=0.2057 train_global_acc=0.2129 val_loss=2.0429 val_acc=0.1795
+epoch=3 train_loss=2.8635 train_hard_loss=1.9309 train_global_loss=1.8682 train_acc=0.2323 train_global_acc=0.2689 val_loss=2.0463 val_acc=0.2436
+epoch=4 train_loss=2.7694 train_hard_loss=1.8656 train_global_loss=1.8075 train_acc=0.2386 train_global_acc=0.2810 val_loss=2.0340 val_acc=0.2179
+epoch=5 train_loss=2.7144 train_hard_loss=1.8368 train_global_loss=1.7607 train_acc=0.2465 train_global_acc=0.3039 val_loss=1.9721 val_acc=0.2692
+epoch=6 train_loss=2.6144 train_hard_loss=1.7933 train_global_loss=1.6526 train_acc=0.2732 train_global_acc=0.3570 val_loss=2.0196 val_acc=0.2308
+epoch=7 train_loss=2.5361 train_hard_loss=1.7366 train_global_loss=1.5989 train_acc=0.3030 train_global_acc=0.3846 val_loss=2.0332 val_acc=0.2564
+epoch=8 train_loss=2.4155 train_hard_loss=1.6706 train_global_loss=1.4922 train_acc=0.3218 train_global_acc=0.4135 val_loss=2.0531 val_acc=0.2436
+epoch=9 train_loss=2.3449 train_hard_loss=1.6209 train_global_loss=1.4481 train_acc=0.3611 train_global_acc=0.4333 val_loss=2.1040 val_acc=0.2564
+epoch=10 train_loss=2.2208 train_hard_loss=1.5591 train_global_loss=1.3297 train_acc=0.3752 train_global_acc=0.4921 val_loss=2.0813 val_acc=0.2692
+epoch=11 train_loss=2.1868 train_hard_loss=1.5387 train_global_loss=1.3002 train_acc=0.3846 train_global_acc=0.4898 val_loss=2.1542 val_acc=0.2179
+epoch=12 train_loss=2.1031 train_hard_loss=1.4873 train_global_loss=1.2316 train_acc=0.4207 train_global_acc=0.5385 val_loss=2.2248 val_acc=0.2821
+
+"max_negatives": 7,
+  "metrics": {
+    "loss": 1.9774105607167534,
+    "mean_candidates": 8.0,
+    "mean_rank": 3.246376811594203,
+    "median_rank": 3.0,
+    "mrr": 0.4547274009041164,
+    "num_examples": 69.0,
+    "recall@1": 0.18840579710144928,
+    "recall@2": 0.4782608695652174,
+    "recall@3": 0.6231884057971014,
+    "recall@5": 0.8405797101449275,
+    "top1_accuracy": 0.18840579710144928
+  },
+  "split": "test",
+  "temperature": 0.07
+"metrics": {
+    "alignment_margin_mean": 0.07682015001773834,
+    "audio_dim": 256.0,
+    "audio_effective_rank": 14.130521817560362,
+    "audio_feature_std_mean": 0.032270655035972595,
+    "audio_feature_std_min": 0.017785480245947838,
+    "audio_mean_pairwise_cosine": 0.7173956632614136,
+    "audio_norm_mean": 1.0,
+    "audio_norm_std": 4.1840323206088215e-08,
+    "audio_num_examples": 69.0,
+    "audio_participation_ratio": 7.904931545257568,
+    "audio_pitch_probe_baseline_mae_semitones": 6.616596870952183,
+    "audio_pitch_probe_mae_semitones": 7.3465695646074085,
+    "audio_pitch_probe_r2": -15.733580740674544,
+    "audio_pitch_probe_split": "grouped_by_song",
+    "audio_pitch_probe_test_examples": 9.0,
+    "audio_pitch_probe_train_examples": 60.0,
+    "audio_std_pairwise_cosine": 0.13069292902946472,
+    "audio_top_singular_variance_fraction": 0.24924632906913757,
+    "cross_song_negative_cosine_mean": 0.3044653832912445,
+    "melody_dim": 256.0,
+    "melody_effective_rank": 5.9266068411729105,
+    "melody_feature_std_mean": 0.0516522079706192,
+    "melody_feature_std_min": 0.020560327917337418,
+    "melody_mean_pairwise_cosine": 0.24222995340824127,
+    "melody_norm_mean": 1.0,
+    "melody_norm_std": 3.515290103450752e-08,
+    "melody_num_examples": 69.0,
+    "melody_participation_ratio": 4.082788467407227,
+    "melody_pitch_probe_baseline_mae_semitones": 6.616596870952183,
+    "melody_pitch_probe_mae_semitones": 0.7527317470974393,
+    "melody_pitch_probe_r2": 0.8076368341259024,
+    "melody_pitch_probe_split": "grouped_by_song",
+    "melody_pitch_probe_test_examples": 9.0,
+    "melody_pitch_probe_train_examples": 60.0,
+    "melody_std_pairwise_cosine": 0.3807176649570465,
+    "melody_top_singular_variance_fraction": 0.384695440530777,
+    "modality_centroid_cosine": 0.6789392828941345,
+    "modality_centroid_l2_distance": 0.6279451251029968,
+    "modality_probe_accuracy": 1.0,
+    "modality_probe_chance": 0.5,
+    "num_examples": 69.0,
+    "num_songs": 5.0,
+    "pitch_label_mean_semitones_from_a4": -0.2912957928534867,
+    "pitch_label_std_semitones": 4.278447747703134,
+    "positive_cosine_mean": 0.38128554821014404,
+    "positive_cosine_std": 0.12940487265586853,
+    "positive_vs_cross_song_auc": 0.6339004410838059
+  },
+  "split": "test"
+
+
+
+
+90 songs:
+
+epoch=1 train_loss=2.8505 train_hard_loss=1.9201 train_global_loss=1.8607 train_acc=0.2277 train_global_acc=0.2414 val_loss=1.8098 val_acc=0.2867 val_mrr=0.5045 val_mean_rank=3.13 val_r@2=0.4755
+epoch=2 train_loss=2.5276 train_hard_loss=1.7199 train_global_loss=1.6224 train_acc=0.3125 train_global_acc=0.3835 val_loss=1.6909 val_acc=0.3147 val_mrr=0.5354 val_mean_rank=2.92 val_r@2=0.5455
+epoch=3 train_loss=2.3784 train_hard_loss=1.6212 train_global_loss=1.5169 train_acc=0.3502 train_global_acc=0.3868 val_loss=1.7147 val_acc=0.2937 val_mrr=0.5273 val_mean_rank=2.85 val_r@2=0.5245
+epoch=4 train_loss=2.2633 train_hard_loss=1.5609 train_global_loss=1.4108 train_acc=0.3604 train_global_acc=0.4342 val_loss=1.7203 val_acc=0.3147 val_mrr=0.5321 val_mean_rank=2.90 val_r@2=0.5105
+epoch=5 train_loss=2.1404 train_hard_loss=1.4803 train_global_loss=1.3202 train_acc=0.3896 train_global_acc=0.4743 val_loss=1.7642 val_acc=0.3007 val_mrr=0.5258 val_mean_rank=2.94 val_r@2=0.5105
+epoch=6 train_loss=2.0597 train_hard_loss=1.4248 train_global_loss=1.2719 train_acc=0.4127 train_global_acc=0.4966 val_loss=1.7212 val_acc=0.3357 val_mrr=0.5334 val_mean_rank=2.97 val_r@2=0.4825
+epoch=7 train_loss=2.0057 train_hard_loss=1.3802 train_global_loss=1.2530 train_acc=0.4529 train_global_acc=0.5009 val_loss=1.7647 val_acc=0.3217 val_mrr=0.5408 val_mean_rank=2.86 val_r@2=0.5315
+epoch=8 train_loss=1.8838 train_hard_loss=1.3256 train_global_loss=1.1175 train_acc=0.4795 train_global_acc=0.5484 val_loss=1.6924 val_acc=0.3706 val_mrr=0.5643 val_mean_rank=2.84 val_r@2=0.5315
+epoch=9 train_loss=1.8332 train_hard_loss=1.2806 train_global_loss=1.1080 train_acc=0.5163 train_global_acc=0.5605 val_loss=2.0495 val_acc=0.3287 val_mrr=0.5306 val_mean_rank=3.01 val_r@2=0.4825
+epoch=10 train_loss=1.7657 train_hard_loss=1.2274 train_global_loss=1.0794 train_acc=0.5077 train_global_acc=0.5760 val_loss=1.7414 val_acc=0.3357 val_mrr=0.5551 val_mean_rank=2.75 val_r@2=0.5385
+epoch=11 train_loss=1.7009 train_hard_loss=1.1842 train_global_loss=1.0378 train_acc=0.5154 train_global_acc=0.6079 val_loss=1.8691 val_acc=0.3287 val_mrr=0.5368 val_mean_rank=2.94 val_r@2=0.5035
+epoch=12 train_loss=1.5963 train_hard_loss=1.1165 train_global_loss=0.9596 train_acc=0.5693 train_global_acc=0.6276 val_loss=1.8922 val_acc=0.3007 val_mrr=0.5403 val_mean_rank=2.78 val_r@2=0.5594
+
+Epoch 12: (evaluation results turn out to be better than the epoch with highest mrr)
+  "max_negatives": 7,
+  "metrics": {
+    "loss": 1.8874836428468276,
+    "mean_candidates": 7.917241379310345,
+    "mean_rank": 2.6620689655172414,
+    "median_rank": 2.0,
+    "mrr": 0.5886781627761907,
+    "num_examples": 145.0,
+    "recall@1": 0.38620689655172413,
+    "recall@2": 0.6,
+    "recall@3": 0.7172413793103448,
+    "recall@5": 0.903448275862069,
+    "top1_accuracy": 0.38620689655172413
+  },
+  "split": "test",
+  "temperature": 0.07
+"alignment_margin_mean": 0.22234705090522766,
+    "audio_dim": 256.0,
+    "audio_effective_rank": 8.599807641476493,
+    "audio_feature_std_mean": 0.04634557664394379,
+    "audio_feature_std_min": 0.022392109036445618,
+    "audio_mean_pairwise_cosine": 0.3964252471923828,
+    "audio_norm_mean": 1.0,
+    "audio_norm_std": 3.802087533699705e-08,
+    "audio_num_examples": 145.0,
+    "audio_participation_ratio": 3.7938148975372314,
+    "audio_pitch_probe_baseline_mae_semitones": 6.242212391105191,
+    "audio_pitch_probe_mae_semitones": 7.23626185285634,
+    "audio_pitch_probe_r2": -0.7672886371470509,
+    "audio_pitch_probe_split": "grouped_by_song",
+    "audio_pitch_probe_test_examples": 29.0,
+    "audio_pitch_probe_train_examples": 116.0,
+    "audio_std_pairwise_cosine": 0.4038119614124298,
+    "audio_top_singular_variance_fraction": 0.4813922643661499,
+    "cross_song_negative_cosine_mean": 0.18720829486846924,
+    "melody_dim": 256.0,
+    "melody_effective_rank": 8.293389294282147,
+    "melody_feature_std_mean": 0.052955262362957,
+    "melody_feature_std_min": 0.015520949847996235,
+    "melody_mean_pairwise_cosine": 0.2234056442975998,
+    "melody_norm_mean": 1.0,
+    "melody_norm_std": 3.357182976060358e-08,
+    "melody_num_examples": 145.0,
+    "melody_participation_ratio": 5.80121374130249,
+    "melody_pitch_probe_baseline_mae_semitones": 6.242212391105191,
+    "melody_pitch_probe_mae_semitones": 1.0285391519809592,
+    "melody_pitch_probe_r2": 0.9442736483235807,
+    "melody_pitch_probe_split": "grouped_by_song",
+    "melody_pitch_probe_test_examples": 29.0,
+    "melody_pitch_probe_train_examples": 116.0,
+    "melody_std_pairwise_cosine": 0.3469405174255371,
+    "melody_top_singular_variance_fraction": 0.26905691623687744,
+    "modality_centroid_cosine": 0.5906736850738525,
+    "modality_centroid_l2_distance": 0.5212796330451965,
+    "modality_probe_accuracy": 1.0,
+    "modality_probe_chance": 0.5,
+    "num_examples": 145.0,
+    "num_songs": 9.0,
+    "pitch_label_mean_semitones_from_a4": -1.8680609872628902,
+    "pitch_label_std_semitones": 5.509336320528709,
+    "positive_cosine_mean": 0.4095553457736969,
+    "positive_cosine_std": 0.1881464719772339,
+    "positive_vs_cross_song_auc": 0.7457788347205707
