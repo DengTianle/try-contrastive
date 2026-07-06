@@ -18,8 +18,8 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from prosodia.datasets import MelodyOnlyDataset, melody_only_collate
-from prosodia.melody_encoder import MelodyMaskedProsodyModel
+from prosodia.datasets import MelodyConfig, MelodyOnlyDataset, melody_only_collate
+from prosodia.melody_encoder import MelodyMaskedTokenModel
 
 
 try:
@@ -64,20 +64,20 @@ def maybe_progress(iterable: Any, enabled: bool, **kwargs: Any) -> Any:
 def random_span_mask(
     attention_mask: torch.Tensor,
     mask_prob: float,
-    mask_span_frames: int,
+    mask_span_tokens: int,
 ) -> torch.Tensor:
     if not 0.0 < mask_prob < 1.0:
         raise ValueError("mask_prob must be in (0, 1)")
-    if mask_span_frames <= 0:
-        raise ValueError("mask_span_frames must be positive")
+    if mask_span_tokens <= 0:
+        raise ValueError("mask_span_tokens must be positive")
 
-    frame_mask = torch.zeros_like(attention_mask, dtype=torch.bool)
+    token_mask = torch.zeros_like(attention_mask, dtype=torch.bool)
     for batch_index, valid_length_tensor in enumerate(attention_mask.sum(dim=1)):
         valid_length = int(valid_length_tensor.detach().cpu())
         if valid_length <= 0:
             continue
-        target_frames = max(1, int(round(valid_length * mask_prob)))
-        num_spans = max(1, math.ceil(target_frames / mask_span_frames))
+        target_tokens = max(1, int(round(valid_length * mask_prob)))
+        num_spans = max(1, math.ceil(target_tokens / mask_span_tokens))
         starts = torch.randint(
             low=0,
             high=valid_length,
@@ -86,55 +86,9 @@ def random_span_mask(
         )
         for start_tensor in starts:
             start = int(start_tensor.detach().cpu())
-            end = min(start + mask_span_frames, valid_length)
-            frame_mask[batch_index, start:end] = True
-    return frame_mask & attention_mask.to(dtype=torch.bool)
-
-
-def augment_melody_inputs(
-    melody_features: torch.Tensor,
-    melody_voiced: torch.Tensor,
-    melody_attention_mask: torch.Tensor,
-    transpose_semitones: float,
-    pitch_noise_std: float,
-    pitch_dropout_prob: float,
-) -> torch.Tensor:
-    augmented = melody_features.clone()
-    voiced = melody_voiced.to(dtype=torch.bool) & melody_attention_mask.to(dtype=torch.bool)
-
-    if transpose_semitones > 0.0:
-        shifts = torch.empty(
-            melody_features.shape[0],
-            1,
-            device=melody_features.device,
-            dtype=melody_features.dtype,
-        ).uniform_(-transpose_semitones / 12.0, transpose_semitones / 12.0)
-        augmented[..., 0] = torch.where(voiced, augmented[..., 0] + shifts, augmented[..., 0])
-
-    if pitch_noise_std > 0.0:
-        noise = torch.randn_like(augmented[..., 0]) * pitch_noise_std
-        augmented[..., 0] = torch.where(voiced, augmented[..., 0] + noise, augmented[..., 0])
-
-    if pitch_dropout_prob > 0.0:
-        pitch_dropout = torch.rand_like(augmented[..., 0]) < pitch_dropout_prob
-        augmented[..., 0] = torch.where(voiced & pitch_dropout, torch.zeros_like(augmented[..., 0]), augmented[..., 0])
-
-    return augmented
-
-
-def build_prosody_targets(
-    melody_features: torch.Tensor,
-    melody_voiced: torch.Tensor,
-    melody_attention_mask: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    log_f0 = melody_features[..., 0]
-    voiced = melody_voiced.to(dtype=torch.bool) & melody_attention_mask.to(dtype=torch.bool)
-
-    delta = torch.zeros_like(log_f0)
-    delta_valid = torch.zeros_like(voiced, dtype=torch.bool)
-    delta[:, 1:] = log_f0[:, 1:] - log_f0[:, :-1]
-    delta_valid[:, 1:] = voiced[:, 1:] & voiced[:, :-1]
-    return delta, delta_valid
+            end = min(start + mask_span_tokens, valid_length)
+            token_mask[batch_index, start:end] = True
+    return token_mask & attention_mask.to(dtype=torch.bool)
 
 
 def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -144,82 +98,47 @@ def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 
 def pretrain_step(
-    model: MelodyMaskedProsodyModel,
+    model: MelodyMaskedTokenModel,
     batch: dict[str, Any],
     mask_prob: float,
-    mask_span_frames: int,
-    transpose_semitones: float,
-    pitch_noise_std: float,
-    pitch_dropout_prob: float,
-    delta_loss_weight: float,
-    voiced_loss_weight: float,
+    mask_span_tokens: int,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     attention_mask = batch["melody_attention_mask"].to(dtype=torch.bool)
-    frame_mask = random_span_mask(
+    token_mask = random_span_mask(
         attention_mask=attention_mask,
         mask_prob=mask_prob,
-        mask_span_frames=mask_span_frames,
+        mask_span_tokens=mask_span_tokens,
     )
-    melody_inputs = augment_melody_inputs(
-        melody_features=batch["melody_features"],
-        melody_voiced=batch["melody_voiced"],
-        melody_attention_mask=attention_mask,
-        transpose_semitones=transpose_semitones,
-        pitch_noise_std=pitch_noise_std,
-        pitch_dropout_prob=pitch_dropout_prob,
-    )
-    delta_targets, delta_valid = build_prosody_targets(
-        melody_features=batch["melody_features"],
-        melody_voiced=batch["melody_voiced"],
-        melody_attention_mask=attention_mask,
-    )
+    token_targets = batch["melody_token_ids"]
+    melody_inputs = token_targets.masked_fill(token_mask, model.mask_token_id)
 
     outputs = model(
-        melody_features=melody_inputs,
+        melody_token_ids=melody_inputs,
         melody_attention_mask=attention_mask,
-        frame_mask=frame_mask,
     )
 
-    voiced_loss_mask = frame_mask & attention_mask
-    delta_loss_mask = frame_mask & delta_valid
-    delta_loss = masked_mean(
-        F.smooth_l1_loss(outputs["delta_log_f0"], delta_targets, reduction="none"),
-        delta_loss_mask,
-    )
-    voiced_loss = masked_mean(
-        F.binary_cross_entropy_with_logits(
-            outputs["voiced_logits"],
-            batch["melody_voiced"].to(dtype=outputs["voiced_logits"].dtype),
-            reduction="none",
-        ),
-        voiced_loss_mask,
-    )
-    loss = delta_loss_weight * delta_loss + voiced_loss_weight * voiced_loss
+    loss_mask = token_mask & attention_mask
+    if not bool(loss_mask.any()):
+        loss = outputs["token_logits"].new_zeros(())
+    else:
+        loss = F.cross_entropy(outputs["token_logits"][loss_mask], token_targets[loss_mask])
 
     with torch.no_grad():
-        voiced_predictions = outputs["voiced_logits"].sigmoid() >= 0.5
-        voiced_accuracy = masked_mean(
-            (voiced_predictions == batch["melody_voiced"].to(dtype=torch.bool)).to(dtype=torch.float32),
-            voiced_loss_mask,
-        )
-        delta_mae = masked_mean(
-            (outputs["delta_log_f0"] - delta_targets).abs(),
-            delta_loss_mask,
+        predictions = outputs["token_logits"].argmax(dim=-1)
+        token_accuracy = masked_mean(
+            (predictions == token_targets).to(dtype=torch.float32),
+            loss_mask,
         )
         metrics = {
             "loss": float(loss.detach().cpu()),
-            "delta_loss": float(delta_loss.detach().cpu()),
-            "voiced_loss": float(voiced_loss.detach().cpu()),
-            "delta_mae": float(delta_mae.detach().cpu()),
-            "voiced_accuracy": float(voiced_accuracy.detach().cpu()),
-            "masked_frames": float(voiced_loss_mask.sum().detach().cpu()),
-            "delta_frames": float(delta_loss_mask.sum().detach().cpu()),
+            "token_accuracy": float(token_accuracy.detach().cpu()),
+            "masked_tokens": float(loss_mask.sum().detach().cpu()),
         }
     return loss, metrics
 
 
 def train_one_epoch(
-    model: MelodyMaskedProsodyModel,
+    model: MelodyMaskedTokenModel,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -232,10 +151,8 @@ def train_one_epoch(
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     totals = {
         "loss": 0.0,
-        "delta_loss": 0.0,
-        "voiced_loss": 0.0,
-        "delta_mae": 0.0,
-        "voiced_accuracy": 0.0,
+        "token_accuracy": 0.0,
+        "masked_tokens": 0.0,
     }
     total_examples = 0
 
@@ -249,12 +166,7 @@ def train_one_epoch(
                 model=model,
                 batch=batch,
                 mask_prob=args.mask_prob,
-                mask_span_frames=args.mask_span_frames,
-                transpose_semitones=args.transpose_semitones,
-                pitch_noise_std=args.pitch_noise_std,
-                pitch_dropout_prob=args.pitch_dropout_prob,
-                delta_loss_weight=args.delta_loss_weight,
-                voiced_loss_weight=args.voiced_loss_weight,
+                mask_span_tokens=args.mask_span_tokens,
             )
 
         scaler.scale(loss).backward()
@@ -264,15 +176,14 @@ def train_one_epoch(
         scaler.step(optimizer)
         scaler.update()
 
-        batch_size = batch["melody_features"].shape[0]
+        batch_size = batch["melody_token_ids"].shape[0]
         for key in totals:
             totals[key] += metrics[key] * batch_size
         total_examples += batch_size
         if tqdm is not None and hasattr(progress_bar, "set_postfix"):
             progress_bar.set_postfix(
                 loss=totals["loss"] / max(total_examples, 1),
-                v_acc=totals["voiced_accuracy"] / max(total_examples, 1),
-                d_mae=totals["delta_mae"] / max(total_examples, 1),
+                acc=totals["token_accuracy"] / max(total_examples, 1),
             )
 
     return {key: value / max(total_examples, 1) for key, value in totals.items()}
@@ -280,7 +191,7 @@ def train_one_epoch(
 
 @torch.no_grad()
 def evaluate(
-    model: MelodyMaskedProsodyModel,
+    model: MelodyMaskedTokenModel,
     loader: DataLoader,
     device: torch.device,
     args: argparse.Namespace,
@@ -291,10 +202,8 @@ def evaluate(
     model.eval()
     totals = {
         "loss": 0.0,
-        "delta_loss": 0.0,
-        "voiced_loss": 0.0,
-        "delta_mae": 0.0,
-        "voiced_accuracy": 0.0,
+        "token_accuracy": 0.0,
+        "masked_tokens": 0.0,
     }
     total_examples = 0
 
@@ -306,23 +215,17 @@ def evaluate(
                 model=model,
                 batch=batch,
                 mask_prob=args.mask_prob,
-                mask_span_frames=args.mask_span_frames,
-                transpose_semitones=args.transpose_semitones,
-                pitch_noise_std=args.pitch_noise_std,
-                pitch_dropout_prob=args.pitch_dropout_prob,
-                delta_loss_weight=args.delta_loss_weight,
-                voiced_loss_weight=args.voiced_loss_weight,
+                mask_span_tokens=args.mask_span_tokens,
             )
 
-        batch_size = batch["melody_features"].shape[0]
+        batch_size = batch["melody_token_ids"].shape[0]
         for key in totals:
             totals[key] += metrics[key] * batch_size
         total_examples += batch_size
         if tqdm is not None and hasattr(progress_bar, "set_postfix"):
             progress_bar.set_postfix(
                 loss=totals["loss"] / max(total_examples, 1),
-                v_acc=totals["voiced_accuracy"] / max(total_examples, 1),
-                d_mae=totals["delta_mae"] / max(total_examples, 1),
+                acc=totals["token_accuracy"] / max(total_examples, 1),
             )
 
     return {key: value / max(total_examples, 1) for key, value in totals.items()}
@@ -331,7 +234,7 @@ def evaluate(
 def save_checkpoint(
     output_dir: Path,
     name: str,
-    model: MelodyMaskedProsodyModel,
+    model: MelodyMaskedTokenModel,
     optimizer: torch.optim.Optimizer,
     epoch: int,
     args: argparse.Namespace,
@@ -345,14 +248,20 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "args": vars(args),
         "metrics": metrics,
-        "objective": "masked_voicing_and_delta_log_f0",
+        "objective": "masked_note_token_modeling",
     }
     torch.save(checkpoint, output_dir / name)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Pretrain the melody encoder on masked prosody.")
-    parser.add_argument("--manifest", type=Path, default=Path("data/prepared90/segments_manifest.csv"))
+    parser = argparse.ArgumentParser(description="Pretrain the melody encoder on masked note tokens.")
+    parser.add_argument("--manifest", type=Path, default=Path("data/prepared_good/segments_manifest.csv"))
+    parser.add_argument(
+        "--quantization-dir",
+        type=Path,
+        default=None,
+        help="Directory containing events.jsonl and ratio_vocabulary.json. Defaults to <manifest-dir>/quantization.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("checkpoints/melody_pretrain"))
     parser.add_argument("--projection-dim", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -370,14 +279,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--melody-num-layers", type=int, default=4)
     parser.add_argument("--melody-num-heads", type=int, default=4)
     parser.add_argument("--melody-dim-feedforward", type=int, default=1024)
+    parser.add_argument("--melody-max-length", type=int, default=4096)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--mask-prob", type=float, default=0.35)
-    parser.add_argument("--mask-span-frames", type=int, default=5)
-    parser.add_argument("--transpose-semitones", type=float, default=12.0)
-    parser.add_argument("--pitch-noise-std", type=float, default=0.01)
-    parser.add_argument("--pitch-dropout-prob", type=float, default=0.1)
-    parser.add_argument("--delta-loss-weight", type=float, default=1.0)
-    parser.add_argument("--voiced-loss-weight", type=float, default=0.5)
+    parser.add_argument("--mask-span-tokens", type=int, default=3)
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
     parser.add_argument("--seed", type=int, default=13)
     return parser.parse_args()
@@ -386,21 +291,17 @@ def parse_args() -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> None:
     if not 0.0 < args.mask_prob < 1.0:
         raise SystemExit("--mask-prob must be in (0, 1)")
-    if args.mask_span_frames <= 0:
-        raise SystemExit("--mask-span-frames must be positive")
-    if args.transpose_semitones < 0.0:
-        raise SystemExit("--transpose-semitones must be non-negative")
-    if args.pitch_noise_std < 0.0:
-        raise SystemExit("--pitch-noise-std must be non-negative")
-    if not 0.0 <= args.pitch_dropout_prob < 1.0:
-        raise SystemExit("--pitch-dropout-prob must be in [0, 1)")
-    if args.delta_loss_weight < 0.0 or args.voiced_loss_weight < 0.0:
-        raise SystemExit("Loss weights must be non-negative")
+    if args.mask_span_tokens <= 0:
+        raise SystemExit("--mask-span-tokens must be positive")
+    if args.melody_max_length <= 0:
+        raise SystemExit("--melody-max-length must be positive")
 
 
 def main() -> None:
     args = parse_args()
     args.manifest = resolve_user_path(args.manifest)
+    if args.quantization_dir is not None:
+        args.quantization_dir = resolve_user_path(args.quantization_dir)
     args.output_dir = resolve_user_path(args.output_dir)
     validate_args(args)
 
@@ -415,9 +316,11 @@ def main() -> None:
     train_dataset = MelodyOnlyDataset(
         manifest_path=args.manifest,
         split=args.train_split,
+        melody_config=MelodyConfig(quantization_dir=args.quantization_dir),
     )
     if len(train_dataset) == 0:
         raise SystemExit(f"No melody training examples found for split={args.train_split}")
+    args.melody_vocab_size = train_dataset.melody_vocab_size
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -431,6 +334,7 @@ def main() -> None:
         val_dataset = MelodyOnlyDataset(
             manifest_path=args.manifest,
             split=args.val_split,
+            melody_config=MelodyConfig(quantization_dir=args.quantization_dir),
         )
         if len(val_dataset) > 0:
             val_loader = DataLoader(
@@ -441,13 +345,15 @@ def main() -> None:
                 collate_fn=melody_only_collate,
             )
 
-    model = MelodyMaskedProsodyModel(
+    model = MelodyMaskedTokenModel(
+        vocab_size=args.melody_vocab_size,
         projection_dim=args.projection_dim,
         d_model=args.melody_d_model,
         num_layers=args.melody_num_layers,
         num_heads=args.melody_num_heads,
         dim_feedforward=args.melody_dim_feedforward,
         dropout=args.dropout,
+        max_length=args.melody_max_length,
     ).to(device)
     optimizer = AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
@@ -476,8 +382,8 @@ def main() -> None:
         message = (
             f"epoch={epoch} "
             f"train_loss={train_metrics['loss']:.4f} "
-            f"train_delta_mae={train_metrics['delta_mae']:.4f} "
-            f"train_voiced_acc={train_metrics['voiced_accuracy']:.4f}"
+            f"train_token_acc={train_metrics['token_accuracy']:.4f} "
+            f"train_masked_tokens={train_metrics['masked_tokens']:.1f}"
         )
 
         if val_loader is not None:
@@ -493,8 +399,7 @@ def main() -> None:
             metrics["val"] = val_metrics
             message += (
                 f" val_loss={val_metrics['loss']:.4f} "
-                f"val_delta_mae={val_metrics['delta_mae']:.4f} "
-                f"val_voiced_acc={val_metrics['voiced_accuracy']:.4f}"
+                f"val_token_acc={val_metrics['token_accuracy']:.4f}"
             )
             if val_metrics["loss"] < best_val_loss:
                 best_val_loss = val_metrics["loss"]

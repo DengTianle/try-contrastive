@@ -13,21 +13,23 @@ class MelodyAudioContrastiveModel(nn.Module):
         hubert_model_name: str,
         projection_dim: int = 256,
         freeze_hubert: bool = False,
-        melody_input_dim: int = 2,
+        melody_vocab_size: int = 234,
         melody_d_model: int = 256,
         melody_num_layers: int = 4,
         melody_num_heads: int = 4,
         melody_dim_feedforward: int = 1024,
+        melody_max_length: int = 4096,
         dropout: float = 0.1,
     ) -> None:
         super().__init__()
         self.melody_encoder = MelodyTransformerEncoder(
-            input_dim=melody_input_dim,
+            vocab_size=melody_vocab_size,
             projection_dim=projection_dim,
             d_model=melody_d_model,
             num_layers=melody_num_layers,
             num_heads=melody_num_heads,
             dim_feedforward=melody_dim_feedforward,
+            max_length=melody_max_length,
             dropout=dropout,
         )
         self.audio_encoder = HubertProsodyEncoder(
@@ -39,11 +41,11 @@ class MelodyAudioContrastiveModel(nn.Module):
 
     def encode_melody(
         self,
-        melody_features: torch.Tensor,
+        melody_token_ids: torch.Tensor,
         melody_attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         return self.melody_encoder(
-            melody_features=melody_features,
+            melody_token_ids=melody_token_ids,
             melody_attention_mask=melody_attention_mask,
         )
 
@@ -59,13 +61,13 @@ class MelodyAudioContrastiveModel(nn.Module):
 
     def forward(
         self,
-        melody_features: torch.Tensor,
+        melody_token_ids: torch.Tensor,
         candidate_input_values: torch.Tensor,
         melody_attention_mask: torch.Tensor | None = None,
         candidate_audio_attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         melody_embeddings = self.encode_melody(
-            melody_features=melody_features,
+            melody_token_ids=melody_token_ids,
             melody_attention_mask=melody_attention_mask,
         )
 

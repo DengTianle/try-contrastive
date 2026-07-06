@@ -3,6 +3,8 @@ from .contrastive_dataset import (
     GroupedContrastiveDataset,
     MelodyOnlyDataset,
     MelodyConfig,
+    NoteEventTokenizer,
+    QuantizedSongEvents,
     grouped_contrastive_collate,
     melody_only_collate,
 )
@@ -12,6 +14,8 @@ __all__ = [
     "GroupedContrastiveDataset",
     "MelodyOnlyDataset",
     "MelodyConfig",
+    "NoteEventTokenizer",
+    "QuantizedSongEvents",
     "grouped_contrastive_collate",
     "melody_only_collate",
 ]

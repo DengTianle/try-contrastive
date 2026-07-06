@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import random
 from collections import defaultdict
 from dataclasses import dataclass
@@ -21,8 +22,76 @@ class AudioConfig:
 
 @dataclass(frozen=True)
 class MelodyConfig:
-    log_f0_reference_hz: float = 440.0
-    include_voiced_feature: bool = True
+    quantization_dir: str | Path | None = None
+    events_filename: str = "events.jsonl"
+    ratio_vocabulary_filename: str = "ratio_vocabulary.json"
+
+
+@dataclass(frozen=True)
+class QuantizedSongEvents:
+    events: list[dict[str, Any]]
+
+
+class NoteEventTokenizer:
+    """Tokenize quantized melody events as (onset/rest, duration-ratio) IDs."""
+
+    pad_token_id = 0
+    mask_token_id = 1
+
+    def __init__(self, ratios: list[str]) -> None:
+        if not ratios:
+            raise ValueError("ratio vocabulary must not be empty")
+        if len(set(ratios)) != len(ratios):
+            raise ValueError("ratio vocabulary contains duplicate ratios")
+        self.ratios = ratios
+        self.ratio_to_id = {ratio: index for index, ratio in enumerate(ratios)}
+        self.vocab_size = 2 + (2 * len(ratios))
+
+    @property
+    def ratio_count(self) -> int:
+        return len(self.ratios)
+
+    def token_id(self, onset: int, ratio: str) -> int:
+        ratio_id = self.ratio_to_id[ratio]
+        return 2 + (int(onset) * self.ratio_count) + ratio_id
+
+    def encode_events(
+        self,
+        events: list[dict[str, Any]],
+        start_seconds: float,
+        end_seconds: float,
+    ) -> dict[str, torch.Tensor]:
+        token_ids: list[int] = []
+        onset_ids: list[int] = []
+        ratio_ids: list[int] = []
+        event_starts: list[float] = []
+        event_ends: list[float] = []
+
+        for event in events:
+            event_start = float(event["start"])
+            event_end = float(event["end"])
+            if event_end <= start_seconds or event_start >= end_seconds:
+                continue
+            kind = str(event.get("kind", ""))
+            if kind not in {"note", "rest"}:
+                continue
+            ratio = str(event.get("reference_ratio", ""))
+            if ratio not in self.ratio_to_id:
+                raise ValueError(f"Unknown quantized melody ratio: {ratio}")
+            onset = 1 if kind == "note" else 0
+            token_ids.append(self.token_id(onset=onset, ratio=ratio))
+            onset_ids.append(onset)
+            ratio_ids.append(self.ratio_to_id[ratio])
+            event_starts.append(event_start)
+            event_ends.append(event_end)
+
+        return {
+            "token_ids": torch.tensor(token_ids, dtype=torch.long),
+            "onsets": torch.tensor(onset_ids, dtype=torch.long),
+            "ratio_ids": torch.tensor(ratio_ids, dtype=torch.long),
+            "event_starts": torch.tensor(event_starts, dtype=torch.float32),
+            "event_ends": torch.tensor(event_ends, dtype=torch.float32),
+        }
 
 
 def audio_start_seconds(row: dict[str, str]) -> float:
@@ -43,27 +112,44 @@ def resolve_manifest_path(path: str, manifest_dir: Path) -> str:
     return str(resolved.resolve(strict=False))
 
 
-def load_melody(path: str | Path, melody_config: MelodyConfig) -> dict[str, torch.Tensor]:
-    with np.load(path) as melody:
-        f0_hz = melody["f0_hz"].astype(np.float32)
-        voiced = melody["voiced"].astype(bool)
-        frame_times = melody["frame_times"].astype(np.float32)
+def quantization_dir_for_manifest(manifest_dir: Path, melody_config: MelodyConfig) -> Path:
+    if melody_config.quantization_dir is None:
+        return manifest_dir / "quantization"
+    quantization_dir = Path(melody_config.quantization_dir).expanduser()
+    if not quantization_dir.is_absolute():
+        quantization_dir = manifest_dir / quantization_dir
+    return quantization_dir.resolve(strict=False)
 
-    log_f0 = np.zeros_like(f0_hz, dtype=np.float32)
-    valid = voiced & np.isfinite(f0_hz) & (f0_hz > 0.0)
-    log_f0[valid] = np.log2(f0_hz[valid] / melody_config.log_f0_reference_hz)
 
-    feature_parts = [log_f0[:, None]]
-    if melody_config.include_voiced_feature:
-        feature_parts.append(voiced.astype(np.float32)[:, None])
-    features = np.concatenate(feature_parts, axis=1).astype(np.float32)
+def load_ratio_vocabulary(path: Path) -> list[str]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Ratio vocabulary does not exist: {path}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    ratios = data.get("ratios")
+    if not isinstance(ratios, list):
+        raise ValueError(f"Expected a 'ratios' list in {path}")
+    return [str(item["ratio"]) for item in ratios]
 
-    return {
-        "features": torch.from_numpy(features),
-        "f0_hz": torch.from_numpy(f0_hz),
-        "voiced": torch.from_numpy(voiced),
-        "frame_times": torch.from_numpy(frame_times),
-    }
+
+def load_quantized_song_events(path: Path) -> dict[str, QuantizedSongEvents]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Quantized melody events file does not exist: {path}")
+    events_by_song: dict[str, QuantizedSongEvents] = {}
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            song_id = str(record.get("song_id", ""))
+            if not song_id:
+                raise ValueError(f"Missing song_id in {path}:{line_number}")
+            events = record.get("events")
+            if not isinstance(events, list):
+                raise ValueError(f"Expected events list for {song_id} in {path}:{line_number}")
+            events_by_song[song_id] = QuantizedSongEvents(
+                events=sorted(events, key=lambda event: float(event["start"]))
+            )
+    return events_by_song
 
 
 def stable_row_rng(seed: int, row_id: str) -> random.Random:
@@ -97,6 +183,13 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         self.min_negative_offset_seconds = min_negative_offset_seconds
         self.seed = seed
         self.transform = transform
+        self.quantization_dir = quantization_dir_for_manifest(self.manifest_dir, self.melody_config)
+        self.tokenizer = NoteEventTokenizer(
+            load_ratio_vocabulary(self.quantization_dir / self.melody_config.ratio_vocabulary_filename)
+        )
+        self.quantized_events_by_song = load_quantized_song_events(
+            self.quantization_dir / self.melody_config.events_filename
+        )
 
         with self.manifest_path.open(newline="", encoding="utf-8") as handle:
             rows = list(csv.DictReader(handle))
@@ -104,16 +197,32 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
 
         if split is not None:
             rows = [row for row in rows if row["split"] == split]
+        rows = [row for row in rows if self._row_has_quantized_melody(row)]
         self.rows = rows
 
         self.groups = self._build_groups_from_segment_rows(rows, max_negatives=max_negatives)
 
     def _resolve_row_paths(self, row: dict[str, str]) -> dict[str, str]:
         resolved = dict(row)
-        for key in ("audio_path", "raw_audio_path", "melody_path"):
+        for key in ("audio_path", "raw_audio_path"):
             if resolved.get(key):
                 resolved[key] = resolve_manifest_path(resolved[key], self.manifest_dir)
         return resolved
+
+    @property
+    def melody_vocab_size(self) -> int:
+        return self.tokenizer.vocab_size
+
+    def _row_has_quantized_melody(self, row: dict[str, str]) -> bool:
+        song_events = self.quantized_events_by_song.get(row["dali_id"])
+        if song_events is None:
+            return False
+        encoded = self.tokenizer.encode_events(
+            song_events.events,
+            start_seconds=float(row["start_seconds"]),
+            end_seconds=float(row["end_seconds"]),
+        )
+        return encoded["token_ids"].numel() > 0
 
     def _build_groups_from_segment_rows(
         self,
@@ -168,18 +277,19 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
             rng.shuffle(order)
             target = order.index(0)
             candidate_rows = [candidate_rows[index] for index in order]
-        melody = load_melody(positive["melody_path"], self.melody_config)
+        melody = self._load_melody_tokens(positive)
         candidate_audio = self._load_candidate_audio(candidate_rows)
         candidate_ids = self._candidate_ids(positive, candidate_rows)
         candidate_types = self._candidate_types(positive, candidate_rows)
 
         item: dict[str, Any] = {
-            "melody_features": melody["features"],
-            "melody_f0_hz": melody["f0_hz"],
-            "melody_voiced": melody["voiced"],
-            "melody_frame_times": melody["frame_times"],
+            "melody_token_ids": melody["token_ids"],
+            "melody_onsets": melody["onsets"],
+            "melody_ratio_ids": melody["ratio_ids"],
+            "melody_event_starts": melody["event_starts"],
+            "melody_event_ends": melody["event_ends"],
             "melody_attention_mask": torch.ones(
-                melody["features"].shape[0],
+                melody["token_ids"].shape[0],
                 dtype=torch.bool,
             ),
             "candidate_input_values": torch.stack(candidate_audio),
@@ -196,6 +306,22 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         if self.transform is not None:
             item = self.transform(item)
         return item
+
+    def _load_melody_tokens(self, row: dict[str, str]) -> dict[str, torch.Tensor]:
+        song_events = self.quantized_events_by_song.get(row["dali_id"])
+        if song_events is None:
+            raise ValueError(f"No quantized melody events found for song: {row['dali_id']}")
+        melody = self.tokenizer.encode_events(
+            song_events.events,
+            start_seconds=float(row["start_seconds"]),
+            end_seconds=float(row["end_seconds"]),
+        )
+        if melody["token_ids"].numel() == 0:
+            raise ValueError(
+                f"No quantized melody tokens for {row['sample_id']} "
+                f"({row['start_seconds']}--{row['end_seconds']})"
+            )
+        return melody
 
     def _candidate_ids(
         self,
@@ -305,33 +431,54 @@ class MelodyOnlyDataset(Dataset[dict[str, Any]]):
         self.manifest_dir = self.manifest_path.parent
         self.melody_config = melody_config or MelodyConfig()
         self.transform = transform
+        self.quantization_dir = quantization_dir_for_manifest(self.manifest_dir, self.melody_config)
+        self.tokenizer = NoteEventTokenizer(
+            load_ratio_vocabulary(self.quantization_dir / self.melody_config.ratio_vocabulary_filename)
+        )
+        self.quantized_events_by_song = load_quantized_song_events(
+            self.quantization_dir / self.melody_config.events_filename
+        )
 
         with self.manifest_path.open(newline="", encoding="utf-8") as handle:
             rows = list(csv.DictReader(handle))
         rows = [self._resolve_row_paths(row) for row in rows]
         if split is not None:
             rows = [row for row in rows if row["split"] == split]
+        rows = [row for row in rows if self._row_has_quantized_melody(row)]
         self.rows = rows
 
     def _resolve_row_paths(self, row: dict[str, str]) -> dict[str, str]:
-        resolved = dict(row)
-        if resolved.get("melody_path"):
-            resolved["melody_path"] = resolve_manifest_path(resolved["melody_path"], self.manifest_dir)
-        return resolved
+        return dict(row)
+
+    @property
+    def melody_vocab_size(self) -> int:
+        return self.tokenizer.vocab_size
+
+    def _row_has_quantized_melody(self, row: dict[str, str]) -> bool:
+        song_events = self.quantized_events_by_song.get(row["dali_id"])
+        if song_events is None:
+            return False
+        encoded = self.tokenizer.encode_events(
+            song_events.events,
+            start_seconds=float(row["start_seconds"]),
+            end_seconds=float(row["end_seconds"]),
+        )
+        return encoded["token_ids"].numel() > 0
 
     def __len__(self) -> int:
         return len(self.rows)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self.rows[index]
-        melody = load_melody(row["melody_path"], self.melody_config)
+        melody = self._load_melody_tokens(row)
         item: dict[str, Any] = {
-            "melody_features": melody["features"],
-            "melody_f0_hz": melody["f0_hz"],
-            "melody_voiced": melody["voiced"],
-            "melody_frame_times": melody["frame_times"],
+            "melody_token_ids": melody["token_ids"],
+            "melody_onsets": melody["onsets"],
+            "melody_ratio_ids": melody["ratio_ids"],
+            "melody_event_starts": melody["event_starts"],
+            "melody_event_ends": melody["event_ends"],
             "melody_attention_mask": torch.ones(
-                melody["features"].shape[0],
+                melody["token_ids"].shape[0],
                 dtype=torch.bool,
             ),
             "melody_sample_id": melody_sample_id(row),
@@ -341,31 +488,53 @@ class MelodyOnlyDataset(Dataset[dict[str, Any]]):
             item = self.transform(item)
         return item
 
+    def _load_melody_tokens(self, row: dict[str, str]) -> dict[str, torch.Tensor]:
+        song_events = self.quantized_events_by_song.get(row["dali_id"])
+        if song_events is None:
+            raise ValueError(f"No quantized melody events found for song: {row['dali_id']}")
+        melody = self.tokenizer.encode_events(
+            song_events.events,
+            start_seconds=float(row["start_seconds"]),
+            end_seconds=float(row["end_seconds"]),
+        )
+        if melody["token_ids"].numel() == 0:
+            raise ValueError(
+                f"No quantized melody tokens for {row['sample_id']} "
+                f"({row['start_seconds']}--{row['end_seconds']})"
+            )
+        return melody
+
 
 def melody_only_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    max_frames = max(item["melody_features"].shape[0] for item in batch)
+    max_tokens = max(item["melody_token_ids"].shape[0] for item in batch)
     batch_size = len(batch)
-    feature_dim = batch[0]["melody_features"].shape[-1]
 
-    melody_features = torch.zeros(batch_size, max_frames, feature_dim)
-    melody_f0_hz = torch.zeros(batch_size, max_frames)
-    melody_voiced = torch.zeros(batch_size, max_frames, dtype=torch.bool)
-    melody_frame_times = torch.zeros(batch_size, max_frames)
-    melody_attention_mask = torch.zeros(batch_size, max_frames, dtype=torch.bool)
+    melody_token_ids = torch.full(
+        (batch_size, max_tokens),
+        NoteEventTokenizer.pad_token_id,
+        dtype=torch.long,
+    )
+    melody_onsets = torch.full((batch_size, max_tokens), -1, dtype=torch.long)
+    melody_ratio_ids = torch.full((batch_size, max_tokens), -1, dtype=torch.long)
+    melody_event_starts = torch.zeros(batch_size, max_tokens)
+    melody_event_ends = torch.zeros(batch_size, max_tokens)
+    melody_attention_mask = torch.zeros(batch_size, max_tokens, dtype=torch.bool)
 
     for batch_index, item in enumerate(batch):
-        frame_count = item["melody_features"].shape[0]
-        melody_features[batch_index, :frame_count] = item["melody_features"]
-        melody_f0_hz[batch_index, :frame_count] = item["melody_f0_hz"]
-        melody_voiced[batch_index, :frame_count] = item["melody_voiced"]
-        melody_frame_times[batch_index, :frame_count] = item["melody_frame_times"]
-        melody_attention_mask[batch_index, :frame_count] = item["melody_attention_mask"]
+        token_count = item["melody_token_ids"].shape[0]
+        melody_token_ids[batch_index, :token_count] = item["melody_token_ids"]
+        melody_onsets[batch_index, :token_count] = item["melody_onsets"]
+        melody_ratio_ids[batch_index, :token_count] = item["melody_ratio_ids"]
+        melody_event_starts[batch_index, :token_count] = item["melody_event_starts"]
+        melody_event_ends[batch_index, :token_count] = item["melody_event_ends"]
+        melody_attention_mask[batch_index, :token_count] = item["melody_attention_mask"]
 
     return {
-        "melody_features": melody_features,
-        "melody_f0_hz": melody_f0_hz,
-        "melody_voiced": melody_voiced,
-        "melody_frame_times": melody_frame_times,
+        "melody_token_ids": melody_token_ids,
+        "melody_onsets": melody_onsets,
+        "melody_ratio_ids": melody_ratio_ids,
+        "melody_event_starts": melody_event_starts,
+        "melody_event_ends": melody_event_ends,
         "melody_attention_mask": melody_attention_mask,
         "melody_sample_id": [item["melody_sample_id"] for item in batch],
         "metadata": [item["metadata"] for item in batch],
@@ -395,17 +564,11 @@ def grouped_contrastive_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         candidate_mask[batch_index, :num_candidates] = item["candidate_mask"]
 
     return {
-        "melody_features": torch.stack([item["melody_features"] for item in batch]),
-        "melody_attention_mask": torch.stack([item["melody_attention_mask"] for item in batch]),
-        "melody_f0_hz": torch.stack([item["melody_f0_hz"] for item in batch]),
-        "melody_voiced": torch.stack([item["melody_voiced"] for item in batch]),
-        "melody_frame_times": torch.stack([item["melody_frame_times"] for item in batch]),
+        **melody_only_collate(batch),
         "candidate_input_values": candidate_input_values,
         "candidate_audio_attention_mask": candidate_audio_attention_mask,
         "candidate_mask": candidate_mask,
         "target": torch.stack([item["target"] for item in batch]),
-        "melody_sample_id": [item["melody_sample_id"] for item in batch],
         "candidate_ids": [item["candidate_ids"] for item in batch],
         "candidate_types": [item["candidate_types"] for item in batch],
-        "metadata": [item["metadata"] for item in batch],
     }

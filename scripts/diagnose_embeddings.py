@@ -22,7 +22,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from prosodia.datasets import GroupedContrastiveDataset, grouped_contrastive_collate
+from prosodia.datasets import MelodyConfig, GroupedContrastiveDataset, grouped_contrastive_collate
 from prosodia.training import (
     build_contrastive_model_from_checkpoint_args,
     checkpoint_arg,
@@ -61,19 +61,17 @@ def safe_float(value: Any) -> float:
         return float("nan")
 
 
-def finite_mean_log_f0_semitones(
-    f0_hz: torch.Tensor,
-    voiced: torch.Tensor,
-    reference_hz: float = 440.0,
+def finite_mean_onset_fraction(
+    onsets: torch.Tensor,
+    attention_mask: torch.Tensor,
 ) -> list[float]:
     values: list[float] = []
-    for sample_f0, sample_voiced in zip(f0_hz.detach().cpu(), voiced.detach().cpu()):
-        valid = sample_voiced.to(dtype=torch.bool) & torch.isfinite(sample_f0) & (sample_f0 > 0)
+    for sample_onsets, sample_mask in zip(onsets.detach().cpu(), attention_mask.detach().cpu()):
+        valid = sample_mask.to(dtype=torch.bool)
         if not bool(valid.any()):
             values.append(float("nan"))
             continue
-        mean_log2 = torch.log2(sample_f0[valid] / reference_hz).mean()
-        values.append(float(mean_log2 * 12.0))
+        values.append(float(sample_onsets[valid].to(dtype=torch.float32).mean()))
     return values
 
 
@@ -91,13 +89,13 @@ def extract_embeddings(
     song_ids: list[str] = []
     starts_seconds: list[float] = []
     voiced_ratios: list[float] = []
-    pitch_semitones: list[float] = []
+    onset_fractions: list[float] = []
 
     for batch in loader:
         batch = move_batch_to_device(batch, device)
         with torch.amp.autocast("cuda", enabled=use_amp):
             batch_melody_embeddings, candidate_audio_embeddings = model(
-                melody_features=batch["melody_features"],
+                melody_token_ids=batch["melody_token_ids"],
                 melody_attention_mask=batch["melody_attention_mask"],
                 candidate_input_values=batch["candidate_input_values"],
                 candidate_audio_attention_mask=batch["candidate_audio_attention_mask"],
@@ -109,8 +107,8 @@ def extract_embeddings(
 
         melody_embeddings.append(batch_melody_embeddings.detach().cpu())
         audio_embeddings.append(batch_audio_embeddings.detach().cpu())
-        pitch_semitones.extend(
-            finite_mean_log_f0_semitones(batch["melody_f0_hz"], batch["melody_voiced"])
+        onset_fractions.extend(
+            finite_mean_onset_fraction(batch["melody_onsets"], batch["melody_attention_mask"])
         )
 
         targets = batch["target"].detach().cpu().tolist()
@@ -131,7 +129,7 @@ def extract_embeddings(
         "song_ids": song_ids,
         "start_seconds": starts_seconds,
         "voiced_ratio": voiced_ratios,
-        "pitch_semitones": pitch_semitones,
+        "onset_fraction": onset_fractions,
     }
 
 
@@ -307,44 +305,40 @@ def grouped_probe_split(
     return np.asarray(train_indices), np.asarray(test_indices), "random_examples"
 
 
-def pitch_probe_for_embeddings(
+def onset_probe_for_embeddings(
     prefix: str,
     embeddings: np.ndarray,
-    pitch_semitones: np.ndarray,
+    onset_fractions: np.ndarray,
     song_ids: list[str],
     seed: int,
     test_size: float,
 ) -> dict[str, float | str]:
-    if np.isfinite(pitch_semitones).sum() < 12:
+    if np.isfinite(onset_fractions).sum() < 12:
         return {
-            f"{prefix}_pitch_probe_r2": float("nan"),
-            f"{prefix}_pitch_probe_mae_semitones": float("nan"),
-            f"{prefix}_pitch_probe_baseline_mae_semitones": float("nan"),
-            f"{prefix}_pitch_probe_split": "too_few_examples",
+            f"{prefix}_onset_probe_r2": float("nan"),
+            f"{prefix}_onset_probe_mae": float("nan"),
+            f"{prefix}_onset_probe_baseline_mae": float("nan"),
+            f"{prefix}_onset_probe_split": "too_few_examples",
         }
 
     train_indices, test_indices, split_name = grouped_probe_split(
-        labels=pitch_semitones,
+        labels=onset_fractions,
         group_ids=song_ids,
         seed=seed,
         test_size=test_size,
     )
     probe = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
-    probe.fit(embeddings[train_indices], pitch_semitones[train_indices])
+    probe.fit(embeddings[train_indices], onset_fractions[train_indices])
     predictions = probe.predict(embeddings[test_indices])
-    baseline = np.full_like(predictions, np.median(pitch_semitones[train_indices]), dtype=np.float64)
+    baseline = np.full_like(predictions, np.median(onset_fractions[train_indices]), dtype=np.float64)
 
     return {
-        f"{prefix}_pitch_probe_r2": float(r2_score(pitch_semitones[test_indices], predictions)),
-        f"{prefix}_pitch_probe_mae_semitones": float(
-            mean_absolute_error(pitch_semitones[test_indices], predictions)
-        ),
-        f"{prefix}_pitch_probe_baseline_mae_semitones": float(
-            mean_absolute_error(pitch_semitones[test_indices], baseline)
-        ),
-        f"{prefix}_pitch_probe_train_examples": float(len(train_indices)),
-        f"{prefix}_pitch_probe_test_examples": float(len(test_indices)),
-        f"{prefix}_pitch_probe_split": split_name,
+        f"{prefix}_onset_probe_r2": float(r2_score(onset_fractions[test_indices], predictions)),
+        f"{prefix}_onset_probe_mae": float(mean_absolute_error(onset_fractions[test_indices], predictions)),
+        f"{prefix}_onset_probe_baseline_mae": float(mean_absolute_error(onset_fractions[test_indices], baseline)),
+        f"{prefix}_onset_probe_train_examples": float(len(train_indices)),
+        f"{prefix}_onset_probe_test_examples": float(len(test_indices)),
+        f"{prefix}_onset_probe_split": split_name,
     }
 
 
@@ -356,13 +350,13 @@ def run_diagnostics(
     melody_embeddings = extracted["melody_embeddings"]
     audio_embeddings = extracted["audio_embeddings"]
     song_ids = extracted["song_ids"]
-    pitch_semitones = np.asarray(extracted["pitch_semitones"], dtype=np.float64)
+    onset_fractions = np.asarray(extracted["onset_fraction"], dtype=np.float64)
 
     metrics: dict[str, Any] = {
         "num_examples": float(melody_embeddings.shape[0]),
         "num_songs": float(len(set(song_ids))),
-        "pitch_label_mean_semitones_from_a4": float(np.nanmean(pitch_semitones)),
-        "pitch_label_std_semitones": float(np.nanstd(pitch_semitones)),
+        "onset_fraction_mean": float(np.nanmean(onset_fractions)),
+        "onset_fraction_std": float(np.nanstd(onset_fractions)),
     }
     metrics.update(embedding_health("melody", melody_embeddings))
     metrics.update(embedding_health("audio", audio_embeddings))
@@ -383,20 +377,20 @@ def run_diagnostics(
         )
     )
     metrics.update(
-        pitch_probe_for_embeddings(
+        onset_probe_for_embeddings(
             prefix="melody",
             embeddings=melody_embeddings,
-            pitch_semitones=pitch_semitones,
+            onset_fractions=onset_fractions,
             song_ids=song_ids,
             seed=seed,
             test_size=probe_test_size,
         )
     )
     metrics.update(
-        pitch_probe_for_embeddings(
+        onset_probe_for_embeddings(
             prefix="audio",
             embeddings=audio_embeddings,
-            pitch_semitones=pitch_semitones,
+            onset_fractions=onset_fractions,
             song_ids=song_ids,
             seed=seed,
             test_size=probe_test_size,
@@ -408,11 +402,17 @@ def run_diagnostics(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Diagnose melody/audio embedding collapse, modality gap, and absolute-pitch leakage."
+            "Diagnose melody/audio embedding collapse, modality gap, and onset-density leakage."
         )
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--manifest", type=Path, default=Path("data/prepared/dali/segments_manifest.csv"))
+    parser.add_argument("--manifest", type=Path, default=Path("data/prepared_good/segments_manifest.csv"))
+    parser.add_argument(
+        "--quantization-dir",
+        type=Path,
+        default=None,
+        help="Directory containing events.jsonl and ratio_vocabulary.json. Defaults to <manifest-dir>/quantization.",
+    )
     parser.add_argument("--split", default="test")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -429,6 +429,8 @@ def main() -> None:
     args = parse_args()
     args.checkpoint = resolve_user_path(args.checkpoint)
     args.manifest = resolve_user_path(args.manifest)
+    if args.quantization_dir is not None:
+        args.quantization_dir = resolve_user_path(args.quantization_dir)
     if args.output_json is not None:
         args.output_json = resolve_user_path(args.output_json)
     if not 0.05 <= args.probe_test_size <= 0.8:
@@ -441,6 +443,7 @@ def main() -> None:
     dataset = GroupedContrastiveDataset(
         manifest_path=args.manifest,
         split=args.split,
+        melody_config=MelodyConfig(quantization_dir=args.quantization_dir),
         max_negatives=0,
         seed=seed,
     )

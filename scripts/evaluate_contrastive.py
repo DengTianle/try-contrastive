@@ -15,7 +15,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from prosodia.datasets import GroupedContrastiveDataset, grouped_contrastive_collate
+from prosodia.datasets import MelodyConfig, GroupedContrastiveDataset, grouped_contrastive_collate
 from prosodia.training import (
     MelodyAudioContrastiveModel,
     build_contrastive_model_from_checkpoint_args,
@@ -90,7 +90,7 @@ def evaluate_retrieval(
         batch = move_batch_to_device(batch, device)
         with torch.amp.autocast("cuda", enabled=use_amp):
             melody_embeddings, audio_embeddings = model(
-                melody_features=batch["melody_features"],
+                melody_token_ids=batch["melody_token_ids"],
                 melody_attention_mask=batch["melody_attention_mask"],
                 candidate_input_values=batch["candidate_input_values"],
                 candidate_audio_attention_mask=batch["candidate_audio_attention_mask"],
@@ -250,7 +250,13 @@ def write_predictions(path: Path, rows: list[dict[str, Any]]) -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate melody/audio contrastive retrieval.")
     parser.add_argument("--checkpoint", type=Path, required=True)
-    parser.add_argument("--manifest", type=Path, default=Path("data/prepared/dali/segments_manifest.csv"))
+    parser.add_argument("--manifest", type=Path, default=Path("data/prepared_good/segments_manifest.csv"))
+    parser.add_argument(
+        "--quantization-dir",
+        type=Path,
+        default=None,
+        help="Directory containing events.jsonl and ratio_vocabulary.json. Defaults to <manifest-dir>/quantization.",
+    )
     parser.add_argument("--split", default="test")
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
@@ -274,6 +280,8 @@ def main() -> None:
     args = parse_args()
     args.checkpoint = resolve_user_path(args.checkpoint)
     args.manifest = resolve_user_path(args.manifest)
+    if args.quantization_dir is not None:
+        args.quantization_dir = resolve_user_path(args.quantization_dir)
     if args.output_json is not None:
         args.output_json = resolve_user_path(args.output_json)
     if args.predictions_csv is not None:
@@ -290,6 +298,7 @@ def main() -> None:
     dataset = GroupedContrastiveDataset(
         manifest_path=args.manifest,
         split=args.split,
+        melody_config=MelodyConfig(quantization_dir=args.quantization_dir),
         max_negatives=args.max_negatives,
         min_negative_offset_seconds=args.min_negative_offset_seconds,
         seed=checkpoint_arg(checkpoint_args, "seed", 13),

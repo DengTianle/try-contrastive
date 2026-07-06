@@ -103,6 +103,15 @@ def read_ground_truth_ids(gt_file: Path) -> set[str]:
     return set(data.keys())
 
 
+def read_ids_file(ids_file: Path) -> set[str]:
+    if not ids_file.is_file():
+        raise SystemExit(f"IDs file does not exist: {ids_file}")
+    ids = {line.strip() for line in ids_file.read_text(encoding="utf-8").splitlines() if line.strip()}
+    if not ids:
+        raise SystemExit(f"IDs file is empty: {ids_file}")
+    return ids
+
+
 def find_audio_file(entry: Any, by_stem: dict[str, Path]) -> Path | None:
     dali_id = entry.info["id"]
     candidates = [dali_id]
@@ -371,6 +380,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use only DALI ids present in --gt-file. Useful for small aligned experiments.",
     )
+    parser.add_argument(
+        "--ids-file",
+        type=Path,
+        default=None,
+        help="Optional text file of DALI ids to load, one id per line.",
+    )
     parser.add_argument("--sample-rate", type=int, default=16000, help="Target audio rate for future dataloaders.")
     parser.add_argument(
         "--prepared-audio-dir",
@@ -408,6 +423,8 @@ def main() -> None:
     args.output_dir = resolve_user_path(args.output_dir)
     if args.gt_file is not None:
         args.gt_file = resolve_user_path(args.gt_file)
+    if args.ids_file is not None:
+        args.ids_file = resolve_user_path(args.ids_file)
     if args.prepared_audio_dir is None:
         args.prepared_audio_dir = args.output_dir / f"audio_{args.sample_rate // 1000}k"
     args.prepared_audio_dir = resolve_user_path(args.prepared_audio_dir)
@@ -437,6 +454,11 @@ def main() -> None:
         if args.gt_file is None:
             raise SystemExit("--ground-truth-only requires --gt-file")
         keep_ids = read_ground_truth_ids(args.gt_file)
+    if args.ids_file is not None:
+        file_ids = read_ids_file(args.ids_file)
+        keep_ids = file_ids if keep_ids is None else keep_ids & file_ids
+        if not keep_ids:
+            raise SystemExit("No ids remain after applying --ids-file and other filters.")
 
     print("Loading DALI annotations...")
     dali_data = load_dali(args.dali_data_dir, args.gt_file, keep_ids=keep_ids)
@@ -595,6 +617,11 @@ def main() -> None:
         "source": "DALI",
         "dali_data_dir": manifest_relative_path(args.dali_data_dir, metadata_path.parent),
         "audio_dir": manifest_relative_path(args.audio_dir, metadata_path.parent),
+        "ids_file": (
+            manifest_relative_path(args.ids_file, metadata_path.parent)
+            if args.ids_file is not None
+            else None
+        ),
         "prepared_audio_dir": manifest_relative_path(args.prepared_audio_dir, metadata_path.parent),
         "audio_format": args.audio_format,
         "skip_audio_prep": args.skip_audio_prep,

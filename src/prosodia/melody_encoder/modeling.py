@@ -30,21 +30,17 @@ class SinusoidalPositionalEncoding(nn.Module):
 
 @dataclass
 class MelodyEncoderOutput:
-    frame_embeddings: torch.Tensor
+    token_embeddings: torch.Tensor
     pooled_embedding: torch.Tensor
     projected_embedding: torch.Tensor
 
 
 class MelodyTransformerEncoder(nn.Module):
-    """Transformer encoder for frame-based vocal melody tokens.
-
-    Input shape is [batch, frames, input_dim]. With the prepared DALI dataset,
-    input_dim is normally 2: log-frequency and voiced flag.
-    """
+    """Transformer encoder for tokenized note/rest-ratio melody sequences."""
 
     def __init__(
         self,
-        input_dim: int = 2,
+        vocab_size: int,
         projection_dim: int = 256,
         d_model: int = 256,
         num_layers: int = 4,
@@ -53,22 +49,26 @@ class MelodyTransformerEncoder(nn.Module):
         dropout: float = 0.1,
         max_length: int = 4096,
         pooling: str = "cls",
+        pad_token_id: int = 0,
+        mask_token_id: int = 1,
     ) -> None:
         super().__init__()
         if pooling not in {"cls", "mean"}:
             raise ValueError(f"Unsupported pooling: {pooling}")
         if d_model % num_heads != 0:
             raise ValueError("-- d_model must be divisible by num_heads")
+        if vocab_size <= 0:
+            raise ValueError("vocab_size must be positive")
 
-        self.input_dim = input_dim
+        self.vocab_size = vocab_size
         self.projection_dim = projection_dim
         self.d_model = d_model
         self.pooling = pooling
+        self.pad_token_id = pad_token_id
+        self.mask_token_id = mask_token_id
 
-        self.input_projection = nn.Sequential(
-            nn.Linear(input_dim, d_model),
-            nn.LayerNorm(d_model),
-        )
+        self.token_embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_token_id)
+        self.input_norm = nn.LayerNorm(d_model)
         self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
         self.positional_encoding = SinusoidalPositionalEncoding(d_model, max_length=max_length + 1)
         encoder_layer = nn.TransformerEncoderLayer(
@@ -100,24 +100,16 @@ class MelodyTransformerEncoder(nn.Module):
 
     def encode(
         self,
-        melody_features: torch.Tensor,
+        melody_token_ids: torch.Tensor,
         melody_attention_mask: torch.Tensor | None = None,
-        frame_mask: torch.Tensor | None = None,
         normalize: bool = True,
     ) -> MelodyEncoderOutput:
-        if melody_features.ndim != 3:
+        if melody_token_ids.ndim != 2:
             raise ValueError(
-                f"Expected melody_features with shape [batch, frames, features], got {melody_features.shape}"
+                f"Expected melody_token_ids with shape [batch, tokens], got {melody_token_ids.shape}"
             )
 
-        x = self.input_projection(melody_features)
-        if frame_mask is not None:
-            if frame_mask.shape != melody_features.shape[:2]:
-                raise ValueError(
-                    "Expected frame_mask with shape [batch, frames], "
-                    f"got {frame_mask.shape}"
-                )
-            x = x.masked_fill(frame_mask.to(device=x.device, dtype=torch.bool).unsqueeze(-1), 0.0)
+        x = self.input_norm(self.token_embedding(melody_token_ids))
 
         batch_size = x.shape[0]
         cls = self.cls_token.expand(batch_size, -1, -1)
@@ -129,7 +121,12 @@ class MelodyTransformerEncoder(nn.Module):
         if melody_attention_mask is not None:
             if melody_attention_mask.ndim != 2:
                 raise ValueError(
-                    "Expected melody_attention_mask with shape [batch, frames]"
+                    "Expected melody_attention_mask with shape [batch, tokens]"
+                )
+            if melody_attention_mask.shape != melody_token_ids.shape:
+                raise ValueError(
+                    "Expected melody_attention_mask to match melody_token_ids, "
+                    f"got {melody_attention_mask.shape} and {melody_token_ids.shape}"
                 )
             cls_mask = torch.ones(
                 batch_size,
@@ -143,15 +140,15 @@ class MelodyTransformerEncoder(nn.Module):
 
         encoded = self.transformer(x, src_key_padding_mask=key_padding_mask)
         encoded = self.output_norm(encoded)
-        frame_embeddings = encoded[:, 1:]
+        token_embeddings = encoded[:, 1:]
 
         if self.pooling == "cls":
             pooled = encoded[:, 0]
         elif pooled_mask is None:
-            pooled = frame_embeddings.mean(dim=1)
+            pooled = token_embeddings.mean(dim=1)
         else:
-            mask = pooled_mask.to(frame_embeddings.device).unsqueeze(-1)
-            summed = (frame_embeddings * mask).sum(dim=1)
+            mask = pooled_mask.to(token_embeddings.device).unsqueeze(-1)
+            summed = (token_embeddings * mask).sum(dim=1)
             lengths = mask.sum(dim=1).clamp_min(1)
             pooled = summed / lengths
 
@@ -159,30 +156,30 @@ class MelodyTransformerEncoder(nn.Module):
         if normalize:
             embeddings = F.normalize(embeddings, dim=-1)
         return MelodyEncoderOutput(
-            frame_embeddings=frame_embeddings,
+            token_embeddings=token_embeddings,
             pooled_embedding=pooled,
             projected_embedding=embeddings,
         )
 
     def forward(
         self,
-        melody_features: torch.Tensor,
+        melody_token_ids: torch.Tensor,
         melody_attention_mask: torch.Tensor | None = None,
         normalize: bool = True,
     ) -> torch.Tensor:
         return self.encode(
-            melody_features=melody_features,
+            melody_token_ids=melody_token_ids,
             melody_attention_mask=melody_attention_mask,
             normalize=normalize,
         ).projected_embedding
 
 
-class MelodyMaskedProsodyModel(nn.Module):
-    """Frame-level masked prosody pretraining head for the melody encoder."""
+class MelodyMaskedTokenModel(nn.Module):
+    """Masked language-model style pretraining head for melody note tokens."""
 
     def __init__(
         self,
-        input_dim: int = 2,
+        vocab_size: int,
         projection_dim: int = 256,
         d_model: int = 256,
         num_layers: int = 4,
@@ -191,10 +188,15 @@ class MelodyMaskedProsodyModel(nn.Module):
         dropout: float = 0.1,
         max_length: int = 4096,
         pooling: str = "cls",
+        pad_token_id: int = 0,
+        mask_token_id: int = 1,
     ) -> None:
         super().__init__()
+        self.vocab_size = vocab_size
+        self.pad_token_id = pad_token_id
+        self.mask_token_id = mask_token_id
         self.encoder = MelodyTransformerEncoder(
-            input_dim=input_dim,
+            vocab_size=vocab_size,
             projection_dim=projection_dim,
             d_model=d_model,
             num_layers=num_layers,
@@ -203,35 +205,30 @@ class MelodyMaskedProsodyModel(nn.Module):
             dropout=dropout,
             max_length=max_length,
             pooling=pooling,
+            pad_token_id=pad_token_id,
+            mask_token_id=mask_token_id,
         )
-        self.delta_head = nn.Sequential(
+        self.token_head = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model, 1),
-        )
-        self.voiced_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, 1),
+            nn.Linear(d_model, vocab_size),
         )
 
     def forward(
         self,
-        melody_features: torch.Tensor,
+        melody_token_ids: torch.Tensor,
         melody_attention_mask: torch.Tensor | None = None,
-        frame_mask: torch.Tensor | None = None,
     ) -> dict[str, torch.Tensor]:
         encoded = self.encoder.encode(
-            melody_features=melody_features,
+            melody_token_ids=melody_token_ids,
             melody_attention_mask=melody_attention_mask,
-            frame_mask=frame_mask,
             normalize=False,
         )
-        frame_embeddings = encoded.frame_embeddings
         return {
-            "delta_log_f0": self.delta_head(frame_embeddings).squeeze(-1),
-            "voiced_logits": self.voiced_head(frame_embeddings).squeeze(-1),
+            "token_logits": self.token_head(encoded.token_embeddings),
             "pooled_embedding": encoded.projected_embedding,
         }
+
+
+MelodyMaskedProsodyModel = MelodyMaskedTokenModel

@@ -1,6 +1,7 @@
 from .modeling import (
     MelodyEncoderOutput,
     MelodyMaskedProsodyModel,
+    MelodyMaskedTokenModel,
     MelodyTransformerEncoder,
     SinusoidalPositionalEncoding,
 )
@@ -8,6 +9,7 @@ from .modeling import (
 __all__ = [
     "MelodyEncoderOutput",
     "MelodyMaskedProsodyModel",
+    "MelodyMaskedTokenModel",
     "MelodyTransformerEncoder",
     "SinusoidalPositionalEncoding",
 ]
