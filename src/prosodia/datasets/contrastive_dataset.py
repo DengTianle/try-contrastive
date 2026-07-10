@@ -6,6 +6,7 @@ import json
 import random
 from collections import defaultdict
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Any, Callable
 
@@ -45,6 +46,7 @@ class NoteEventTokenizer:
             raise ValueError("ratio vocabulary contains duplicate ratios")
         self.ratios = ratios
         self.ratio_to_id = {ratio: index for index, ratio in enumerate(ratios)}
+        self.ratio_values = [float(Fraction(ratio)) for ratio in ratios]
         self.vocab_size = 2 + (2 * len(ratios))
 
     @property
@@ -212,6 +214,14 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
     @property
     def melody_vocab_size(self) -> int:
         return self.tokenizer.vocab_size
+
+    @property
+    def melody_ratio_count(self) -> int:
+        return self.tokenizer.ratio_count
+
+    @property
+    def melody_ratio_values(self) -> list[float]:
+        return self.tokenizer.ratio_values
 
     def _row_has_quantized_melody(self, row: dict[str, str]) -> bool:
         song_events = self.quantized_events_by_song.get(row["dali_id"])
@@ -453,6 +463,14 @@ class MelodyOnlyDataset(Dataset[dict[str, Any]]):
     @property
     def melody_vocab_size(self) -> int:
         return self.tokenizer.vocab_size
+
+    @property
+    def melody_ratio_count(self) -> int:
+        return self.tokenizer.ratio_count
+
+    @property
+    def melody_ratio_values(self) -> list[float]:
+        return self.tokenizer.ratio_values
 
     def _row_has_quantized_melody(self, row: dict[str, str]) -> bool:
         song_events = self.quantized_events_by_song.get(row["dali_id"])

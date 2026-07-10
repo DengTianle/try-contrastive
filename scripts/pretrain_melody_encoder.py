@@ -102,6 +102,9 @@ def pretrain_step(
     batch: dict[str, Any],
     mask_prob: float,
     mask_span_tokens: int,
+    ratio_values: torch.Tensor,
+    onset_loss_weight: float,
+    ratio_loss_weight: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     attention_mask = batch["melody_attention_mask"].to(dtype=torch.bool)
     token_mask = random_span_mask(
@@ -110,6 +113,8 @@ def pretrain_step(
         mask_span_tokens=mask_span_tokens,
     )
     token_targets = batch["melody_token_ids"]
+    onset_targets = batch["melody_onsets"].to(dtype=torch.long)
+    ratio_targets = batch["melody_ratio_ids"].to(dtype=torch.long)
     melody_inputs = token_targets.masked_fill(token_mask, model.mask_token_id)
 
     outputs = model(
@@ -119,19 +124,94 @@ def pretrain_step(
 
     loss_mask = token_mask & attention_mask
     if not bool(loss_mask.any()):
-        loss = outputs["token_logits"].new_zeros(())
+        onset_loss = outputs["onset_logits"].new_zeros(())
+        ratio_loss = outputs["ratio_logits"].new_zeros(())
     else:
-        loss = F.cross_entropy(outputs["token_logits"][loss_mask], token_targets[loss_mask])
+        onset_loss = F.cross_entropy(
+            outputs["onset_logits"][loss_mask],
+            onset_targets[loss_mask],
+        )
+        ratio_loss = F.cross_entropy(
+            outputs["ratio_logits"][loss_mask],
+            ratio_targets[loss_mask],
+        )
+    loss = onset_loss_weight * onset_loss + ratio_loss_weight * ratio_loss
 
     with torch.no_grad():
-        predictions = outputs["token_logits"].argmax(dim=-1)
+        onset_predictions = outputs["onset_logits"].argmax(dim=-1)
+        ratio_predictions = outputs["ratio_logits"].argmax(dim=-1)
+        predictions = 2 + onset_predictions * model.ratio_count + ratio_predictions
         token_accuracy = masked_mean(
             (predictions == token_targets).to(dtype=torch.float32),
             loss_mask,
         )
+        onset_accuracy = masked_mean(
+            (onset_predictions == onset_targets).to(dtype=torch.float32),
+            loss_mask,
+        )
+        ratio_accuracy = masked_mean(
+            (ratio_predictions == ratio_targets).to(dtype=torch.float32),
+            loss_mask,
+        )
+        topk = min(3, model.ratio_count)
+        ratio_top3 = outputs["ratio_logits"].topk(k=topk, dim=-1).indices
+        ratio_top3_accuracy = masked_mean(
+            (ratio_top3 == ratio_targets.unsqueeze(-1)).any(dim=-1).to(dtype=torch.float32),
+            loss_mask,
+        )
+        topk = min(5, model.ratio_count)
+        ratio_top5 = outputs["ratio_logits"].topk(k=topk, dim=-1).indices
+        ratio_top5_accuracy = masked_mean(
+            (ratio_top5 == ratio_targets.unsqueeze(-1)).any(dim=-1).to(dtype=torch.float32),
+            loss_mask,
+        )
+        predicted_ratio_values = ratio_values[ratio_predictions.clamp_min(0)]
+        target_ratio_values = ratio_values[ratio_targets.clamp_min(0)]
+        duration_mae = masked_mean(
+            (predicted_ratio_values - target_ratio_values).abs(),
+            loss_mask,
+        )
+        duration_log_mae = masked_mean(
+            (predicted_ratio_values.clamp_min(1e-8).log() - target_ratio_values.clamp_min(1e-8).log()).abs(),
+            loss_mask,
+        )
+        predicted_onset_rate = masked_mean(
+            onset_predictions.to(dtype=torch.float32),
+            loss_mask,
+        )
+        target_onset_rate = masked_mean(
+            onset_targets.to(dtype=torch.float32),
+            loss_mask,
+        )
+        if bool(loss_mask.any()):
+            flat_ratio_predictions = ratio_predictions[loss_mask]
+            flat_ratio_targets = ratio_targets[loss_mask]
+            ratio_prediction_top_share = (
+                torch.bincount(flat_ratio_predictions, minlength=model.ratio_count).max()
+                / flat_ratio_predictions.numel()
+            )
+            ratio_target_top_share = (
+                torch.bincount(flat_ratio_targets, minlength=model.ratio_count).max()
+                / flat_ratio_targets.numel()
+            )
+        else:
+            ratio_prediction_top_share = ratio_accuracy.new_zeros(())
+            ratio_target_top_share = ratio_accuracy.new_zeros(())
         metrics = {
             "loss": float(loss.detach().cpu()),
+            "onset_loss": float(onset_loss.detach().cpu()),
+            "ratio_loss": float(ratio_loss.detach().cpu()),
             "token_accuracy": float(token_accuracy.detach().cpu()),
+            "onset_accuracy": float(onset_accuracy.detach().cpu()),
+            "ratio_accuracy": float(ratio_accuracy.detach().cpu()),
+            "ratio_top3_accuracy": float(ratio_top3_accuracy.detach().cpu()),
+            "ratio_top5_accuracy": float(ratio_top5_accuracy.detach().cpu()),
+            "duration_mae": float(duration_mae.detach().cpu()),
+            "duration_log_mae": float(duration_log_mae.detach().cpu()),
+            "predicted_onset_rate": float(predicted_onset_rate.detach().cpu()),
+            "target_onset_rate": float(target_onset_rate.detach().cpu()),
+            "ratio_prediction_top_share": float(ratio_prediction_top_share.detach().cpu()),
+            "ratio_target_top_share": float(ratio_target_top_share.detach().cpu()),
             "masked_tokens": float(loss_mask.sum().detach().cpu()),
         }
     return loss, metrics
@@ -143,6 +223,7 @@ def train_one_epoch(
     optimizer: torch.optim.Optimizer,
     device: torch.device,
     args: argparse.Namespace,
+    ratio_values: torch.Tensor,
     use_amp: bool,
     progress: bool,
     desc: str,
@@ -151,7 +232,19 @@ def train_one_epoch(
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     totals = {
         "loss": 0.0,
+        "onset_loss": 0.0,
+        "ratio_loss": 0.0,
         "token_accuracy": 0.0,
+        "onset_accuracy": 0.0,
+        "ratio_accuracy": 0.0,
+        "ratio_top3_accuracy": 0.0,
+        "ratio_top5_accuracy": 0.0,
+        "duration_mae": 0.0,
+        "duration_log_mae": 0.0,
+        "predicted_onset_rate": 0.0,
+        "target_onset_rate": 0.0,
+        "ratio_prediction_top_share": 0.0,
+        "ratio_target_top_share": 0.0,
         "masked_tokens": 0.0,
     }
     total_examples = 0
@@ -167,6 +260,9 @@ def train_one_epoch(
                 batch=batch,
                 mask_prob=args.mask_prob,
                 mask_span_tokens=args.mask_span_tokens,
+                ratio_values=ratio_values,
+                onset_loss_weight=args.onset_loss_weight,
+                ratio_loss_weight=args.ratio_loss_weight,
             )
 
         scaler.scale(loss).backward()
@@ -183,7 +279,9 @@ def train_one_epoch(
         if tqdm is not None and hasattr(progress_bar, "set_postfix"):
             progress_bar.set_postfix(
                 loss=totals["loss"] / max(total_examples, 1),
-                acc=totals["token_accuracy"] / max(total_examples, 1),
+                tok=totals["token_accuracy"] / max(total_examples, 1),
+                onset=totals["onset_accuracy"] / max(total_examples, 1),
+                ratio=totals["ratio_accuracy"] / max(total_examples, 1),
             )
 
     return {key: value / max(total_examples, 1) for key, value in totals.items()}
@@ -195,6 +293,7 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
     args: argparse.Namespace,
+    ratio_values: torch.Tensor,
     use_amp: bool,
     progress: bool,
     desc: str,
@@ -202,7 +301,19 @@ def evaluate(
     model.eval()
     totals = {
         "loss": 0.0,
+        "onset_loss": 0.0,
+        "ratio_loss": 0.0,
         "token_accuracy": 0.0,
+        "onset_accuracy": 0.0,
+        "ratio_accuracy": 0.0,
+        "ratio_top3_accuracy": 0.0,
+        "ratio_top5_accuracy": 0.0,
+        "duration_mae": 0.0,
+        "duration_log_mae": 0.0,
+        "predicted_onset_rate": 0.0,
+        "target_onset_rate": 0.0,
+        "ratio_prediction_top_share": 0.0,
+        "ratio_target_top_share": 0.0,
         "masked_tokens": 0.0,
     }
     total_examples = 0
@@ -216,6 +327,9 @@ def evaluate(
                 batch=batch,
                 mask_prob=args.mask_prob,
                 mask_span_tokens=args.mask_span_tokens,
+                ratio_values=ratio_values,
+                onset_loss_weight=args.onset_loss_weight,
+                ratio_loss_weight=args.ratio_loss_weight,
             )
 
         batch_size = batch["melody_token_ids"].shape[0]
@@ -225,7 +339,9 @@ def evaluate(
         if tqdm is not None and hasattr(progress_bar, "set_postfix"):
             progress_bar.set_postfix(
                 loss=totals["loss"] / max(total_examples, 1),
-                acc=totals["token_accuracy"] / max(total_examples, 1),
+                tok=totals["token_accuracy"] / max(total_examples, 1),
+                onset=totals["onset_accuracy"] / max(total_examples, 1),
+                ratio=totals["ratio_accuracy"] / max(total_examples, 1),
             )
 
     return {key: value / max(total_examples, 1) for key, value in totals.items()}
@@ -248,7 +364,7 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "args": vars(args),
         "metrics": metrics,
-        "objective": "masked_note_token_modeling",
+        "objective": "masked_onset_and_ratio_modeling",
     }
     torch.save(checkpoint, output_dir / name)
 
@@ -282,7 +398,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--melody-max-length", type=int, default=4096)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--mask-prob", type=float, default=0.35)
-    parser.add_argument("--mask-span-tokens", type=int, default=3)
+    parser.add_argument("--mask-span-tokens", type=int, default=1)
+    parser.add_argument("--onset-loss-weight", type=float, default=1.0)
+    parser.add_argument("--ratio-loss-weight", type=float, default=1.0)
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
     parser.add_argument("--seed", type=int, default=13)
     return parser.parse_args()
@@ -295,6 +413,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--mask-span-tokens must be positive")
     if args.melody_max_length <= 0:
         raise SystemExit("--melody-max-length must be positive")
+    if args.onset_loss_weight < 0.0 or args.ratio_loss_weight < 0.0:
+        raise SystemExit("--onset-loss-weight and --ratio-loss-weight must be non-negative")
+    if args.onset_loss_weight == 0.0 and args.ratio_loss_weight == 0.0:
+        raise SystemExit("At least one pretraining loss weight must be positive")
 
 
 def main() -> None:
@@ -321,6 +443,12 @@ def main() -> None:
     if len(train_dataset) == 0:
         raise SystemExit(f"No melody training examples found for split={args.train_split}")
     args.melody_vocab_size = train_dataset.melody_vocab_size
+    args.melody_ratio_count = train_dataset.melody_ratio_count
+    ratio_values = torch.tensor(
+        train_dataset.melody_ratio_values,
+        dtype=torch.float32,
+        device=device,
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
@@ -347,6 +475,7 @@ def main() -> None:
 
     model = MelodyMaskedTokenModel(
         vocab_size=args.melody_vocab_size,
+        ratio_count=args.melody_ratio_count,
         projection_dim=args.projection_dim,
         d_model=args.melody_d_model,
         num_layers=args.melody_num_layers,
@@ -373,6 +502,7 @@ def main() -> None:
             optimizer=optimizer,
             device=device,
             args=args,
+            ratio_values=ratio_values,
             use_amp=use_amp,
             progress=progress,
             desc=f"pretrain epoch {epoch}/{args.epochs}",
@@ -382,8 +512,15 @@ def main() -> None:
         message = (
             f"epoch={epoch} "
             f"train_loss={train_metrics['loss']:.4f} "
+            f"train_onset_loss={train_metrics['onset_loss']:.4f} "
+            f"train_ratio_loss={train_metrics['ratio_loss']:.4f} "
             f"train_token_acc={train_metrics['token_accuracy']:.4f} "
-            f"train_masked_tokens={train_metrics['masked_tokens']:.1f}"
+            f"train_onset_acc={train_metrics['onset_accuracy']:.4f} "
+            f"train_ratio_acc={train_metrics['ratio_accuracy']:.4f} "
+            f"train_ratio_top3={train_metrics['ratio_top3_accuracy']:.4f} "
+            f"train_dur_mae={train_metrics['duration_mae']:.4f} "
+            f"train_pred_onset={train_metrics['predicted_onset_rate']:.3f} "
+            f"train_ratio_top_share={train_metrics['ratio_prediction_top_share']:.3f}"
         )
 
         if val_loader is not None:
@@ -392,6 +529,7 @@ def main() -> None:
                 loader=val_loader,
                 device=device,
                 args=args,
+                ratio_values=ratio_values,
                 use_amp=use_amp,
                 progress=progress,
                 desc=f"val epoch {epoch}/{args.epochs}",
@@ -399,7 +537,15 @@ def main() -> None:
             metrics["val"] = val_metrics
             message += (
                 f" val_loss={val_metrics['loss']:.4f} "
-                f"val_token_acc={val_metrics['token_accuracy']:.4f}"
+                f"val_token_acc={val_metrics['token_accuracy']:.4f} "
+                f"val_onset_acc={val_metrics['onset_accuracy']:.4f} "
+                f"val_ratio_acc={val_metrics['ratio_accuracy']:.4f} "
+                f"val_ratio_top3={val_metrics['ratio_top3_accuracy']:.4f} "
+                f"val_dur_mae={val_metrics['duration_mae']:.4f} "
+                f"val_pred_onset={val_metrics['predicted_onset_rate']:.3f} "
+                f"val_target_onset={val_metrics['target_onset_rate']:.3f} "
+                f"val_ratio_top_share={val_metrics['ratio_prediction_top_share']:.3f} "
+                f"val_ratio_target_top_share={val_metrics['ratio_target_top_share']:.3f}"
             )
             if val_metrics["loss"] < best_val_loss:
                 best_val_loss = val_metrics["loss"]

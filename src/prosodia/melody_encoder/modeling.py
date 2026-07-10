@@ -175,11 +175,12 @@ class MelodyTransformerEncoder(nn.Module):
 
 
 class MelodyMaskedTokenModel(nn.Module):
-    """Masked language-model style pretraining head for melody note tokens."""
+    """Masked pretraining heads for onset/rest and duration-ratio tokens."""
 
     def __init__(
         self,
         vocab_size: int,
+        ratio_count: int | None = None,
         projection_dim: int = 256,
         d_model: int = 256,
         num_layers: int = 4,
@@ -195,6 +196,13 @@ class MelodyMaskedTokenModel(nn.Module):
         self.vocab_size = vocab_size
         self.pad_token_id = pad_token_id
         self.mask_token_id = mask_token_id
+        if ratio_count is None:
+            if (vocab_size - 2) % 2 != 0:
+                raise ValueError("Cannot infer ratio_count from vocab_size")
+            ratio_count = (vocab_size - 2) // 2
+        if ratio_count <= 0:
+            raise ValueError("ratio_count must be positive")
+        self.ratio_count = ratio_count
         self.encoder = MelodyTransformerEncoder(
             vocab_size=vocab_size,
             projection_dim=projection_dim,
@@ -208,11 +216,17 @@ class MelodyMaskedTokenModel(nn.Module):
             pad_token_id=pad_token_id,
             mask_token_id=mask_token_id,
         )
-        self.token_head = nn.Sequential(
+        self.onset_head = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model, vocab_size),
+            nn.Linear(d_model, 2),
+        )
+        self.ratio_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, ratio_count),
         )
 
     def forward(
@@ -226,7 +240,8 @@ class MelodyMaskedTokenModel(nn.Module):
             normalize=False,
         )
         return {
-            "token_logits": self.token_head(encoded.token_embeddings),
+            "onset_logits": self.onset_head(encoded.token_embeddings),
+            "ratio_logits": self.ratio_head(encoded.token_embeddings),
             "pooled_embedding": encoded.projected_embedding,
         }
 
