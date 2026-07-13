@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import math
 import random
 from collections import defaultdict
 from dataclasses import dataclass
@@ -26,6 +27,8 @@ class MelodyConfig:
     quantization_dir: str | Path | None = None
     events_filename: str = "events.jsonl"
     ratio_vocabulary_filename: str = "ratio_vocabulary.json"
+    min_pitch_midi: int = 21
+    max_pitch_midi: int = 108
 
 
 @dataclass(frozen=True)
@@ -34,28 +37,68 @@ class QuantizedSongEvents:
 
 
 class NoteEventTokenizer:
-    """Tokenize quantized melody events as (onset/rest, duration-ratio) IDs."""
+    """Tokenize melody events as bounded MIDI-pitch/rest and duration-ratio IDs.
+
+    Event class 0 is a rest. Note event classes 1..pitch_count correspond to
+    chromatic MIDI pitches in the configured inclusive range. Note pitches
+    outside that range are clipped to the nearest boundary before tokenization.
+    """
 
     pad_token_id = 0
     mask_token_id = 1
 
-    def __init__(self, ratios: list[str]) -> None:
+    def __init__(
+        self,
+        ratios: list[str],
+        min_pitch_midi: int = 21,
+        max_pitch_midi: int = 108,
+    ) -> None:
         if not ratios:
             raise ValueError("ratio vocabulary must not be empty")
         if len(set(ratios)) != len(ratios):
             raise ValueError("ratio vocabulary contains duplicate ratios")
+        min_pitch_midi = int(min_pitch_midi)
+        max_pitch_midi = int(max_pitch_midi)
+        if not 0 <= min_pitch_midi <= max_pitch_midi <= 127:
+            raise ValueError(
+                "pitch range must satisfy 0 <= min_pitch_midi <= max_pitch_midi <= 127"
+            )
+        if max_pitch_midi - min_pitch_midi + 1 > 88:
+            raise ValueError("pitch vocabulary must contain at most 88 note pitches")
         self.ratios = ratios
         self.ratio_to_id = {ratio: index for index, ratio in enumerate(ratios)}
         self.ratio_values = [float(Fraction(ratio)) for ratio in ratios]
-        self.vocab_size = 2 + (2 * len(ratios))
+        self.min_pitch_midi = min_pitch_midi
+        self.max_pitch_midi = max_pitch_midi
+        self.pitch_count = self.max_pitch_midi - self.min_pitch_midi + 1
+        self.event_class_count = 1 + self.pitch_count
+        self.vocab_size = 2 + (self.event_class_count * len(ratios))
 
     @property
     def ratio_count(self) -> int:
         return len(self.ratios)
 
-    def token_id(self, onset: int, ratio: str) -> int:
+    def quantize_pitch_midi(self, pitch_midi: Any) -> int:
+        if pitch_midi is None:
+            raise ValueError("Note event is missing pitch_midi")
+        pitch_value = float(pitch_midi)
+        if not math.isfinite(pitch_value):
+            raise ValueError(f"Note event has non-finite pitch_midi: {pitch_midi}")
+        rounded_pitch = int(math.floor(pitch_value + 0.5))
+        clipped_pitch = min(max(rounded_pitch, self.min_pitch_midi), self.max_pitch_midi)
+        return clipped_pitch - self.min_pitch_midi
+
+    def token_id(self, onset: int, ratio: str, pitch_id: int | None = None) -> int:
         ratio_id = self.ratio_to_id[ratio]
-        return 2 + (int(onset) * self.ratio_count) + ratio_id
+        if int(onset) == 0:
+            event_class_id = 0
+        else:
+            if pitch_id is None or not 0 <= pitch_id < self.pitch_count:
+                raise ValueError(
+                    f"Note pitch_id must be in [0, {self.pitch_count - 1}], got {pitch_id}"
+                )
+            event_class_id = 1 + pitch_id
+        return 2 + (event_class_id * self.ratio_count) + ratio_id
 
     def encode_events(
         self,
@@ -65,6 +108,7 @@ class NoteEventTokenizer:
     ) -> dict[str, torch.Tensor]:
         token_ids: list[int] = []
         onset_ids: list[int] = []
+        pitch_ids: list[int] = []
         ratio_ids: list[int] = []
         event_starts: list[float] = []
         event_ends: list[float] = []
@@ -81,8 +125,16 @@ class NoteEventTokenizer:
             if ratio not in self.ratio_to_id:
                 raise ValueError(f"Unknown quantized melody ratio: {ratio}")
             onset = 1 if kind == "note" else 0
-            token_ids.append(self.token_id(onset=onset, ratio=ratio))
+            pitch_id = self.quantize_pitch_midi(event.get("pitch_midi")) if onset else -1
+            token_ids.append(
+                self.token_id(
+                    onset=onset,
+                    ratio=ratio,
+                    pitch_id=pitch_id if onset else None,
+                )
+            )
             onset_ids.append(onset)
+            pitch_ids.append(pitch_id)
             ratio_ids.append(self.ratio_to_id[ratio])
             event_starts.append(event_start)
             event_ends.append(event_end)
@@ -90,6 +142,7 @@ class NoteEventTokenizer:
         return {
             "token_ids": torch.tensor(token_ids, dtype=torch.long),
             "onsets": torch.tensor(onset_ids, dtype=torch.long),
+            "pitch_ids": torch.tensor(pitch_ids, dtype=torch.long),
             "ratio_ids": torch.tensor(ratio_ids, dtype=torch.long),
             "event_starts": torch.tensor(event_starts, dtype=torch.float32),
             "event_ends": torch.tensor(event_ends, dtype=torch.float32),
@@ -187,7 +240,9 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         self.transform = transform
         self.quantization_dir = quantization_dir_for_manifest(self.manifest_dir, self.melody_config)
         self.tokenizer = NoteEventTokenizer(
-            load_ratio_vocabulary(self.quantization_dir / self.melody_config.ratio_vocabulary_filename)
+            load_ratio_vocabulary(self.quantization_dir / self.melody_config.ratio_vocabulary_filename),
+            min_pitch_midi=self.melody_config.min_pitch_midi,
+            max_pitch_midi=self.melody_config.max_pitch_midi,
         )
         self.quantized_events_by_song = load_quantized_song_events(
             self.quantization_dir / self.melody_config.events_filename
@@ -218,6 +273,10 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
     @property
     def melody_ratio_count(self) -> int:
         return self.tokenizer.ratio_count
+
+    @property
+    def melody_pitch_count(self) -> int:
+        return self.tokenizer.pitch_count
 
     @property
     def melody_ratio_values(self) -> list[float]:
@@ -295,6 +354,7 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         item: dict[str, Any] = {
             "melody_token_ids": melody["token_ids"],
             "melody_onsets": melody["onsets"],
+            "melody_pitch_ids": melody["pitch_ids"],
             "melody_ratio_ids": melody["ratio_ids"],
             "melody_event_starts": melody["event_starts"],
             "melody_event_ends": melody["event_ends"],
@@ -443,7 +503,9 @@ class MelodyOnlyDataset(Dataset[dict[str, Any]]):
         self.transform = transform
         self.quantization_dir = quantization_dir_for_manifest(self.manifest_dir, self.melody_config)
         self.tokenizer = NoteEventTokenizer(
-            load_ratio_vocabulary(self.quantization_dir / self.melody_config.ratio_vocabulary_filename)
+            load_ratio_vocabulary(self.quantization_dir / self.melody_config.ratio_vocabulary_filename),
+            min_pitch_midi=self.melody_config.min_pitch_midi,
+            max_pitch_midi=self.melody_config.max_pitch_midi,
         )
         self.quantized_events_by_song = load_quantized_song_events(
             self.quantization_dir / self.melody_config.events_filename
@@ -469,6 +531,10 @@ class MelodyOnlyDataset(Dataset[dict[str, Any]]):
         return self.tokenizer.ratio_count
 
     @property
+    def melody_pitch_count(self) -> int:
+        return self.tokenizer.pitch_count
+
+    @property
     def melody_ratio_values(self) -> list[float]:
         return self.tokenizer.ratio_values
 
@@ -492,6 +558,7 @@ class MelodyOnlyDataset(Dataset[dict[str, Any]]):
         item: dict[str, Any] = {
             "melody_token_ids": melody["token_ids"],
             "melody_onsets": melody["onsets"],
+            "melody_pitch_ids": melody["pitch_ids"],
             "melody_ratio_ids": melody["ratio_ids"],
             "melody_event_starts": melody["event_starts"],
             "melody_event_ends": melody["event_ends"],
@@ -533,6 +600,7 @@ def melody_only_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         dtype=torch.long,
     )
     melody_onsets = torch.full((batch_size, max_tokens), -1, dtype=torch.long)
+    melody_pitch_ids = torch.full((batch_size, max_tokens), -1, dtype=torch.long)
     melody_ratio_ids = torch.full((batch_size, max_tokens), -1, dtype=torch.long)
     melody_event_starts = torch.zeros(batch_size, max_tokens)
     melody_event_ends = torch.zeros(batch_size, max_tokens)
@@ -542,6 +610,7 @@ def melody_only_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         token_count = item["melody_token_ids"].shape[0]
         melody_token_ids[batch_index, :token_count] = item["melody_token_ids"]
         melody_onsets[batch_index, :token_count] = item["melody_onsets"]
+        melody_pitch_ids[batch_index, :token_count] = item["melody_pitch_ids"]
         melody_ratio_ids[batch_index, :token_count] = item["melody_ratio_ids"]
         melody_event_starts[batch_index, :token_count] = item["melody_event_starts"]
         melody_event_ends[batch_index, :token_count] = item["melody_event_ends"]
@@ -550,6 +619,7 @@ def melody_only_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "melody_token_ids": melody_token_ids,
         "melody_onsets": melody_onsets,
+        "melody_pitch_ids": melody_pitch_ids,
         "melody_ratio_ids": melody_ratio_ids,
         "melody_event_starts": melody_event_starts,
         "melody_event_ends": melody_event_ends,

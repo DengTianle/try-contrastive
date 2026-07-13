@@ -104,6 +104,7 @@ def pretrain_step(
     mask_span_tokens: int,
     ratio_values: torch.Tensor,
     onset_loss_weight: float,
+    pitch_loss_weight: float,
     ratio_loss_weight: float,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     attention_mask = batch["melody_attention_mask"].to(dtype=torch.bool)
@@ -114,6 +115,7 @@ def pretrain_step(
     )
     token_targets = batch["melody_token_ids"]
     onset_targets = batch["melody_onsets"].to(dtype=torch.long)
+    pitch_targets = batch["melody_pitch_ids"].to(dtype=torch.long)
     ratio_targets = batch["melody_ratio_ids"].to(dtype=torch.long)
     melody_inputs = token_targets.masked_fill(token_mask, model.mask_token_id)
 
@@ -123,6 +125,7 @@ def pretrain_step(
     )
 
     loss_mask = token_mask & attention_mask
+    pitch_loss_mask = loss_mask & onset_targets.to(dtype=torch.bool)
     if not bool(loss_mask.any()):
         onset_loss = outputs["onset_logits"].new_zeros(())
         ratio_loss = outputs["ratio_logits"].new_zeros(())
@@ -135,12 +138,29 @@ def pretrain_step(
             outputs["ratio_logits"][loss_mask],
             ratio_targets[loss_mask],
         )
-    loss = onset_loss_weight * onset_loss + ratio_loss_weight * ratio_loss
+    if not bool(pitch_loss_mask.any()):
+        pitch_loss = outputs["pitch_logits"].new_zeros(())
+    else:
+        pitch_loss = F.cross_entropy(
+            outputs["pitch_logits"][pitch_loss_mask],
+            pitch_targets[pitch_loss_mask],
+        )
+    loss = (
+        onset_loss_weight * onset_loss
+        + pitch_loss_weight * pitch_loss
+        + ratio_loss_weight * ratio_loss
+    )
 
     with torch.no_grad():
         onset_predictions = outputs["onset_logits"].argmax(dim=-1)
+        pitch_predictions = outputs["pitch_logits"].argmax(dim=-1)
         ratio_predictions = outputs["ratio_logits"].argmax(dim=-1)
-        predictions = 2 + onset_predictions * model.ratio_count + ratio_predictions
+        event_class_predictions = torch.where(
+            onset_predictions.to(dtype=torch.bool),
+            1 + pitch_predictions,
+            torch.zeros_like(pitch_predictions),
+        )
+        predictions = 2 + event_class_predictions * model.ratio_count + ratio_predictions
         token_accuracy = masked_mean(
             (predictions == token_targets).to(dtype=torch.float32),
             loss_mask,
@@ -148,6 +168,20 @@ def pretrain_step(
         onset_accuracy = masked_mean(
             (onset_predictions == onset_targets).to(dtype=torch.float32),
             loss_mask,
+        )
+        pitch_accuracy = masked_mean(
+            (pitch_predictions == pitch_targets).to(dtype=torch.float32),
+            pitch_loss_mask,
+        )
+        pitch_topk = min(3, model.pitch_count)
+        pitch_top3 = outputs["pitch_logits"].topk(k=pitch_topk, dim=-1).indices
+        pitch_top3_accuracy = masked_mean(
+            (pitch_top3 == pitch_targets.unsqueeze(-1)).any(dim=-1).to(dtype=torch.float32),
+            pitch_loss_mask,
+        )
+        pitch_mae_semitones = masked_mean(
+            (pitch_predictions - pitch_targets).abs().to(dtype=torch.float32),
+            pitch_loss_mask,
         )
         ratio_accuracy = masked_mean(
             (ratio_predictions == ratio_targets).to(dtype=torch.float32),
@@ -200,9 +234,13 @@ def pretrain_step(
         metrics = {
             "loss": float(loss.detach().cpu()),
             "onset_loss": float(onset_loss.detach().cpu()),
+            "pitch_loss": float(pitch_loss.detach().cpu()),
             "ratio_loss": float(ratio_loss.detach().cpu()),
             "token_accuracy": float(token_accuracy.detach().cpu()),
             "onset_accuracy": float(onset_accuracy.detach().cpu()),
+            "pitch_accuracy": float(pitch_accuracy.detach().cpu()),
+            "pitch_top3_accuracy": float(pitch_top3_accuracy.detach().cpu()),
+            "pitch_mae_semitones": float(pitch_mae_semitones.detach().cpu()),
             "ratio_accuracy": float(ratio_accuracy.detach().cpu()),
             "ratio_top3_accuracy": float(ratio_top3_accuracy.detach().cpu()),
             "ratio_top5_accuracy": float(ratio_top5_accuracy.detach().cpu()),
@@ -213,6 +251,7 @@ def pretrain_step(
             "ratio_prediction_top_share": float(ratio_prediction_top_share.detach().cpu()),
             "ratio_target_top_share": float(ratio_target_top_share.detach().cpu()),
             "masked_tokens": float(loss_mask.sum().detach().cpu()),
+            "masked_note_tokens": float(pitch_loss_mask.sum().detach().cpu()),
         }
     return loss, metrics
 
@@ -233,9 +272,13 @@ def train_one_epoch(
     totals = {
         "loss": 0.0,
         "onset_loss": 0.0,
+        "pitch_loss": 0.0,
         "ratio_loss": 0.0,
         "token_accuracy": 0.0,
         "onset_accuracy": 0.0,
+        "pitch_accuracy": 0.0,
+        "pitch_top3_accuracy": 0.0,
+        "pitch_mae_semitones": 0.0,
         "ratio_accuracy": 0.0,
         "ratio_top3_accuracy": 0.0,
         "ratio_top5_accuracy": 0.0,
@@ -246,6 +289,7 @@ def train_one_epoch(
         "ratio_prediction_top_share": 0.0,
         "ratio_target_top_share": 0.0,
         "masked_tokens": 0.0,
+        "masked_note_tokens": 0.0,
     }
     total_examples = 0
 
@@ -262,6 +306,7 @@ def train_one_epoch(
                 mask_span_tokens=args.mask_span_tokens,
                 ratio_values=ratio_values,
                 onset_loss_weight=args.onset_loss_weight,
+                pitch_loss_weight=args.pitch_loss_weight,
                 ratio_loss_weight=args.ratio_loss_weight,
             )
 
@@ -281,6 +326,7 @@ def train_one_epoch(
                 loss=totals["loss"] / max(total_examples, 1),
                 tok=totals["token_accuracy"] / max(total_examples, 1),
                 onset=totals["onset_accuracy"] / max(total_examples, 1),
+                pitch=totals["pitch_accuracy"] / max(total_examples, 1),
                 ratio=totals["ratio_accuracy"] / max(total_examples, 1),
             )
 
@@ -302,9 +348,13 @@ def evaluate(
     totals = {
         "loss": 0.0,
         "onset_loss": 0.0,
+        "pitch_loss": 0.0,
         "ratio_loss": 0.0,
         "token_accuracy": 0.0,
         "onset_accuracy": 0.0,
+        "pitch_accuracy": 0.0,
+        "pitch_top3_accuracy": 0.0,
+        "pitch_mae_semitones": 0.0,
         "ratio_accuracy": 0.0,
         "ratio_top3_accuracy": 0.0,
         "ratio_top5_accuracy": 0.0,
@@ -315,6 +365,7 @@ def evaluate(
         "ratio_prediction_top_share": 0.0,
         "ratio_target_top_share": 0.0,
         "masked_tokens": 0.0,
+        "masked_note_tokens": 0.0,
     }
     total_examples = 0
 
@@ -329,6 +380,7 @@ def evaluate(
                 mask_span_tokens=args.mask_span_tokens,
                 ratio_values=ratio_values,
                 onset_loss_weight=args.onset_loss_weight,
+                pitch_loss_weight=args.pitch_loss_weight,
                 ratio_loss_weight=args.ratio_loss_weight,
             )
 
@@ -341,6 +393,7 @@ def evaluate(
                 loss=totals["loss"] / max(total_examples, 1),
                 tok=totals["token_accuracy"] / max(total_examples, 1),
                 onset=totals["onset_accuracy"] / max(total_examples, 1),
+                pitch=totals["pitch_accuracy"] / max(total_examples, 1),
                 ratio=totals["ratio_accuracy"] / max(total_examples, 1),
             )
 
@@ -364,7 +417,7 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "args": vars(args),
         "metrics": metrics,
-        "objective": "masked_onset_and_ratio_modeling",
+        "objective": "masked_onset_pitch_and_ratio_modeling",
     }
     torch.save(checkpoint, output_dir / name)
 
@@ -400,7 +453,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-prob", type=float, default=0.35)
     parser.add_argument("--mask-span-tokens", type=int, default=1)
     parser.add_argument("--onset-loss-weight", type=float, default=1.0)
+    parser.add_argument("--pitch-loss-weight", type=float, default=1.0)
     parser.add_argument("--ratio-loss-weight", type=float, default=1.0)
+    parser.add_argument("--min-pitch-midi", type=int, default=36)
+    parser.add_argument("--max-pitch-midi", type=int, default=91)
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
     parser.add_argument("--seed", type=int, default=13)
     return parser.parse_args()
@@ -413,10 +469,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--mask-span-tokens must be positive")
     if args.melody_max_length <= 0:
         raise SystemExit("--melody-max-length must be positive")
-    if args.onset_loss_weight < 0.0 or args.ratio_loss_weight < 0.0:
-        raise SystemExit("--onset-loss-weight and --ratio-loss-weight must be non-negative")
-    if args.onset_loss_weight == 0.0 and args.ratio_loss_weight == 0.0:
+    if min(args.onset_loss_weight, args.pitch_loss_weight, args.ratio_loss_weight) < 0.0:
+        raise SystemExit("Pretraining loss weights must be non-negative")
+    if args.onset_loss_weight == args.pitch_loss_weight == args.ratio_loss_weight == 0.0:
         raise SystemExit("At least one pretraining loss weight must be positive")
+    if not 0 <= args.min_pitch_midi <= args.max_pitch_midi <= 127:
+        raise SystemExit("Pitch range must be within MIDI 0--127 and ordered from min to max")
+    if args.max_pitch_midi - args.min_pitch_midi + 1 > 88:
+        raise SystemExit("Pitch range must contain at most 88 semitone bins")
 
 
 def main() -> None:
@@ -438,12 +498,17 @@ def main() -> None:
     train_dataset = MelodyOnlyDataset(
         manifest_path=args.manifest,
         split=args.train_split,
-        melody_config=MelodyConfig(quantization_dir=args.quantization_dir),
+        melody_config=MelodyConfig(
+            quantization_dir=args.quantization_dir,
+            min_pitch_midi=args.min_pitch_midi,
+            max_pitch_midi=args.max_pitch_midi,
+        ),
     )
     if len(train_dataset) == 0:
         raise SystemExit(f"No melody training examples found for split={args.train_split}")
     args.melody_vocab_size = train_dataset.melody_vocab_size
     args.melody_ratio_count = train_dataset.melody_ratio_count
+    args.melody_pitch_count = train_dataset.melody_pitch_count
     ratio_values = torch.tensor(
         train_dataset.melody_ratio_values,
         dtype=torch.float32,
@@ -462,7 +527,11 @@ def main() -> None:
         val_dataset = MelodyOnlyDataset(
             manifest_path=args.manifest,
             split=args.val_split,
-            melody_config=MelodyConfig(quantization_dir=args.quantization_dir),
+            melody_config=MelodyConfig(
+                quantization_dir=args.quantization_dir,
+                min_pitch_midi=args.min_pitch_midi,
+                max_pitch_midi=args.max_pitch_midi,
+            ),
         )
         if len(val_dataset) > 0:
             val_loader = DataLoader(
@@ -476,6 +545,7 @@ def main() -> None:
     model = MelodyMaskedTokenModel(
         vocab_size=args.melody_vocab_size,
         ratio_count=args.melody_ratio_count,
+        pitch_count=args.melody_pitch_count,
         projection_dim=args.projection_dim,
         d_model=args.melody_d_model,
         num_layers=args.melody_num_layers,
@@ -513,9 +583,12 @@ def main() -> None:
             f"epoch={epoch} "
             f"train_loss={train_metrics['loss']:.4f} "
             f"train_onset_loss={train_metrics['onset_loss']:.4f} "
+            f"train_pitch_loss={train_metrics['pitch_loss']:.4f} "
             f"train_ratio_loss={train_metrics['ratio_loss']:.4f} "
             f"train_token_acc={train_metrics['token_accuracy']:.4f} "
             f"train_onset_acc={train_metrics['onset_accuracy']:.4f} "
+            f"train_pitch_acc={train_metrics['pitch_accuracy']:.4f} "
+            f"train_pitch_mae={train_metrics['pitch_mae_semitones']:.3f} "
             f"train_ratio_acc={train_metrics['ratio_accuracy']:.4f} "
             f"train_ratio_top3={train_metrics['ratio_top3_accuracy']:.4f} "
             f"train_dur_mae={train_metrics['duration_mae']:.4f} "
@@ -539,6 +612,9 @@ def main() -> None:
                 f" val_loss={val_metrics['loss']:.4f} "
                 f"val_token_acc={val_metrics['token_accuracy']:.4f} "
                 f"val_onset_acc={val_metrics['onset_accuracy']:.4f} "
+                f"val_pitch_acc={val_metrics['pitch_accuracy']:.4f} "
+                f"val_pitch_top3={val_metrics['pitch_top3_accuracy']:.4f} "
+                f"val_pitch_mae={val_metrics['pitch_mae_semitones']:.3f} "
                 f"val_ratio_acc={val_metrics['ratio_accuracy']:.4f} "
                 f"val_ratio_top3={val_metrics['ratio_top3_accuracy']:.4f} "
                 f"val_dur_mae={val_metrics['duration_mae']:.4f} "

@@ -593,6 +593,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--melody-num-heads", type=int, default=4)
     parser.add_argument("--melody-dim-feedforward", type=int, default=1024)
     parser.add_argument("--melody-max-length", type=int, default=4096)
+    parser.add_argument("--min-pitch-midi", type=int, default=36)
+    parser.add_argument("--max-pitch-midi", type=int, default=91)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument(
         "--melody-pretrained-checkpoint",
@@ -671,6 +673,10 @@ def main() -> None:
         args.global_loss_weight = 0.0
     if args.melody_max_length <= 0:
         raise SystemExit("--melody-max-length must be positive")
+    if not 0 <= args.min_pitch_midi <= args.max_pitch_midi <= 127:
+        raise SystemExit("Pitch range must be within MIDI 0--127 and ordered from min to max")
+    if args.max_pitch_midi - args.min_pitch_midi + 1 > 88:
+        raise SystemExit("Pitch range must contain at most 88 semitone bins")
     if args.audio_gain_db < 0.0:
         raise SystemExit("--audio-gain-db must be non-negative")
     if args.audio_noise_snr_db is not None and args.audio_noise_snr_db <= 0.0:
@@ -690,7 +696,11 @@ def main() -> None:
     train_dataset = GroupedContrastiveDataset(
         manifest_path=args.manifest,
         split=args.train_split,
-        melody_config=MelodyConfig(quantization_dir=args.quantization_dir),
+        melody_config=MelodyConfig(
+            quantization_dir=args.quantization_dir,
+            min_pitch_midi=args.min_pitch_midi,
+            max_pitch_midi=args.max_pitch_midi,
+        ),
         max_negatives=args.max_negatives,
         min_negative_offset_seconds=args.min_negative_offset_seconds,
         seed=args.seed,
@@ -724,7 +734,11 @@ def main() -> None:
         val_dataset = GroupedContrastiveDataset(
             manifest_path=args.manifest,
             split=args.val_split,
-            melody_config=MelodyConfig(quantization_dir=args.quantization_dir),
+            melody_config=MelodyConfig(
+                quantization_dir=args.quantization_dir,
+                min_pitch_midi=args.min_pitch_midi,
+                max_pitch_midi=args.max_pitch_midi,
+            ),
             max_negatives=args.max_negatives,
             min_negative_offset_seconds=args.min_negative_offset_seconds,
             seed=args.seed,

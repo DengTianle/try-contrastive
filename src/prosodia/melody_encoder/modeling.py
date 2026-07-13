@@ -36,7 +36,7 @@ class MelodyEncoderOutput:
 
 
 class MelodyTransformerEncoder(nn.Module):
-    """Transformer encoder for tokenized note/rest-ratio melody sequences."""
+    """Transformer encoder for tokenized pitch/rest and duration-ratio sequences."""
 
     def __init__(
         self,
@@ -175,12 +175,13 @@ class MelodyTransformerEncoder(nn.Module):
 
 
 class MelodyMaskedTokenModel(nn.Module):
-    """Masked pretraining heads for onset/rest and duration-ratio tokens."""
+    """Masked pretraining heads for onset/rest, pitch, and duration ratio."""
 
     def __init__(
         self,
         vocab_size: int,
         ratio_count: int | None = None,
+        pitch_count: int = 88,
         projection_dim: int = 256,
         d_model: int = 256,
         num_layers: int = 4,
@@ -196,12 +197,22 @@ class MelodyMaskedTokenModel(nn.Module):
         self.vocab_size = vocab_size
         self.pad_token_id = pad_token_id
         self.mask_token_id = mask_token_id
+        if pitch_count <= 0 or pitch_count > 88:
+            raise ValueError("pitch_count must be in [1, 88]")
+        self.pitch_count = pitch_count
         if ratio_count is None:
-            if (vocab_size - 2) % 2 != 0:
+            event_class_count = 1 + pitch_count
+            if (vocab_size - 2) % event_class_count != 0:
                 raise ValueError("Cannot infer ratio_count from vocab_size")
-            ratio_count = (vocab_size - 2) // 2
+            ratio_count = (vocab_size - 2) // event_class_count
         if ratio_count <= 0:
             raise ValueError("ratio_count must be positive")
+        expected_vocab_size = 2 + ((1 + pitch_count) * ratio_count)
+        if vocab_size != expected_vocab_size:
+            raise ValueError(
+                "vocab_size does not match pitch_count and ratio_count: "
+                f"expected {expected_vocab_size}, got {vocab_size}"
+            )
         self.ratio_count = ratio_count
         self.encoder = MelodyTransformerEncoder(
             vocab_size=vocab_size,
@@ -222,6 +233,12 @@ class MelodyMaskedTokenModel(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(d_model, 2),
         )
+        self.pitch_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, pitch_count),
+        )
         self.ratio_head = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.GELU(),
@@ -241,6 +258,7 @@ class MelodyMaskedTokenModel(nn.Module):
         )
         return {
             "onset_logits": self.onset_head(encoded.token_embeddings),
+            "pitch_logits": self.pitch_head(encoded.token_embeddings),
             "ratio_logits": self.ratio_head(encoded.token_embeddings),
             "pooled_embedding": encoded.projected_embedding,
         }

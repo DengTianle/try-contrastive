@@ -21,7 +21,7 @@ def build_contrastive_model_from_checkpoint_args(
         ),
         projection_dim=checkpoint_arg(checkpoint_args, "projection_dim", 256),
         freeze_hubert=checkpoint_arg(checkpoint_args, "freeze_hubert", False),
-        melody_vocab_size=checkpoint_arg(checkpoint_args, "melody_vocab_size", 234),
+        melody_vocab_size=checkpoint_arg(checkpoint_args, "melody_vocab_size", 10326),
         melody_d_model=checkpoint_arg(checkpoint_args, "melody_d_model", 256),
         melody_num_layers=checkpoint_arg(checkpoint_args, "melody_num_layers", 4),
         melody_num_heads=checkpoint_arg(checkpoint_args, "melody_num_heads", 4),

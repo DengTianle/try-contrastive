@@ -508,11 +508,17 @@ def main() -> None:
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     checkpoint_args = checkpoint.get("args", {})
     seed = int(args.seed if args.seed is not None else checkpoint_arg(checkpoint_args, "seed", 13))
+    min_pitch_midi = int(checkpoint_arg(checkpoint_args, "min_pitch_midi", 21))
+    max_pitch_midi = int(checkpoint_arg(checkpoint_args, "max_pitch_midi", 108))
 
     dataset = GroupedContrastiveDataset(
         manifest_path=args.manifest,
         split=args.split,
-        melody_config=MelodyConfig(quantization_dir=args.quantization_dir),
+        melody_config=MelodyConfig(
+            quantization_dir=args.quantization_dir,
+            min_pitch_midi=min_pitch_midi,
+            max_pitch_midi=max_pitch_midi,
+        ),
         max_negatives=0,
         seed=seed,
     )

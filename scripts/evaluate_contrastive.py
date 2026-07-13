@@ -291,6 +291,8 @@ def main() -> None:
     use_amp = args.amp and device.type == "cuda"
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     checkpoint_args = checkpoint.get("args", {})
+    min_pitch_midi = int(checkpoint_arg(checkpoint_args, "min_pitch_midi", 36))
+    max_pitch_midi = int(checkpoint_arg(checkpoint_args, "max_pitch_midi", 108))
     temperature = args.temperature
     if temperature is None:
         temperature = checkpoint_arg(checkpoint_args, "temperature", 0.07)
@@ -298,7 +300,11 @@ def main() -> None:
     dataset = GroupedContrastiveDataset(
         manifest_path=args.manifest,
         split=args.split,
-        melody_config=MelodyConfig(quantization_dir=args.quantization_dir),
+        melody_config=MelodyConfig(
+            quantization_dir=args.quantization_dir,
+            min_pitch_midi=min_pitch_midi,
+            max_pitch_midi=max_pitch_midi,
+        ),
         max_negatives=args.max_negatives,
         min_negative_offset_seconds=args.min_negative_offset_seconds,
         seed=checkpoint_arg(checkpoint_args, "seed", 13),

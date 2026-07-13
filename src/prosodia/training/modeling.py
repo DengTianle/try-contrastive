@@ -13,7 +13,7 @@ class MelodyAudioContrastiveModel(nn.Module):
         hubert_model_name: str,
         projection_dim: int = 256,
         freeze_hubert: bool = False,
-        melody_vocab_size: int = 234,
+        melody_vocab_size: int = 10326,
         melody_d_model: int = 256,
         melody_num_layers: int = 4,
         melody_num_heads: int = 4,
