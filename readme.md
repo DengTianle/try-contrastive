@@ -19,3 +19,14 @@ conda run -n try-contrastive python scripts/train_contrastive.py \
 ```
 
 The contrastive melody projection head is initialized from scratch by default.
+
+## Melody encoder diagnostics
+
+The embedding diagnostic reports collapse and alignment metrics plus linear probes for
+absolute pitch and the total number of annotated notes overlapping each segment. The
+note-count probe requires a manifest produced by the current dataset preparation script.
+
+```bash
+conda run -n try-contrastive python scripts/diagnose_embeddings.py \
+  --checkpoint checkpoints/contrastive/best.pt
+```
