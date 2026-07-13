@@ -311,6 +311,18 @@ def annotation_duration_seconds(notes: list[dict[str, Any]]) -> float:
         return 0.0
     return max(float(note["time"][-1]) for note in notes)
 
+def count_segment_notes(
+    notes: list[dict[str, Any]],
+    start_seconds: float,
+    segment_seconds: float,
+) -> int:
+    """Count annotated notes that overlap a segment by any positive duration."""
+    segment_end = start_seconds + segment_seconds
+    return sum(
+        float(note["time"][-1]) > start_seconds
+        and float(note["time"][0]) < segment_end
+        for note in notes
+    )
 
 def write_melody_npz(
     melody_dir: Path,
@@ -355,6 +367,7 @@ def row_for_segment(
         "segment_seconds": f"{segment['segment_seconds']:.6f}",
         "melody_frame_rate": f"{segment['frame_rate']:.6f}",
         "voiced_ratio": f"{segment['voiced_ratio']:.6f}",
+        "note_count": str(segment["note_count"]),
     }
 
 
@@ -579,6 +592,11 @@ def main() -> None:
                 "segment_seconds": args.segment_seconds,
                 "frame_rate": args.melody_frame_rate,
                 "voiced_ratio": voiced_ratio,
+                "note_count": count_segment_notes(
+                    track["notes"],
+                    start_seconds=start_seconds,
+                    segment_seconds=args.segment_seconds,
+                ),
             }
             all_segments.append(segment)
             if args.max_segments > 0 and len(all_segments) >= args.max_segments:

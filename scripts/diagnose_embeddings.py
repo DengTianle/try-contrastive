@@ -60,6 +60,11 @@ def safe_float(value: Any) -> float:
     except (TypeError, ValueError):
         return float("nan")
 
+def finite_mean_and_std(values: np.ndarray) -> tuple[float, float]:
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return float("nan"), float("nan")
+    return float(np.mean(finite)), float(np.std(finite))
 
 def finite_mean_onset_fraction(
     onsets: torch.Tensor,
@@ -90,6 +95,7 @@ def extract_embeddings(
     starts_seconds: list[float] = []
     voiced_ratios: list[float] = []
     onset_fractions: list[float] = []
+    note_counts: list[float] = []
 
     for batch in loader:
         batch = move_batch_to_device(batch, device)
@@ -118,6 +124,7 @@ def extract_embeddings(
             song_ids.append(str(positive_row["dali_id"]))
             starts_seconds.append(safe_float(positive_row.get("start_seconds")))
             voiced_ratios.append(safe_float(positive_row.get("voiced_ratio")))
+            note_counts.append(safe_float(positive_row.get("note_count")))
 
     if not melody_embeddings:
         raise SystemExit("No examples found for diagnostics.")
@@ -130,6 +137,7 @@ def extract_embeddings(
         "start_seconds": starts_seconds,
         "voiced_ratio": voiced_ratios,
         "onset_fraction": onset_fractions,
+        "note_count": note_counts,
     }
 
 
@@ -341,6 +349,53 @@ def onset_probe_for_embeddings(
         f"{prefix}_onset_probe_split": split_name,
     }
 
+def note_count_probe_for_embeddings(
+    embeddings: np.ndarray,
+    note_counts: np.ndarray,
+    song_ids: list[str],
+    seed: int,
+    test_size: float,
+) -> dict[str, float | str]:
+    metric_prefix = "melody_note_count_probe"
+    finite_count = int(np.isfinite(note_counts).sum())
+    if finite_count < 12:
+        return {
+            f"{metric_prefix}_r2": float("nan"),
+            f"{metric_prefix}_mae_notes": float("nan"),
+            f"{metric_prefix}_baseline_mae_notes": float("nan"),
+            f"{metric_prefix}_split": (
+                "missing_labels" if finite_count == 0 else "too_few_examples"
+            ),
+        }
+
+    train_indices, test_indices, split_name = grouped_probe_split(
+        labels=note_counts,
+        group_ids=song_ids,
+        seed=seed,
+        test_size=test_size,
+    )
+    probe = make_pipeline(StandardScaler(), Ridge(alpha=1.0))
+    probe.fit(embeddings[train_indices], note_counts[train_indices])
+    predictions = probe.predict(embeddings[test_indices])
+    baseline = np.full_like(
+        predictions,
+        np.median(note_counts[train_indices]),
+        dtype=np.float64,
+    )
+
+    return {
+        f"{metric_prefix}_r2": float(r2_score(note_counts[test_indices], predictions)),
+        f"{metric_prefix}_mae_notes": float(
+            mean_absolute_error(note_counts[test_indices], predictions)
+        ),
+        f"{metric_prefix}_baseline_mae_notes": float(
+            mean_absolute_error(note_counts[test_indices], baseline)
+        ),
+        f"{metric_prefix}_train_examples": float(len(train_indices)),
+        f"{metric_prefix}_test_examples": float(len(test_indices)),
+        f"{metric_prefix}_split": split_name,
+    }
+
 
 def run_diagnostics(
     extracted: dict[str, Any],
@@ -351,12 +406,17 @@ def run_diagnostics(
     audio_embeddings = extracted["audio_embeddings"]
     song_ids = extracted["song_ids"]
     onset_fractions = np.asarray(extracted["onset_fraction"], dtype=np.float64)
+    note_counts = np.asarray(extracted["note_count"], dtype=np.float64)
+    note_count_mean, note_count_std = finite_mean_and_std(note_counts)
 
     metrics: dict[str, Any] = {
         "num_examples": float(melody_embeddings.shape[0]),
         "num_songs": float(len(set(song_ids))),
         "onset_fraction_mean": float(np.nanmean(onset_fractions)),
         "onset_fraction_std": float(np.nanstd(onset_fractions)),
+        "note_count_label_mean": note_count_mean,
+        "note_count_label_std": note_count_std,
+        "note_count_label_num_examples": float(np.isfinite(note_counts).sum()),
     }
     metrics.update(embedding_health("melody", melody_embeddings))
     metrics.update(embedding_health("audio", audio_embeddings))
@@ -396,13 +456,22 @@ def run_diagnostics(
             test_size=probe_test_size,
         )
     )
+    metrics.update(
+        note_count_probe_for_embeddings(
+            embeddings=melody_embeddings,
+            note_counts=note_counts,
+            song_ids=song_ids,
+            seed=seed,
+            test_size=probe_test_size,
+        )
+    )
     return metrics
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Diagnose melody/audio embedding collapse, modality gap, and onset-density leakage."
+            "Diagnose melody/audio embedding collapse, modality gap, onset-density leakage and note-count information."
         )
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
