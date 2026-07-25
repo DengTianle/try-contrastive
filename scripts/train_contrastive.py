@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import sys
 from collections import defaultdict
@@ -262,6 +263,183 @@ class DifferentSongBatchSampler(Sampler[list[int]]):
         return (len(self.dataset) + self.batch_size - 1) // self.batch_size
 
 
+def parameter_uses_weight_decay(name: str, parameter: torch.Tensor) -> bool:
+    """Decay matrix-like weights, but not biases or normalization gain/offset."""
+
+    return parameter.ndim >= 2 and not name.endswith(".bias")
+
+
+def build_adamw_parameter_groups(
+    model: MelodyAudioContrastiveModel,
+    *,
+    lr: float,
+    hubert_lr: float,
+    weight_decay: float,
+    hubert_trainable_layers: int,
+) -> list[dict[str, Any]]:
+    eventual_hubert_parameters = (
+        model.audio_encoder.hubert_parameters_for_top_layers(hubert_trainable_layers)
+    )
+    eventual_hubert_parameter_ids = {
+        id(parameter) for _, parameter in eventual_hubert_parameters
+    }
+
+    grouped: dict[tuple[str, bool], list[torch.Tensor]] = {
+        ("head", True): [],
+        ("head", False): [],
+        ("hubert", True): [],
+        ("hubert", False): [],
+    }
+    for name, parameter in model.named_parameters():
+        schedule_name = (
+            "hubert" if id(parameter) in eventual_hubert_parameter_ids else "head"
+        )
+        if schedule_name == "head" and not parameter.requires_grad:
+            continue
+        uses_decay = parameter_uses_weight_decay(name, parameter)
+        grouped[(schedule_name, uses_decay)].append(parameter)
+
+    parameter_groups: list[dict[str, Any]] = []
+    for schedule_name in ("head", "hubert"):
+        peak_lr = lr if schedule_name == "head" else hubert_lr
+        for uses_decay in (True, False):
+            parameters = grouped[(schedule_name, uses_decay)]
+            if not parameters:
+                continue
+            parameter_groups.append(
+                {
+                    "params": parameters,
+                    "lr": peak_lr,
+                    "peak_lr": peak_lr,
+                    "weight_decay": weight_decay if uses_decay else 0.0,
+                    "schedule_name": schedule_name,
+                    "decay_parameters": uses_decay,
+                }
+            )
+
+    optimized_parameter_ids = {
+        id(parameter)
+        for group in parameter_groups
+        for parameter in group["params"]
+    }
+    expected_parameter_ids = {
+        id(parameter)
+        for _, parameter in model.named_parameters()
+        if parameter.requires_grad or id(parameter) in eventual_hubert_parameter_ids
+    }
+    if optimized_parameter_ids != expected_parameter_ids:
+        raise RuntimeError("AdamW parameter grouping omitted or duplicated model parameters")
+    return parameter_groups
+
+
+def warmup_cosine_multiplier(
+    update_step: int,
+    *,
+    total_steps: int,
+    warmup_steps: int,
+    min_lr_ratio: float,
+) -> float:
+    if total_steps <= 0:
+        return 1.0
+    bounded_step = min(max(update_step, 0), total_steps - 1)
+    if warmup_steps > 0 and bounded_step < warmup_steps:
+        return float(bounded_step + 1) / float(warmup_steps)
+    decay_steps = max(total_steps - warmup_steps - 1, 1)
+    decay_progress = min(
+        max((bounded_step - warmup_steps) / decay_steps, 0.0),
+        1.0,
+    )
+    cosine = 0.5 * (1.0 + math.cos(math.pi * decay_progress))
+    return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
+
+
+class StagedWarmupCosineScheduler:
+    """Per-update schedules for heads and a later-unfrozen HuBERT parameter group."""
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        *,
+        total_steps: int,
+        head_warmup_steps: int,
+        hubert_unfreeze_step: int | None,
+        hubert_warmup_steps: int,
+        min_lr_ratio: float,
+        enabled: bool,
+    ) -> None:
+        if total_steps <= 0:
+            raise ValueError("total_steps must be positive")
+        if not 0.0 <= min_lr_ratio <= 1.0:
+            raise ValueError("min_lr_ratio must be in [0, 1]")
+        self.optimizer = optimizer
+        self.total_steps = total_steps
+        self.head_warmup_steps = max(head_warmup_steps, 0)
+        self.hubert_unfreeze_step = hubert_unfreeze_step
+        self.hubert_warmup_steps = max(hubert_warmup_steps, 0)
+        self.min_lr_ratio = min_lr_ratio
+        self.enabled = enabled
+        self.update_step = 0
+        self._apply_learning_rates()
+
+    def _multiplier_for_group(self, schedule_name: str) -> float:
+        if not self.enabled:
+            if schedule_name == "hubert":
+                if self.hubert_unfreeze_step is None:
+                    return 0.0
+                if self.update_step < self.hubert_unfreeze_step:
+                    return 0.0
+            return 1.0
+        if schedule_name == "head":
+            return warmup_cosine_multiplier(
+                self.update_step,
+                total_steps=self.total_steps,
+                warmup_steps=self.head_warmup_steps,
+                min_lr_ratio=self.min_lr_ratio,
+            )
+        if schedule_name != "hubert":
+            raise ValueError(f"Unknown optimizer schedule group: {schedule_name}")
+        if self.hubert_unfreeze_step is None:
+            return 0.0
+        if self.update_step < self.hubert_unfreeze_step:
+            return 0.0
+        local_step = self.update_step - self.hubert_unfreeze_step
+        remaining_steps = max(self.total_steps - self.hubert_unfreeze_step, 1)
+        return warmup_cosine_multiplier(
+            local_step,
+            total_steps=remaining_steps,
+            warmup_steps=self.hubert_warmup_steps,
+            min_lr_ratio=self.min_lr_ratio,
+        )
+
+    def _apply_learning_rates(self) -> None:
+        for group in self.optimizer.param_groups:
+            peak_lr = float(group["peak_lr"])
+            multiplier = self._multiplier_for_group(str(group["schedule_name"]))
+            group["lr"] = peak_lr * multiplier
+
+    def step(self) -> None:
+        self.update_step += 1
+        self._apply_learning_rates()
+
+    def learning_rates(self) -> dict[str, float]:
+        rates: dict[str, float] = {}
+        for group in self.optimizer.param_groups:
+            schedule_name = str(group["schedule_name"])
+            rates[schedule_name] = max(rates.get(schedule_name, 0.0), float(group["lr"]))
+        return rates
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "total_steps": self.total_steps,
+            "head_warmup_steps": self.head_warmup_steps,
+            "hubert_unfreeze_step": self.hubert_unfreeze_step,
+            "hubert_warmup_steps": self.hubert_warmup_steps,
+            "min_lr_ratio": self.min_lr_ratio,
+            "enabled": self.enabled,
+            "update_step": self.update_step,
+        }
+
+
 def train_one_epoch(
     model: MelodyAudioContrastiveModel,
     loader: DataLoader,
@@ -276,6 +454,8 @@ def train_one_epoch(
     audio_background_mix_snr_db: float,
     grad_clip_norm: float | None,
     use_amp: bool,
+    scaler: torch.amp.GradScaler,
+    scheduler: StagedWarmupCosineScheduler,
     progress: bool,
     desc: str,
 ) -> dict[str, float]:
@@ -288,8 +468,6 @@ def train_one_epoch(
     total_global_audio_correct = 0
     total_examples = 0
     total_global_examples = 0
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-
     progress_bar = maybe_progress(loader, enabled=progress, desc=desc, leave=False)
     for batch in progress_bar:
         batch = move_batch_to_device(batch, device)
@@ -349,6 +527,7 @@ def train_one_epoch(
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
         scaler.step(optimizer)
         scaler.update()
+        scheduler.step()
 
         targets = batch["target"].to(dtype=torch.long)
         total_loss += float(loss.detach().cpu()) * batch_size
@@ -456,6 +635,8 @@ def save_checkpoint(
     name: str,
     model: MelodyAudioContrastiveModel,
     optimizer: torch.optim.Optimizer,
+    scheduler: StagedWarmupCosineScheduler,
+    scaler: torch.amp.GradScaler,
     epoch: int,
     args: argparse.Namespace,
     metrics: dict[str, Any],
@@ -463,8 +644,11 @@ def save_checkpoint(
     output_dir.mkdir(parents=True, exist_ok=True)
     checkpoint = {
         "epoch": epoch,
+        "global_step": scheduler.update_step,
         "model_state_dict": model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
+        "scheduler_state_dict": scheduler.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
         "args": vars(args),
         "metrics": metrics,
     }
@@ -545,11 +729,99 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hubert-model-name", default="facebook/hubert-base-ls960")
     parser.add_argument("--projection-dim", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.07)
-    parser.add_argument("--freeze-hubert", action="store_true")
-    parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument(
+        "--freeze-hubert",
+        action="store_true",
+        help=(
+            "Keep the complete HuBERT backbone frozen for the entire run. Without "
+            "this flag, HuBERT is initially frozen and its top blocks are later unfrozen."
+        ),
+    )
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--epochs", type=int, default=16)
+    parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-4,
+        help="Peak learning rate for the melody encoder and projection heads.",
+    )
+    parser.add_argument(
+        "--hubert-lr",
+        type=float,
+        default=1e-5,
+        help="Peak learning rate for trainable HuBERT parameters.",
+    )
     parser.add_argument("--weight-decay", type=float, default=1e-2)
+    parser.add_argument(
+        "--hubert-freeze-epochs",
+        type=int,
+        default=4,
+        help=(
+            "Number of complete head-only epochs before partial HuBERT fine-tuning. "
+            "Ignored by --freeze-hubert."
+        ),
+    )
+    parser.add_argument(
+        "--hubert-trainable-layers",
+        type=int,
+        default=4,
+        help=(
+            "Number of top HuBERT transformer blocks to unfreeze after the frozen "
+            "stage. The waveform CNN always remains frozen."
+        ),
+    )
+    parser.add_argument(
+        "--lr-scheduler",
+        choices=["warmup-cosine", "constant"],
+        default="warmup-cosine",
+    )
+    parser.add_argument(
+        "--warmup-ratio",
+        type=float,
+        default=0.05,
+        help="Fraction of all optimizer updates used to warm up the non-HuBERT groups.",
+    )
+    parser.add_argument(
+        "--hubert-warmup-ratio",
+        type=float,
+        default=0.05,
+        help=(
+            "Fraction of post-unfreeze updates used for HuBERT's independent warmup."
+        ),
+    )
+    parser.add_argument(
+        "--min-lr-ratio",
+        type=float,
+        default=0.01,
+        help="Final cosine learning rate as a fraction of each group's peak rate.",
+    )
+    parser.add_argument(
+        "--hubert-spec-augment",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Enable HuBERT's internal SpecAugment while partially fine-tuning. "
+            "Disabled by default to avoid silently stacking it with waveform augmentation."
+        ),
+    )
+    parser.add_argument(
+        "--hubert-layerdrop",
+        type=float,
+        default=0.0,
+        help=(
+            "HuBERT transformer LayerDrop probability during partial fine-tuning. "
+            "Defaults to 0 for deterministic layer selection."
+        ),
+    )
+    parser.add_argument(
+        "--hubert-frozen-modules-eval",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Keep the frozen HuBERT prefix in eval mode while its top blocks train, "
+            "so dropout in frozen modules does not make their features drift."
+        ),
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-negatives", type=int, default=7, help="Limit negatives per anchor to avoid OOM.")
     parser.add_argument(
@@ -694,6 +966,33 @@ def main() -> None:
         args.melody_pretrained_checkpoint = resolve_user_path(args.melody_pretrained_checkpoint)
     if args.global_loss_weight < 0.0:
         raise SystemExit("--global-loss-weight must be non-negative")
+    if args.epochs <= 0:
+        raise SystemExit("--epochs must be positive")
+    if args.lr <= 0.0 or args.hubert_lr <= 0.0:
+        raise SystemExit("--lr and --hubert-lr must be positive")
+    if args.weight_decay < 0.0:
+        raise SystemExit("--weight-decay must be non-negative")
+    if args.hubert_freeze_epochs < 0:
+        raise SystemExit("--hubert-freeze-epochs must be non-negative")
+    if args.hubert_trainable_layers < 0:
+        raise SystemExit("--hubert-trainable-layers must be non-negative")
+    if not 0.0 <= args.warmup_ratio < 1.0:
+        raise SystemExit("--warmup-ratio must be in [0, 1)")
+    if not 0.0 <= args.hubert_warmup_ratio < 1.0:
+        raise SystemExit("--hubert-warmup-ratio must be in [0, 1)")
+    if not 0.0 <= args.min_lr_ratio <= 1.0:
+        raise SystemExit("--min-lr-ratio must be in [0, 1]")
+    if not 0.0 <= args.hubert_layerdrop < 1.0:
+        raise SystemExit("--hubert-layerdrop must be in [0, 1)")
+    if (
+        not args.freeze_hubert
+        and args.hubert_trainable_layers > 0
+        and args.hubert_freeze_epochs >= args.epochs
+    ):
+        raise SystemExit(
+            "--hubert-freeze-epochs must be smaller than --epochs when HuBERT "
+            "fine-tuning is enabled"
+        )
     if args.no_in_batch_negatives:
         args.global_loss_weight = 0.0
     if args.melody_transpose_semitones < 0.0:
@@ -769,10 +1068,11 @@ def main() -> None:
                 collate_fn=grouped_contrastive_collate,
             )
 
+    initially_freeze_hubert = args.freeze_hubert or args.hubert_freeze_epochs > 0
     model = MelodyAudioContrastiveModel(
         hubert_model_name=args.hubert_model_name,
         projection_dim=args.projection_dim,
-        freeze_hubert=args.freeze_hubert,
+        freeze_hubert=initially_freeze_hubert,
         melody_d_model=args.melody_d_model,
         melody_num_layers=args.melody_num_layers,
         melody_num_heads=args.melody_num_heads,
@@ -787,11 +1087,68 @@ def main() -> None:
             load_projection=args.load_melody_pretrained_projection,
         )
 
-    optimizer = AdamW(
-        [parameter for parameter in model.parameters() if parameter.requires_grad],
-        lr=args.lr,
-        weight_decay=args.weight_decay,
+    num_hubert_layers = model.audio_encoder.num_hubert_transformer_layers
+    if args.hubert_trainable_layers > num_hubert_layers:
+        raise SystemExit(
+            f"--hubert-trainable-layers cannot exceed this model's "
+            f"{num_hubert_layers} transformer blocks"
+        )
+    eventual_hubert_trainable_layers = (
+        0 if args.freeze_hubert else args.hubert_trainable_layers
     )
+    initial_hubert_trainable_layers = (
+        0
+        if args.freeze_hubert or args.hubert_freeze_epochs > 0
+        else eventual_hubert_trainable_layers
+    )
+    model.audio_encoder.configure_hubert_regularization(
+        apply_spec_augment=args.hubert_spec_augment,
+        layerdrop=args.hubert_layerdrop,
+        frozen_modules_eval=args.hubert_frozen_modules_eval,
+    )
+    model.audio_encoder.set_hubert_trainable_layers(initial_hubert_trainable_layers)
+
+    parameter_groups = build_adamw_parameter_groups(
+        model,
+        lr=args.lr,
+        hubert_lr=args.hubert_lr,
+        weight_decay=args.weight_decay,
+        hubert_trainable_layers=eventual_hubert_trainable_layers,
+    )
+    optimizer = AdamW(
+        parameter_groups,
+        lr=args.lr,
+        weight_decay=0.0,
+    )
+    steps_per_epoch = len(train_loader)
+    total_training_steps = args.epochs * steps_per_epoch
+    hubert_unfreeze_step = (
+        None
+        if eventual_hubert_trainable_layers == 0
+        else args.hubert_freeze_epochs * steps_per_epoch
+    )
+    post_unfreeze_steps = (
+        0
+        if hubert_unfreeze_step is None
+        else total_training_steps - hubert_unfreeze_step
+    )
+    scheduler = StagedWarmupCosineScheduler(
+        optimizer,
+        total_steps=total_training_steps,
+        head_warmup_steps=round(total_training_steps * args.warmup_ratio),
+        hubert_unfreeze_step=hubert_unfreeze_step,
+        hubert_warmup_steps=round(post_unfreeze_steps * args.hubert_warmup_ratio),
+        min_lr_ratio=args.min_lr_ratio,
+        enabled=args.lr_scheduler == "warmup-cosine",
+    )
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+
+    args.steps_per_epoch = steps_per_epoch
+    args.total_training_steps = total_training_steps
+    args.hubert_unfreeze_step = hubert_unfreeze_step
+    args.head_warmup_steps = scheduler.head_warmup_steps
+    args.hubert_warmup_steps = scheduler.hubert_warmup_steps
+    args.effective_hubert_trainable_layers = eventual_hubert_trainable_layers
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     with (args.output_dir / "config.json").open("w", encoding="utf-8") as handle:
@@ -801,6 +1158,26 @@ def main() -> None:
     best_metric_direction = checkpoint_metric_direction(best_metric_name)
     best_metric_value = float("inf") if best_metric_direction == "min" else -float("inf")
     for epoch in range(1, args.epochs + 1):
+        desired_hubert_trainable_layers = (
+            eventual_hubert_trainable_layers
+            if epoch > args.hubert_freeze_epochs
+            else 0
+        )
+        if args.freeze_hubert:
+            desired_hubert_trainable_layers = 0
+        if (
+            model.audio_encoder.hubert_trainable_layers
+            != desired_hubert_trainable_layers
+        ):
+            model.audio_encoder.set_hubert_trainable_layers(
+                desired_hubert_trainable_layers
+            )
+            print(
+                f"epoch={epoch} unfreezing top "
+                f"{desired_hubert_trainable_layers}/{num_hubert_layers} "
+                "HuBERT transformer blocks"
+            )
+
         train_metrics = train_one_epoch(
             model=model,
             loader=train_loader,
@@ -815,17 +1192,31 @@ def main() -> None:
             audio_background_mix_snr_db=args.audio_background_mix_snr_db,
             grad_clip_norm=args.grad_clip_norm,
             use_amp=use_amp,
+            scaler=scaler,
+            scheduler=scheduler,
             progress=progress,
             desc=f"train epoch {epoch}/{args.epochs}",
         )
 
-        metrics: dict[str, Any] = {"train": train_metrics}
+        learning_rates = scheduler.learning_rates()
+        metrics: dict[str, Any] = {
+            "train": train_metrics,
+            "optimization": {
+                "global_step": scheduler.update_step,
+                "head_lr": learning_rates.get("head", 0.0),
+                "hubert_lr": learning_rates.get("hubert", 0.0),
+                "hubert_trainable_layers": model.audio_encoder.hubert_trainable_layers,
+            },
+        }
         message = (
             f"epoch={epoch} "
             f"train_loss={train_metrics['loss']:.4f} "
             f"train_hard_loss={train_metrics['hard_loss']:.4f} "
             f"train_global_loss={train_metrics['global_loss']:.4f} "
-            f"train_acc={train_metrics['accuracy']:.4f}"
+            f"train_acc={train_metrics['accuracy']:.4f} "
+            f"head_lr={learning_rates.get('head', 0.0):.2e} "
+            f"hubert_lr={learning_rates.get('hubert', 0.0):.2e} "
+            f"hubert_layers={model.audio_encoder.hubert_trainable_layers}"
         )
         if args.global_loss_weight > 0.0:
             message += f" train_global_acc={train_metrics['global_accuracy']:.4f}"
@@ -864,10 +1255,30 @@ def main() -> None:
                     "direction": best_metric_direction,
                     "value": best_metric_value,
                 }
-                save_checkpoint(args.output_dir, "best.pt", model, optimizer, epoch, args, metrics)
+                save_checkpoint(
+                    args.output_dir,
+                    "best.pt",
+                    model,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    epoch,
+                    args,
+                    metrics,
+                )
 
         print(message)
-        save_checkpoint(args.output_dir, "last.pt", model, optimizer, epoch, args, metrics)
+        save_checkpoint(
+            args.output_dir,
+            "last.pt",
+            model,
+            optimizer,
+            scheduler,
+            scaler,
+            epoch,
+            args,
+            metrics,
+        )
 
 
 if __name__ == "__main__":

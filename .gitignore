@@ -4,6 +4,7 @@ __pycache__/
 
 data/
 checkpoints/
+tests/
 .vscode/
 *.npz
 *.wav
