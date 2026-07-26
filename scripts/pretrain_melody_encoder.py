@@ -352,7 +352,11 @@ def save_checkpoint(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Pretrain the melody encoder on masked prosody.")
-    parser.add_argument("--manifest", type=Path, default=Path("data/prepared90/segments_manifest.csv"))
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=Path("data/prepared/dali/segments_manifest.csv"),
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("checkpoints/melody_pretrain"))
     parser.add_argument("--projection-dim", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=32)

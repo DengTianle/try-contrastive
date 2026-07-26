@@ -17,6 +17,7 @@ from torch.utils.data import Dataset
 class AudioConfig:
     sample_rate: int = 16000
     normalize_peak: bool = False
+    minimum_input_samples: int = 400
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,19 @@ class MelodyConfig:
 
 def audio_start_seconds(row: dict[str, str]) -> float:
     return float(row["start_seconds"])
+
+
+def audio_end_seconds(row: dict[str, str]) -> float:
+    if row.get("end_seconds"):
+        return float(row["end_seconds"])
+    return audio_start_seconds(row) + float(row["segment_seconds"])
+
+
+def segments_overlap(first: dict[str, str], second: dict[str, str]) -> bool:
+    return max(audio_start_seconds(first), audio_start_seconds(second)) < min(
+        audio_end_seconds(first),
+        audio_end_seconds(second),
+    )
 
 
 def melody_sample_id(row: dict[str, str]) -> str:
@@ -128,14 +142,11 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         for song_rows in rows_by_song.values():
             song_rows.sort(key=lambda row: (audio_start_seconds(row), audio_sample_id(row)))
             for anchor in song_rows:
-                min_offset = self.min_negative_offset_seconds
-                if min_offset is None:
-                    min_offset = float(anchor["segment_seconds"])
                 negatives = [
                     candidate
                     for candidate in song_rows
                     if audio_sample_id(candidate) != audio_sample_id(anchor)
-                    and abs(audio_start_seconds(candidate) - audio_start_seconds(anchor)) >= min_offset
+                    and self._valid_negative(anchor, candidate)
                 ]
                 if max_negatives is not None and len(negatives) > max_negatives:
                     rng = stable_row_rng(self.seed, audio_sample_id(anchor))
@@ -154,6 +165,18 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
                 )
         return built_groups
 
+    def _valid_negative(
+        self,
+        anchor: dict[str, str],
+        candidate: dict[str, str],
+    ) -> bool:
+        if self.min_negative_offset_seconds is None:
+            return not segments_overlap(anchor, candidate)
+        return (
+            abs(audio_start_seconds(candidate) - audio_start_seconds(anchor))
+            >= self.min_negative_offset_seconds
+        )
+
     def __len__(self) -> int:
         return len(self.groups)
 
@@ -170,6 +193,10 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
             candidate_rows = [candidate_rows[index] for index in order]
         melody = load_melody(positive["melody_path"], self.melody_config)
         candidate_audio = self._load_candidate_audio(candidate_rows)
+        candidate_input_values, candidate_audio_attention_mask = pad_candidate_audio(
+            candidate_audio,
+            minimum_samples=self.audio_config.minimum_input_samples,
+        )
         candidate_ids = self._candidate_ids(positive, candidate_rows)
         candidate_types = self._candidate_types(positive, candidate_rows)
 
@@ -182,10 +209,8 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
                 melody["features"].shape[0],
                 dtype=torch.bool,
             ),
-            "candidate_input_values": torch.stack(candidate_audio),
-            "candidate_audio_attention_mask": torch.stack(
-                [torch.ones_like(audio, dtype=torch.bool) for audio in candidate_audio]
-            ),
+            "candidate_input_values": candidate_input_values,
+            "candidate_audio_attention_mask": candidate_audio_attention_mask,
             "candidate_mask": torch.ones(len(candidate_rows), dtype=torch.bool),
             "target": torch.tensor(target, dtype=torch.long),
             "melody_sample_id": group["melody_sample_id"],
@@ -274,7 +299,10 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         read_start_sample: int,
     ) -> torch.Tensor:
         start_sample = int(round(audio_start_seconds(row) * self.audio_config.sample_rate))
-        expected_samples = int(round(float(row["segment_seconds"]) * self.audio_config.sample_rate))
+        expected_samples = max(
+            1,
+            int(round(float(row["segment_seconds"]) * self.audio_config.sample_rate)),
+        )
         offset = max(start_sample - read_start_sample, 0)
         crop = audio_array[offset : offset + expected_samples]
 
@@ -289,6 +317,27 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
                 crop = crop / peak
 
         return torch.from_numpy(crop.astype(np.float32, copy=True))
+
+
+def pad_candidate_audio(
+    candidate_audio: list[torch.Tensor],
+    minimum_samples: int = 1,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if not candidate_audio:
+        raise ValueError("Expected at least one candidate audio segment")
+    if minimum_samples <= 0:
+        raise ValueError("minimum_samples must be positive")
+    max_samples = max(
+        minimum_samples,
+        max(audio.shape[0] for audio in candidate_audio),
+    )
+    values = candidate_audio[0].new_zeros(len(candidate_audio), max_samples)
+    attention_mask = torch.zeros(len(candidate_audio), max_samples, dtype=torch.bool)
+    for candidate_index, audio in enumerate(candidate_audio):
+        sample_count = audio.shape[0]
+        values[candidate_index, :sample_count] = audio
+        attention_mask[candidate_index, :sample_count] = True
+    return values, attention_mask
 
 
 class MelodyOnlyDataset(Dataset[dict[str, Any]]):
@@ -375,31 +424,44 @@ def melody_only_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
 def grouped_contrastive_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     max_candidates = max(item["candidate_input_values"].shape[0] for item in batch)
     batch_size = len(batch)
-    sample_count = batch[0]["candidate_input_values"].shape[-1]
+    max_samples = max(item["candidate_input_values"].shape[-1] for item in batch)
 
-    candidate_input_values = torch.zeros(batch_size, max_candidates, sample_count)
+    candidate_input_values = torch.zeros(batch_size, max_candidates, max_samples)
     candidate_audio_attention_mask = torch.zeros(
         batch_size,
         max_candidates,
-        sample_count,
+        max_samples,
         dtype=torch.bool,
     )
     candidate_mask = torch.zeros(batch_size, max_candidates, dtype=torch.bool)
 
     for batch_index, item in enumerate(batch):
         num_candidates = item["candidate_input_values"].shape[0]
-        candidate_input_values[batch_index, :num_candidates] = item["candidate_input_values"]
-        candidate_audio_attention_mask[batch_index, :num_candidates] = item[
+        sample_count = item["candidate_input_values"].shape[-1]
+        candidate_input_values[
+            batch_index,
+            :num_candidates,
+            :sample_count,
+        ] = item["candidate_input_values"]
+        candidate_audio_attention_mask[
+            batch_index,
+            :num_candidates,
+            :sample_count,
+        ] = item[
             "candidate_audio_attention_mask"
         ]
-        candidate_mask[batch_index, :num_candidates] = item["candidate_mask"]
+        candidate_mask[batch_index, :num_candidates] = item["candidate_mask"].to(
+            dtype=torch.bool
+        )
+
+    melody_batch = melody_only_collate(batch)
 
     return {
-        "melody_features": torch.stack([item["melody_features"] for item in batch]),
-        "melody_attention_mask": torch.stack([item["melody_attention_mask"] for item in batch]),
-        "melody_f0_hz": torch.stack([item["melody_f0_hz"] for item in batch]),
-        "melody_voiced": torch.stack([item["melody_voiced"] for item in batch]),
-        "melody_frame_times": torch.stack([item["melody_frame_times"] for item in batch]),
+        "melody_features": melody_batch["melody_features"],
+        "melody_attention_mask": melody_batch["melody_attention_mask"],
+        "melody_f0_hz": melody_batch["melody_f0_hz"],
+        "melody_voiced": melody_batch["melody_voiced"],
+        "melody_frame_times": melody_batch["melody_frame_times"],
         "candidate_input_values": candidate_input_values,
         "candidate_audio_attention_mask": candidate_audio_attention_mask,
         "candidate_mask": candidate_mask,

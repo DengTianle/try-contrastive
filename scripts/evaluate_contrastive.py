@@ -24,6 +24,9 @@ from prosodia.training import (
 )
 
 
+SEGMENT_LENGTH_TOLERANCE_SECONDS = 1e-3
+
+
 def resolve_user_path(path: Path) -> Path:
     expanded = path.expanduser()
     if not expanded.is_absolute():
@@ -65,6 +68,70 @@ def positive_ranks(
     return (valid_logits >= positive_scores[:, None]).sum(dim=-1)
 
 
+def row_segment_seconds(row: dict[str, Any]) -> float:
+    if row.get("segment_seconds") not in (None, ""):
+        return float(row["segment_seconds"])
+    return float(row["end_seconds"]) - float(row["start_seconds"])
+
+
+def segment_length_probe_for_example(
+    candidate_rows: list[dict[str, Any]],
+    target_index: int,
+    scores: torch.Tensor,
+    tolerance_seconds: float = SEGMENT_LENGTH_TOLERANCE_SECONDS,
+) -> dict[str, float]:
+    """Measure how well duration alone identifies the paired audio candidate."""
+    if not candidate_rows:
+        raise ValueError("Segment-length probe requires at least one candidate")
+    if not 0 <= target_index < len(candidate_rows):
+        raise ValueError("Segment-length probe target is outside the candidate list")
+
+    lengths = torch.tensor(
+        [row_segment_seconds(row) for row in candidate_rows],
+        dtype=torch.float64,
+    )
+    scores = scores.detach().cpu().to(dtype=torch.float64)
+    if scores.ndim != 1 or scores.shape[0] != lengths.shape[0]:
+        raise ValueError("Segment-length probe scores must match the candidate rows")
+
+    target_length = lengths[target_index]
+    length_errors = (lengths - target_length).abs()
+    minimum_error = length_errors.min()
+    nearest_mask = length_errors <= minimum_error + tolerance_seconds
+    matching_candidates = int(nearest_mask.sum().item())
+    target_is_nearest = bool(nearest_mask[target_index])
+    expected_top1 = (
+        1.0 / matching_candidates if target_is_nearest and matching_candidates else 0.0
+    )
+
+    top_index = int(scores.argmax().item())
+    model_top1_length_match = float(
+        length_errors[top_index] <= tolerance_seconds
+    )
+
+    correlation = float("nan")
+    if len(candidate_rows) >= 2:
+        proximity = -length_errors
+        centered_scores = scores - scores.mean()
+        centered_proximity = proximity - proximity.mean()
+        denominator = torch.sqrt(
+            centered_scores.square().sum() * centered_proximity.square().sum()
+        )
+        if float(denominator) > 0.0:
+            correlation = float(
+                (centered_scores * centered_proximity).sum() / denominator
+            )
+
+    return {
+        "expected_top1_accuracy": expected_top1,
+        "chance_top1_accuracy": 1.0 / len(candidate_rows),
+        "unique_match": float(matching_candidates == 1),
+        "matching_candidates": float(matching_candidates),
+        "model_top1_length_match": model_top1_length_match,
+        "score_proximity_correlation": correlation,
+    }
+
+
 @torch.no_grad()
 def evaluate_retrieval(
     model: MelodyAudioContrastiveModel,
@@ -85,6 +152,12 @@ def evaluate_retrieval(
     recall_hits = {k: 0 for k in recall_k}
     all_ranks: list[int] = []
     predictions: list[dict[str, Any]] = []
+    length_probe_expected_top1 = 0.0
+    length_probe_chance_top1 = 0.0
+    length_probe_unique_matches = 0.0
+    length_probe_matching_candidates = 0.0
+    length_probe_model_top1_matches = 0.0
+    length_probe_correlations: list[float] = []
 
     for batch in loader:
         batch = move_batch_to_device(batch, device)
@@ -119,6 +192,25 @@ def evaluate_retrieval(
         for k in recall_k:
             recall_hits[k] += int((ranks <= k).sum().detach().cpu())
 
+        logits_cpu = logits.detach().cpu()
+        targets_cpu = batch["target"].detach().cpu().tolist()
+        candidate_counts_cpu = candidate_counts.detach().cpu().tolist()
+        for batch_index, target_index in enumerate(targets_cpu):
+            valid_count = int(candidate_counts_cpu[batch_index])
+            probe = segment_length_probe_for_example(
+                candidate_rows=batch["metadata"][batch_index][:valid_count],
+                target_index=int(target_index),
+                scores=logits_cpu[batch_index, :valid_count],
+            )
+            length_probe_expected_top1 += probe["expected_top1_accuracy"]
+            length_probe_chance_top1 += probe["chance_top1_accuracy"]
+            length_probe_unique_matches += probe["unique_match"]
+            length_probe_matching_candidates += probe["matching_candidates"]
+            length_probe_model_top1_matches += probe["model_top1_length_match"]
+            correlation = probe["score_proximity_correlation"]
+            if correlation == correlation:
+                length_probe_correlations.append(correlation)
+
         if collect_predictions:
             predictions.extend(
                 prediction_rows(
@@ -147,6 +239,29 @@ def evaluate_retrieval(
         "median_rank": median_rank,
         "mean_candidates": total_candidates / total_examples,
         "num_examples": float(total_examples),
+        "segment_length_probe_expected_top1_accuracy": (
+            length_probe_expected_top1 / total_examples
+        ),
+        "segment_length_probe_chance_top1_accuracy": (
+            length_probe_chance_top1 / total_examples
+        ),
+        "segment_length_probe_unique_match_rate": (
+            length_probe_unique_matches / total_examples
+        ),
+        "segment_length_probe_mean_matching_candidates": (
+            length_probe_matching_candidates / total_examples
+        ),
+        "segment_length_probe_model_top1_match_rate": (
+            length_probe_model_top1_matches / total_examples
+        ),
+        "segment_length_probe_score_proximity_correlation": (
+            sum(length_probe_correlations) / len(length_probe_correlations)
+            if length_probe_correlations
+            else float("nan")
+        ),
+        "segment_length_probe_correlation_examples": float(
+            len(length_probe_correlations)
+        ),
     }
     for k in recall_k:
         metrics[f"recall@{k}"] = (
@@ -178,6 +293,8 @@ def prediction_rows(
         positive_row = batch["metadata"][batch_index][target_index]
         top_start = float(top_row["start_seconds"]) if top_row else ""
         positive_start = float(positive_row["start_seconds"])
+        top_segment_seconds = row_segment_seconds(top_row) if top_row else ""
+        positive_segment_seconds = row_segment_seconds(positive_row)
         rows.append(
             {
                 "melody_sample_id": melody_sample_id,
@@ -200,6 +317,12 @@ def prediction_rows(
                 "top_candidate_start_seconds": top_start,
                 "top_candidate_end_seconds": float(top_row["end_seconds"]) if top_row else "",
                 "top_candidate_offset_seconds": top_start - positive_start if top_row else "",
+                "top_candidate_segment_seconds": top_segment_seconds,
+                "top_candidate_length_error_seconds": (
+                    abs(float(top_segment_seconds) - positive_segment_seconds)
+                    if top_row
+                    else ""
+                ),
                 "top_candidate_type": batch["candidate_types"][batch_index][top_index]
                 if top_index >= 0
                 else "",
@@ -207,6 +330,7 @@ def prediction_rows(
                 "positive_candidate_sample_id": positive_row["sample_id"],
                 "positive_candidate_start_seconds": positive_start,
                 "positive_candidate_end_seconds": float(positive_row["end_seconds"]),
+                "positive_candidate_segment_seconds": positive_segment_seconds,
                 "correct_top1": bool(top_index == target_index),
                 "valid_mask": " ".join(
                     "1" if bool(value) else "0" for value in candidate_mask_cpu[batch_index].tolist()
@@ -233,11 +357,14 @@ def write_predictions(path: Path, rows: list[dict[str, Any]]) -> None:
         "top_candidate_start_seconds",
         "top_candidate_end_seconds",
         "top_candidate_offset_seconds",
+        "top_candidate_segment_seconds",
+        "top_candidate_length_error_seconds",
         "top_candidate_type",
         "positive_candidate_id",
         "positive_candidate_sample_id",
         "positive_candidate_start_seconds",
         "positive_candidate_end_seconds",
+        "positive_candidate_segment_seconds",
         "correct_top1",
         "valid_mask",
     ]
@@ -259,7 +386,10 @@ def parse_args() -> argparse.Namespace:
         "--min-negative-offset-seconds",
         type=float,
         default=None,
-        help="Minimum same-song negative offset for segment manifests. Defaults to the segment length.",
+        help=(
+            "Optional minimum difference between same-song segment start times. "
+            "By default, all non-overlapping DALI line segments are eligible negatives."
+        ),
     )
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--recall-k", type=parse_recall_k, default=parse_recall_k("1,2,3,5"))
@@ -323,6 +453,7 @@ def main() -> None:
         "split": args.split,
         "max_negatives": args.max_negatives,
         "temperature": float(temperature),
+        "segment_length_probe_tolerance_seconds": SEGMENT_LENGTH_TOLERANCE_SECONDS,
         "metrics": metrics,
     }
 

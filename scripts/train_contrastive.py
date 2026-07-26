@@ -853,8 +853,8 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=None,
         help=(
-            "Minimum same-song negative offset when --manifest points to a segment manifest. "
-            "Defaults to the anchor segment length."
+            "Optional minimum difference between same-song segment start times. "
+            "By default, all non-overlapping DALI line segments are eligible negatives."
         ),
     )
     parser.add_argument("--train-split", default="train")

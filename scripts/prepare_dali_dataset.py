@@ -5,10 +5,10 @@ import csv
 import gzip
 import hashlib
 import json
-import math
 import os
 import pickle
 import random
+import unicodedata
 from collections import Counter
 from pathlib import Path
 from typing import Any
@@ -18,7 +18,6 @@ import numpy as np
 
 AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".aac"}
 PREPARED_AUDIO_FORMATS = {"flac", "wav"}
-SEGMENT_TIME_DECIMALS = 6 #6dp
 
 
 def load_dali(
@@ -212,9 +211,100 @@ def split_track_ids(
     return split_by_id
 
 
-def stable_sample_id(dali_id: str, start_seconds: float) -> str:
-    digest = hashlib.sha1(f"{dali_id}:{start_seconds:.3f}".encode("utf-8")).hexdigest()[:10]
+def stable_sample_id(
+    dali_id: str,
+    start_seconds: float,
+    line_index: int | None = None,
+) -> str:
+    identity = f"{dali_id}:{start_seconds:.3f}"
+    if line_index is not None:
+        identity = f"{dali_id}:{start_seconds:.6f}:{line_index}"
+    digest = hashlib.sha1(identity.encode("utf-8")).hexdigest()[:10]
     return f"{dali_id}_{int(round(start_seconds * 1000)):09d}_{digest}"
+
+
+def flatten_dali_text(value: Any) -> str:
+    if isinstance(value, dict):
+        return flatten_dali_text(value.get("text", ""))
+    if isinstance(value, (list, tuple)):
+        return " ".join(part for item in value if (part := flatten_dali_text(item)))
+    return str(value).strip()
+
+
+def normalize_line_text(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text).casefold()
+    return " ".join(normalized.split())
+
+
+def extract_dali_lines(entry: Any) -> list[dict[str, Any]]:
+    annotations = getattr(entry, "annotations", {})
+    annot = annotations.get("annot", {}) if isinstance(annotations, dict) else {}
+    lines = annot.get("lines", []) if isinstance(annot, dict) else []
+
+    if not lines and isinstance(annot, dict):
+        hierarchical = annot.get("hierarchical", [])
+        lines = [
+            line
+            for paragraph in hierarchical
+            if isinstance(paragraph, dict)
+            for line in paragraph.get("text", [])
+            if isinstance(line, dict)
+        ]
+
+    valid_lines: list[dict[str, Any]] = []
+    for line_index, line in enumerate(lines):
+        times = np.asarray(line.get("time", []), dtype=np.float64)
+        if times.size < 2 or not np.all(np.isfinite(times)):
+            continue
+        start_seconds = float(times[0])
+        end_seconds = float(times[-1])
+        if end_seconds <= start_seconds:
+            continue
+        text = flatten_dali_text(line.get("text", ""))
+        normalized_text = normalize_line_text(text)
+        if not normalized_text:
+            continue
+        valid_lines.append(
+            {
+                "line_index": line_index,
+                "text": text,
+                "normalized_text": normalized_text,
+                "start_seconds": start_seconds,
+                "end_seconds": end_seconds,
+            }
+        )
+    valid_lines.sort(key=lambda item: (item["start_seconds"], item["line_index"]))
+    return valid_lines
+
+
+def unique_line_segments(
+    lines: list[dict[str, Any]],
+    audio_duration: float,
+) -> tuple[list[dict[str, Any]], Counter[str]]:
+    """Keep the first in-audio occurrence of each normalized DALI lyric line."""
+    seen_text: set[str] = set()
+    segments: list[dict[str, Any]] = []
+    skipped: Counter[str] = Counter()
+    for line in lines:
+        start_seconds = max(0.0, float(line["start_seconds"]))
+        end_seconds = min(float(audio_duration), float(line["end_seconds"]))
+        if end_seconds <= start_seconds:
+            skipped["outside_audio"] += 1
+            continue
+        normalized_text = str(line["normalized_text"])
+        if normalized_text in seen_text:
+            skipped["repeated_line"] += 1
+            continue
+        seen_text.add(normalized_text)
+        segments.append(
+            {
+                **line,
+                "start_seconds": start_seconds,
+                "end_seconds": end_seconds,
+                "segment_seconds": end_seconds - start_seconds,
+            }
+        )
+    return segments, skipped
 
 
 def extract_dali_notes(entry: Any) -> list[dict[str, Any]]:
@@ -260,7 +350,7 @@ def render_melody_frames(
     segment_seconds: float,
     frame_rate: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    num_frames = int(round(segment_seconds * frame_rate))
+    num_frames = max(1, int(round(segment_seconds * frame_rate)))
     frame_times = start_seconds + (np.arange(num_frames, dtype=np.float32) + 0.5) / frame_rate
     f0_hz = np.zeros(num_frames, dtype=np.float32)
     voiced = np.zeros(num_frames, dtype=np.bool_)
@@ -287,14 +377,6 @@ def render_melody_frames(
 
     relative_times = frame_times - start_seconds
     return relative_times.astype(np.float32), f0_hz, voiced
-
-
-def iter_segment_starts(duration: float, segment_seconds: float, hop_seconds: float) -> list[float]:
-    last_start = duration - segment_seconds
-    if last_start < 0:
-        return []
-    count = int(math.floor(last_start / hop_seconds)) + 1
-    return [round(index * hop_seconds, SEGMENT_TIME_DECIMALS) for index in range(count)]
 
 
 def annotation_duration_seconds(notes: list[dict[str, Any]]) -> float:
@@ -361,6 +443,8 @@ def row_for_segment(
         "melody_frame_rate": f"{segment['frame_rate']:.6f}",
         "voiced_ratio": f"{segment['voiced_ratio']:.6f}",
         "note_count": str(segment["note_count"]),
+        "line_index": str(segment["line_index"]),
+        "line_text": segment["line_text"],
     }
 
 
@@ -374,7 +458,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Prepare DALI vocal-melody/audio contrastive data. The script writes one "
-            "canonical frame-based melody .npz per eligible segment and a segment manifest."
+            "canonical frame-based melody .npz per unique DALI lyric line and a segment manifest."
         )
     )
     parser.add_argument("--dali-data-dir", type=Path, default=Path("data/DALI_v1"))
@@ -404,12 +488,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Regenerate prepared audio files even if they already exist.",
     )
-    parser.add_argument("--segment-seconds", type=float, default=10.0)
-    parser.add_argument("--hop-seconds", type=float, default=10.0)
     parser.add_argument("--melody-frame-rate", type=float, default=50.0, help="Number of frames per second.")
     parser.add_argument("--max-tracks", type=int, default=0, help="0 means no track limit.")
     parser.add_argument("--max-segments", type=int, default=0, help="0 means no segment limit.")
-    parser.add_argument("--min-vocal-ratio", type=float, default=0.4)
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
@@ -426,14 +507,8 @@ def main() -> None:
     if args.prepared_audio_dir is None:
         args.prepared_audio_dir = args.output_dir / f"audio_{args.sample_rate // 1000}k"
     args.prepared_audio_dir = resolve_user_path(args.prepared_audio_dir)
-    if args.segment_seconds <= 0:
-        raise SystemExit("--segment-seconds must be positive")
-    if args.hop_seconds <= 0:
-        raise SystemExit("--hop-seconds must be positive")
     if args.melody_frame_rate <= 0:
         raise SystemExit("--melody-frame-rate must be positive")
-    if not 0.0 <= args.min_vocal_ratio <= 1.0:
-        raise SystemExit("--min-vocal-ratio must be between 0 and 1")
     if args.train_ratio <= 0 or args.val_ratio < 0 or args.train_ratio + args.val_ratio >= 1:
         raise SystemExit("--train-ratio and --val-ratio must leave a positive test split")
 
@@ -476,6 +551,10 @@ def main() -> None:
         if not notes:
             skipped["no_notes"] += 1
             continue
+        lines = extract_dali_lines(entry)
+        if not lines:
+            skipped["no_lines"] += 1
+            continue
 
         annotation_duration = annotation_duration_seconds(notes)
         try:
@@ -488,10 +567,6 @@ def main() -> None:
             duration_sources["annotations"] += 1
         else:
             duration_sources["audio_metadata"] += 1
-
-        if duration < args.segment_seconds:
-            skipped["too_short"] += 1
-            continue
 
         prepared_audio_path = audio_path
         if not args.skip_audio_prep:
@@ -518,6 +593,7 @@ def main() -> None:
                 "raw_audio_path": audio_path,
                 "audio_path": prepared_audio_path,
                 "notes": notes,
+                "lines": lines,
                 "duration": duration,
                 "artist": entry.info.get("artist", ""),
                 "title": entry.info.get("title", ""),
@@ -539,20 +615,27 @@ def main() -> None:
     all_segments: list[dict[str, Any]] = []
     skipped_segments = Counter()
     for track in usable_tracks:
-        starts = iter_segment_starts(track["duration"], args.segment_seconds, args.hop_seconds)
-        for start_seconds in starts:
+        line_segments, line_skips = unique_line_segments(
+            track["lines"],
+            audio_duration=track["duration"],
+        )
+        skipped_segments.update(line_skips)
+        for line in line_segments:
+            start_seconds = line["start_seconds"]
+            segment_seconds = line["segment_seconds"]
             frame_times, f0_hz, voiced = render_melody_frames(
                 track["notes"],
                 start_seconds=start_seconds,
-                segment_seconds=args.segment_seconds,
+                segment_seconds=segment_seconds,
                 frame_rate=args.melody_frame_rate,
             )
             voiced_ratio = float(np.mean(voiced)) if voiced.size else 0.0
-            if voiced_ratio < args.min_vocal_ratio:
-                skipped_segments["low_vocal_ratio"] += 1
-                continue
 
-            sample_id = stable_sample_id(track["dali_id"], start_seconds)
+            sample_id = stable_sample_id(
+                track["dali_id"],
+                start_seconds,
+                line_index=line["line_index"],
+            )
             melody_path = write_melody_npz(
                 melody_dir=melody_dir,
                 sample_id=sample_id,
@@ -561,21 +644,23 @@ def main() -> None:
                 voiced=voiced,
                 frame_rate=args.melody_frame_rate,
                 start_seconds=start_seconds,
-                segment_seconds=args.segment_seconds,
+                segment_seconds=segment_seconds,
             )
             segment = {
                 "sample_id": sample_id,
                 "dali_id": track["dali_id"],
                 "melody_path": melody_path,
                 "start_seconds": start_seconds,
-                "end_seconds": start_seconds + args.segment_seconds,
-                "segment_seconds": args.segment_seconds,
+                "end_seconds": line["end_seconds"],
+                "segment_seconds": segment_seconds,
                 "frame_rate": args.melody_frame_rate,
                 "voiced_ratio": voiced_ratio,
+                "line_index": line["line_index"],
+                "line_text": line["text"],
                 "note_count": count_segment_notes(
                     track["notes"],
                     start_seconds=start_seconds,
-                    segment_seconds=args.segment_seconds,
+                    segment_seconds=segment_seconds,
                 ),
             }
             all_segments.append(segment)
@@ -587,7 +672,7 @@ def main() -> None:
 
     if not all_segments:
         raise SystemExit(
-            "No eligible segments found. Try lowering --min-vocal-ratio or checking DALI/audio alignment."
+            "No eligible DALI line segments found. Check DALI/audio alignment."
         )
 
     track_by_id = {track["dali_id"]: track for track in usable_tracks}
@@ -619,10 +704,9 @@ def main() -> None:
         "audio_format": args.audio_format,
         "skip_audio_prep": args.skip_audio_prep,
         "sample_rate": args.sample_rate,
-        "segment_seconds": args.segment_seconds,
-        "hop_seconds": args.hop_seconds,
+        "segmentation_strategy": "one_unique_dali_line_per_segment",
+        "repeated_line_policy": "keep_first_casefolded_nfkc_text",
         "melody_frame_rate": args.melody_frame_rate,
-        "min_vocal_ratio": args.min_vocal_ratio,
         "seed": args.seed,
         "train_ratio": args.train_ratio,
         "val_ratio": args.val_ratio,
