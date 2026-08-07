@@ -13,6 +13,10 @@ import torch
 from torch.utils.data import Dataset
 
 
+POSITIVE_VARIANT_POLICIES = {"self", "any", "retexted", "retexted-first"}
+CANDIDATE_WINDOW_POLICIES = {"line", "match-positive"}
+
+
 @dataclass(frozen=True)
 class AudioConfig:
     sample_rate: int = 16000
@@ -36,6 +40,10 @@ def audio_end_seconds(row: dict[str, str]) -> float:
     return audio_start_seconds(row) + float(row["segment_seconds"])
 
 
+def segment_duration_seconds(row: dict[str, str]) -> float:
+    return audio_end_seconds(row) - audio_start_seconds(row)
+
+
 def segments_overlap(first: dict[str, str], second: dict[str, str]) -> bool:
     return max(audio_start_seconds(first), audio_start_seconds(second)) < min(
         audio_end_seconds(first),
@@ -49,6 +57,44 @@ def melody_sample_id(row: dict[str, str]) -> str:
 
 def audio_sample_id(row: dict[str, str]) -> str:
     return row["sample_id"]
+
+
+def optional_class_id(row: dict[str, str], key: str) -> int | None:
+    value = row.get(key)
+    if value in (None, "", "None", "null"):
+        return None
+    return int(value)
+
+
+def same_melody_class(first: dict[str, str], second: dict[str, str]) -> bool:
+    if first["dali_id"] != second["dali_id"]:
+        return False
+    first_class = optional_class_id(first, "melody_class")
+    second_class = optional_class_id(second, "melody_class")
+    return (
+        first_class is not None
+        and second_class is not None
+        and first_class == second_class
+    )
+
+
+def same_lyric_class(first: dict[str, str], second: dict[str, str]) -> bool:
+    if first["dali_id"] != second["dali_id"]:
+        return False
+    first_class = optional_class_id(first, "lyric_class")
+    second_class = optional_class_id(second, "lyric_class")
+    return (
+        first_class is not None
+        and second_class is not None
+        and first_class == second_class
+    )
+
+
+def melody_equivalent(first: dict[str, str], second: dict[str, str]) -> bool:
+    return (
+        audio_sample_id(first) == audio_sample_id(second)
+        or same_melody_class(first, second)
+    )
 
 
 def resolve_manifest_path(path: str, manifest_dir: Path) -> str:
@@ -89,8 +135,9 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
     """Grouped view for InfoNCE training.
 
     Each item contains one melody anchor, one positive audio segment, and zero or
-    more same-anchor negative audio segments. The positive candidate is always at
-    index 0, so the training target is 0 for every grouped item.
+    more same-song negative audio segments. When repeat-grouping columns are in the
+    manifest, congruent melody occurrences are positive variants and are never used
+    as negatives.
     """
 
     def __init__(
@@ -101,6 +148,9 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         melody_config: MelodyConfig | None = None,
         max_negatives: int | None = None,
         min_negative_offset_seconds: float | None = None,
+        positive_variant_policy: str = "self",
+        candidate_window_policy: str = "line",
+        randomize_candidate_windows: bool = False,
         seed: int = 13,
         transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
@@ -109,6 +159,19 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         self.audio_config = audio_config or AudioConfig()
         self.melody_config = melody_config or MelodyConfig()
         self.min_negative_offset_seconds = min_negative_offset_seconds
+        if positive_variant_policy not in POSITIVE_VARIANT_POLICIES:
+            raise ValueError(
+                "positive_variant_policy must be one of "
+                f"{sorted(POSITIVE_VARIANT_POLICIES)}"
+            )
+        self.positive_variant_policy = positive_variant_policy
+        if candidate_window_policy not in CANDIDATE_WINDOW_POLICIES:
+            raise ValueError(
+                "candidate_window_policy must be one of "
+                f"{sorted(CANDIDATE_WINDOW_POLICIES)}"
+            )
+        self.candidate_window_policy = candidate_window_policy
+        self.randomize_candidate_windows = randomize_candidate_windows
         self.seed = seed
         self.transform = transform
 
@@ -118,6 +181,8 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
 
         if split is not None:
             rows = [row for row in rows if row["split"] == split]
+        if self.candidate_window_policy == "match-positive":
+            self._backfill_audio_durations(rows)
         self.rows = rows
 
         self.groups = self._build_groups_from_segment_rows(rows, max_negatives=max_negatives)
@@ -128,6 +193,22 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
             if resolved.get(key):
                 resolved[key] = resolve_manifest_path(resolved[key], self.manifest_dir)
         return resolved
+
+    def _backfill_audio_durations(self, rows: list[dict[str, str]]) -> None:
+        missing_by_path: dict[str, list[dict[str, str]]] = defaultdict(list)
+        for row in rows:
+            if not row.get("audio_duration_seconds"):
+                missing_by_path[row["audio_path"]].append(row)
+        if not missing_by_path:
+            return
+
+        import soundfile as sf
+
+        for audio_path, path_rows in missing_by_path.items():
+            info = sf.info(audio_path)
+            duration_seconds = info.frames / info.samplerate
+            for row in path_rows:
+                row["audio_duration_seconds"] = str(duration_seconds)
 
     def _build_groups_from_segment_rows(
         self,
@@ -142,11 +223,22 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         for song_rows in rows_by_song.values():
             song_rows.sort(key=lambda row: (audio_start_seconds(row), audio_sample_id(row)))
             for anchor in song_rows:
+                positive = self._select_positive_variant(anchor, song_rows)
+                protected_rows = [
+                    candidate
+                    for candidate in song_rows
+                    if self._possible_false_negative(anchor, candidate)
+                ]
                 negatives = [
                     candidate
                     for candidate in song_rows
-                    if audio_sample_id(candidate) != audio_sample_id(anchor)
-                    and self._valid_negative(anchor, candidate)
+                    if not self._possible_false_negative(anchor, candidate)
+                    and self._valid_negative(
+                        anchor,
+                        positive,
+                        candidate,
+                        protected_rows,
+                    )
                 ]
                 if max_negatives is not None and len(negatives) > max_negatives:
                     rng = stable_row_rng(self.seed, audio_sample_id(anchor))
@@ -159,29 +251,140 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
                 built_groups.append(
                     {
                         "melody_sample_id": melody_sample_id(anchor),
-                        "positive": anchor,
+                        "anchor": anchor,
+                        "positive": positive,
+                        "protected_rows": protected_rows,
                         "negatives": negatives,
                     }
                 )
         return built_groups
 
-    def _valid_negative(
+    def _select_positive_variant(
+        self,
+        anchor: dict[str, str],
+        song_rows: list[dict[str, str]],
+    ) -> dict[str, str]:
+        if self.positive_variant_policy == "self":
+            return anchor
+
+        alternatives = [
+            candidate
+            for candidate in song_rows
+            if audio_sample_id(candidate) != audio_sample_id(anchor)
+            and same_melody_class(anchor, candidate)
+        ]
+        retexted = [
+            candidate
+            for candidate in alternatives
+            if not same_lyric_class(anchor, candidate)
+        ]
+        if self.positive_variant_policy == "retexted":
+            pool = retexted
+        elif self.positive_variant_policy == "retexted-first":
+            pool = retexted or alternatives
+        else:
+            pool = alternatives
+        if not pool:
+            return anchor
+        rng = stable_row_rng(
+            self.seed,
+            f"{audio_sample_id(anchor)}:positive_variant:{self.positive_variant_policy}",
+        )
+        return pool[rng.randrange(len(pool))]
+
+    def _possible_false_negative(
         self,
         anchor: dict[str, str],
         candidate: dict[str, str],
     ) -> bool:
+        if melody_equivalent(anchor, candidate):
+            return True
+        if same_lyric_class(anchor, candidate) and (
+            optional_class_id(anchor, "melody_class") is None
+            or optional_class_id(candidate, "melody_class") is None
+        ):
+            return True
+        return False
+
+    def _valid_negative(
+        self,
+        anchor: dict[str, str],
+        positive: dict[str, str],
+        candidate: dict[str, str],
+        protected_rows: list[dict[str, str]],
+    ) -> bool:
         if self.min_negative_offset_seconds is None:
-            return not segments_overlap(anchor, candidate)
-        return (
-            abs(audio_start_seconds(candidate) - audio_start_seconds(anchor))
-            >= self.min_negative_offset_seconds
+            valid_offset = not segments_overlap(anchor, candidate)
+        else:
+            valid_offset = (
+                abs(audio_start_seconds(candidate) - audio_start_seconds(anchor))
+                >= self.min_negative_offset_seconds
+            )
+        return valid_offset and self._matching_window_is_feasible(
+            positive,
+            candidate,
+            protected_rows,
         )
+
+    def _matching_window_is_feasible(
+        self,
+        positive: dict[str, str],
+        candidate: dict[str, str],
+        protected_rows: list[dict[str, str]],
+    ) -> bool:
+        if self.candidate_window_policy == "line":
+            return True
+        target_seconds = segment_duration_seconds(positive)
+        if segment_duration_seconds(candidate) >= target_seconds:
+            return True
+
+        audio_duration = float(candidate.get("audio_duration_seconds") or "inf")
+        lower, upper = self._safe_window_start_bounds(
+            candidate=candidate,
+            protected_rows=protected_rows,
+            target_seconds=target_seconds,
+            audio_duration_seconds=audio_duration,
+        )
+        return lower <= upper + 1e-9
+
+    def _safe_window_start_bounds(
+        self,
+        candidate: dict[str, str],
+        protected_rows: list[dict[str, str]],
+        target_seconds: float,
+        audio_duration_seconds: float,
+    ) -> tuple[float, float]:
+        candidate_start = audio_start_seconds(candidate)
+        candidate_end = audio_end_seconds(candidate)
+        safe_region_start = 0.0
+        safe_region_end = audio_duration_seconds
+        for protected in protected_rows:
+            if audio_sample_id(protected) == audio_sample_id(candidate):
+                continue
+            if audio_end_seconds(protected) <= candidate_start:
+                safe_region_start = max(safe_region_start, audio_end_seconds(protected))
+            elif audio_start_seconds(protected) >= candidate_end:
+                safe_region_end = min(safe_region_end, audio_start_seconds(protected))
+            elif segments_overlap(protected, candidate):
+                return 1.0, 0.0
+
+        lower = max(safe_region_start, candidate_end - target_seconds)
+        upper = min(candidate_start, safe_region_end - target_seconds)
+        return lower, upper
 
     def __len__(self) -> int:
         return len(self.groups)
 
+    def positive_variant_counts(self) -> dict[str, int]:
+        counts = {"aligned": 0, "repeated": 0, "retexted": 0}
+        for group in self.groups:
+            variant = self._positive_variant_type(group["anchor"], group["positive"])
+            counts[variant] += 1
+        return counts
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         group = self.groups[index]
+        anchor = group["anchor"]
         positive = group["positive"]
         candidate_rows = [positive, *group["negatives"]]
         target = 0
@@ -191,14 +394,18 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
             rng.shuffle(order)
             target = order.index(0)
             candidate_rows = [candidate_rows[index] for index in order]
-        melody = load_melody(positive["melody_path"], self.melody_config)
-        candidate_audio = self._load_candidate_audio(candidate_rows)
+        melody = load_melody(anchor["melody_path"], self.melody_config)
+        candidate_audio = self._load_candidate_audio(
+            positive=positive,
+            candidate_rows=candidate_rows,
+            protected_rows=group["protected_rows"],
+        )
         candidate_input_values, candidate_audio_attention_mask = pad_candidate_audio(
             candidate_audio,
             minimum_samples=self.audio_config.minimum_input_samples,
         )
-        candidate_ids = self._candidate_ids(positive, candidate_rows)
-        candidate_types = self._candidate_types(positive, candidate_rows)
+        candidate_ids = self._candidate_ids(anchor, positive, candidate_rows)
+        candidate_types = self._candidate_types(anchor, positive, candidate_rows)
 
         item: dict[str, Any] = {
             "melody_features": melody["features"],
@@ -211,11 +418,16 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
             ),
             "candidate_input_values": candidate_input_values,
             "candidate_audio_attention_mask": candidate_audio_attention_mask,
+            "candidate_window_seconds": torch.tensor(
+                [audio.shape[0] / self.audio_config.sample_rate for audio in candidate_audio],
+                dtype=torch.float32,
+            ),
             "candidate_mask": torch.ones(len(candidate_rows), dtype=torch.bool),
             "target": torch.tensor(target, dtype=torch.long),
             "melody_sample_id": group["melody_sample_id"],
             "candidate_ids": candidate_ids,
             "candidate_types": candidate_types,
+            "anchor_metadata": anchor,
             "metadata": candidate_rows,
         }
         if self.transform is not None:
@@ -224,12 +436,13 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
 
     def _candidate_ids(
         self,
+        anchor: dict[str, str],
         positive: dict[str, str],
         candidate_rows: list[dict[str, str]],
     ) -> list[str]:
-        anchor_id = melody_sample_id(positive)
+        anchor_id = melody_sample_id(anchor)
         return [
-            f"{anchor_id}__pos"
+            f"{anchor_id}__pos_{self._positive_variant_type(anchor, positive)}"
             if audio_sample_id(candidate) == audio_sample_id(positive)
             else f"{anchor_id}__same_song_neg{index}"
             for index, candidate in enumerate(candidate_rows)
@@ -237,20 +450,38 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
 
     def _candidate_types(
         self,
+        anchor: dict[str, str],
         positive: dict[str, str],
         candidate_rows: list[dict[str, str]],
     ) -> list[str]:
         return [
-            "positive"
+            f"positive_{self._positive_variant_type(anchor, positive)}"
             if audio_sample_id(candidate) == audio_sample_id(positive)
             else "hard_negative_same_song"
             for candidate in candidate_rows
         ]
 
-    def _load_candidate_audio(self, candidate_rows: list[dict[str, str]]) -> list[torch.Tensor]:
+    def _positive_variant_type(
+        self,
+        anchor: dict[str, str],
+        positive: dict[str, str],
+    ) -> str:
+        if audio_sample_id(anchor) == audio_sample_id(positive):
+            return "aligned"
+        if same_lyric_class(anchor, positive):
+            return "repeated"
+        return "retexted"
+
+    def _load_candidate_audio(
+        self,
+        positive: dict[str, str],
+        candidate_rows: list[dict[str, str]],
+        protected_rows: list[dict[str, str]],
+    ) -> list[torch.Tensor]:
         import soundfile as sf
 
         loaded_by_path: dict[str, tuple[np.ndarray, int]] = {}
+        windows_by_sample_id: dict[str, tuple[int, int]] = {}
         for audio_path, path_rows in self._rows_by_audio_path(candidate_rows).items():
             info = sf.info(audio_path)
             if info.samplerate != self.audio_config.sample_rate:
@@ -259,13 +490,21 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
                     f"got {info.samplerate} Hz: {audio_path}"
                 )
 
-            starts = [int(round(audio_start_seconds(row) * info.samplerate)) for row in path_rows]
-            ends = [
-                start + int(round(float(row["segment_seconds"]) * info.samplerate))
-                for start, row in zip(starts, path_rows)
+            path_windows = [
+                self._candidate_audio_window(
+                    positive=positive,
+                    candidate=row,
+                    protected_rows=protected_rows,
+                    total_audio_samples=info.frames,
+                )
+                for row in path_rows
             ]
+            for row, window in zip(path_rows, path_windows):
+                windows_by_sample_id[audio_sample_id(row)] = window
+            starts = [window[0] for window in path_windows]
+            ends = [start + expected for start, expected in path_windows]
             read_start = max(min(starts), 0)
-            read_end = max(ends)
+            read_end = min(max(ends), info.frames)
             audio, _ = sf.read(
                 audio_path,
                 start=read_start,
@@ -279,9 +518,88 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
             loaded_by_path[audio_path] = (audio_array, read_start)
 
         return [
-            self._crop_loaded_audio(row, *loaded_by_path[str(Path(row["audio_path"]))])
+            self._crop_loaded_audio(
+                *loaded_by_path[str(Path(row["audio_path"]))],
+                *windows_by_sample_id[audio_sample_id(row)],
+            )
             for row in candidate_rows
         ]
+
+    def _candidate_audio_window(
+        self,
+        positive: dict[str, str],
+        candidate: dict[str, str],
+        protected_rows: list[dict[str, str]],
+        total_audio_samples: int,
+    ) -> tuple[int, int]:
+        sample_rate = self.audio_config.sample_rate
+        candidate_start = int(round(audio_start_seconds(candidate) * sample_rate))
+        candidate_end = int(round(audio_end_seconds(candidate) * sample_rate))
+        candidate_samples = max(1, candidate_end - candidate_start)
+        if self.candidate_window_policy == "line":
+            return max(candidate_start, 0), candidate_samples
+
+        positive_start = int(round(audio_start_seconds(positive) * sample_rate))
+        positive_end = int(round(audio_end_seconds(positive) * sample_rate))
+        target_samples = max(1, positive_end - positive_start)
+        if candidate_samples >= target_samples:
+            maximum_offset = candidate_samples - target_samples
+            offset = self._select_window_offset(maximum_offset)
+            return candidate_start + offset, target_samples
+
+        lower_sample, upper_sample = self._safe_window_start_sample_bounds(
+            candidate=candidate,
+            protected_rows=protected_rows,
+            target_samples=target_samples,
+            total_audio_samples=total_audio_samples,
+        )
+        if lower_sample > upper_sample:
+            raise RuntimeError(
+                "No safe context window can match the positive duration for "
+                f"candidate {audio_sample_id(candidate)}"
+            )
+        offset = self._select_window_offset(upper_sample - lower_sample)
+        return lower_sample + offset, target_samples
+
+    def _safe_window_start_sample_bounds(
+        self,
+        candidate: dict[str, str],
+        protected_rows: list[dict[str, str]],
+        target_samples: int,
+        total_audio_samples: int,
+    ) -> tuple[int, int]:
+        sample_rate = self.audio_config.sample_rate
+        candidate_start = int(round(audio_start_seconds(candidate) * sample_rate))
+        candidate_end = int(round(audio_end_seconds(candidate) * sample_rate))
+        safe_region_start = 0
+        safe_region_end = total_audio_samples
+        for protected in protected_rows:
+            if audio_sample_id(protected) == audio_sample_id(candidate):
+                continue
+            if audio_end_seconds(protected) <= audio_start_seconds(candidate):
+                safe_region_start = max(
+                    safe_region_start,
+                    int(round(audio_end_seconds(protected) * sample_rate)),
+                )
+            elif audio_start_seconds(protected) >= audio_end_seconds(candidate):
+                safe_region_end = min(
+                    safe_region_end,
+                    int(round(audio_start_seconds(protected) * sample_rate)),
+                )
+            elif segments_overlap(protected, candidate):
+                return 1, 0
+
+        return (
+            max(safe_region_start, candidate_end - target_samples),
+            min(candidate_start, safe_region_end - target_samples),
+        )
+
+    def _select_window_offset(self, maximum_offset: int) -> int:
+        if maximum_offset <= 0:
+            return 0
+        if self.randomize_candidate_windows:
+            return random.randint(0, maximum_offset)
+        return maximum_offset // 2
 
     def _rows_by_audio_path(
         self,
@@ -294,16 +612,12 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
 
     def _crop_loaded_audio(
         self,
-        row: dict[str, str],
         audio_array: np.ndarray,
         read_start_sample: int,
+        window_start_sample: int,
+        expected_samples: int,
     ) -> torch.Tensor:
-        start_sample = int(round(audio_start_seconds(row) * self.audio_config.sample_rate))
-        expected_samples = max(
-            1,
-            int(round(float(row["segment_seconds"]) * self.audio_config.sample_rate)),
-        )
-        offset = max(start_sample - read_start_sample, 0)
+        offset = max(window_start_sample - read_start_sample, 0)
         crop = audio_array[offset : offset + expected_samples]
 
         if crop.shape[0] < expected_samples:
@@ -434,6 +748,7 @@ def grouped_contrastive_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         dtype=torch.bool,
     )
     candidate_mask = torch.zeros(batch_size, max_candidates, dtype=torch.bool)
+    candidate_window_seconds = torch.zeros(batch_size, max_candidates)
 
     for batch_index, item in enumerate(batch):
         num_candidates = item["candidate_input_values"].shape[0]
@@ -453,6 +768,9 @@ def grouped_contrastive_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         candidate_mask[batch_index, :num_candidates] = item["candidate_mask"].to(
             dtype=torch.bool
         )
+        candidate_window_seconds[batch_index, :num_candidates] = item[
+            "candidate_window_seconds"
+        ]
 
     melody_batch = melody_only_collate(batch)
 
@@ -465,9 +783,11 @@ def grouped_contrastive_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "candidate_input_values": candidate_input_values,
         "candidate_audio_attention_mask": candidate_audio_attention_mask,
         "candidate_mask": candidate_mask,
+        "candidate_window_seconds": candidate_window_seconds,
         "target": torch.stack([item["target"] for item in batch]),
         "melody_sample_id": [item["melody_sample_id"] for item in batch],
         "candidate_ids": [item["candidate_ids"] for item in batch],
         "candidate_types": [item["candidate_types"] for item in batch],
+        "anchor_metadata": [item["anchor_metadata"] for item in batch],
         "metadata": [item["metadata"] for item in batch],
     }

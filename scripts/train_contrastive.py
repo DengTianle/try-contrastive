@@ -242,7 +242,7 @@ class DifferentSongBatchSampler(Sampler[list[int]]):
 
         indices_by_song: dict[str, list[int]] = defaultdict(list)
         for index, group in enumerate(self.dataset.groups):
-            indices_by_song[group["positive"]["dali_id"]].append(index)
+            indices_by_song[group["anchor"]["dali_id"]].append(index)
         for indices in indices_by_song.values():
             rng.shuffle(indices)
 
@@ -825,6 +825,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-negatives", type=int, default=7, help="Limit negatives per anchor to avoid OOM.")
     parser.add_argument(
+        "--positive-variant-policy",
+        choices=["self", "any", "retexted", "retexted-first"],
+        default="retexted-first",
+        help=(
+            "How repeat-grouped melody classes provide the positive audio. "
+            "The default prefers a congruent occurrence with different lyrics, then "
+            "an ordinary repeat, and finally the aligned occurrence."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-window-policy",
+        choices=["line", "match-positive"],
+        default="match-positive",
+        help=(
+            "Audio context shown to the model. The default makes every candidate "
+            "match the selected positive's duration: shorter negatives receive "
+            "random surrounding context and longer negatives are randomly cropped."
+        ),
+    )
+    parser.add_argument(
         "--disable-song-balanced-batches",
         action="store_true",
         help="Use ordinary shuffled batches instead of enforcing different songs per training batch.",
@@ -1006,6 +1026,7 @@ def main() -> None:
     if args.audio_background_mix_snr_db <= 0.0:
         raise SystemExit("--audio-background-mix-snr-db must be positive")
 
+    random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = choose_device(args.device)
     use_amp = args.amp and device.type == "cuda"
@@ -1024,11 +1045,15 @@ def main() -> None:
         split=args.train_split,
         max_negatives=args.max_negatives,
         min_negative_offset_seconds=args.min_negative_offset_seconds,
+        positive_variant_policy=args.positive_variant_policy,
+        candidate_window_policy=args.candidate_window_policy,
+        randomize_candidate_windows=args.candidate_window_policy == "match-positive",
         seed=args.seed,
         transform=train_transform,
     )
     if len(train_dataset) == 0:
         raise SystemExit(f"No grouped training examples found for split={args.train_split}")
+    print(f"Training positive variants: {train_dataset.positive_variant_counts()}")
 
     if args.global_loss_weight > 0.0 and not args.disable_song_balanced_batches:
         train_loader = DataLoader(
@@ -1057,6 +1082,9 @@ def main() -> None:
             split=args.val_split,
             max_negatives=args.max_negatives,
             min_negative_offset_seconds=args.min_negative_offset_seconds,
+            positive_variant_policy=args.positive_variant_policy,
+            candidate_window_policy=args.candidate_window_policy,
+            randomize_candidate_windows=False,
             seed=args.seed,
         )
         if len(val_dataset) > 0:

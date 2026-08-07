@@ -20,6 +20,41 @@ AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".aac"}
 PREPARED_AUDIO_FORMATS = {"flac", "wav"}
 
 
+def repeat_segments_path(path: Path) -> Path:
+    resolved = resolve_user_path(path)
+    if resolved.is_dir():
+        resolved = resolved / "segments.jsonl.gz"
+    if not resolved.is_file():
+        raise SystemExit(f"Repeat-grouping results do not exist: {resolved}")
+    return resolved
+
+
+def load_line_repeat_groupings(
+    path: Path,
+) -> tuple[dict[tuple[str, int], dict[str, Any]], set[str]]:
+    opener = gzip.open if path.suffix == ".gz" else open
+    groupings: dict[tuple[str, int], dict[str, Any]] = {}
+    grouped_song_ids: set[str] = set()
+    with opener(path, "rt", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            row = json.loads(line)
+            if row.get("level") != "line":
+                continue
+            try:
+                key = (str(row["song_id"]), int(row["segment_index"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                raise SystemExit(
+                    f"Invalid repeat-grouping row at {path}:{line_number}"
+                ) from exc
+            if key in groupings:
+                raise SystemExit(f"Duplicate repeat-grouping assignment for {key}")
+            groupings[key] = row
+            grouped_song_ids.add(key[0])
+    if not groupings:
+        raise SystemExit(f"No line-level repeat groupings found in: {path}")
+    return groupings, grouped_song_ids
+
+
 def load_dali(
     dali_data_dir: Path,
     gt_file: Path | None,
@@ -280,8 +315,9 @@ def extract_dali_lines(entry: Any) -> list[dict[str, Any]]:
 def unique_line_segments(
     lines: list[dict[str, Any]],
     audio_duration: float,
+    trim_repeated_text: bool = True,
 ) -> tuple[list[dict[str, Any]], Counter[str]]:
-    """Keep the first in-audio occurrence of each normalized DALI lyric line."""
+    """Clip line intervals and optionally keep only the first normalized lyric."""
     seen_text: set[str] = set()
     segments: list[dict[str, Any]] = []
     skipped: Counter[str] = Counter()
@@ -292,7 +328,7 @@ def unique_line_segments(
             skipped["outside_audio"] += 1
             continue
         normalized_text = str(line["normalized_text"])
-        if normalized_text in seen_text:
+        if trim_repeated_text and normalized_text in seen_text:
             skipped["repeated_line"] += 1
             continue
         seen_text.add(normalized_text)
@@ -437,6 +473,7 @@ def row_for_segment(
         "audio_path": manifest_relative_path(track_info["audio_path"], manifest_dir),
         "raw_audio_path": manifest_relative_path(track_info["raw_audio_path"], manifest_dir),
         "melody_path": manifest_relative_path(segment["melody_path"], manifest_dir),
+        "audio_duration_seconds": f"{track_info['duration']:.6f}",
         "start_seconds": f"{segment['start_seconds']:.6f}",
         "end_seconds": f"{segment['end_seconds']:.6f}",
         "segment_seconds": f"{segment['segment_seconds']:.6f}",
@@ -445,6 +482,23 @@ def row_for_segment(
         "note_count": str(segment["note_count"]),
         "line_index": str(segment["line_index"]),
         "line_text": segment["line_text"],
+        "lyric_class": optional_manifest_value(segment.get("lyric_class")),
+        "melody_class": optional_manifest_value(segment.get("melody_class")),
+        "parent_index": optional_manifest_value(segment.get("parent_index")),
+        "transposition_to_representative": optional_manifest_value(
+            segment.get("transposition_to_representative")
+        ),
+        "onset_mae_to_representative": optional_manifest_value(
+            segment.get("onset_mae_to_representative")
+        ),
+        "duration_mae_to_representative": optional_manifest_value(
+            segment.get("duration_mae_to_representative")
+        ),
+        "group_quality_flags": json.dumps(
+            segment.get("group_quality_flags", []),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ),
     }
 
 
@@ -454,11 +508,16 @@ def manifest_relative_path(path: str | Path, manifest_dir: Path) -> str:
     return Path(os.path.relpath(path, manifest_dir)).as_posix()
 
 
+def optional_manifest_value(value: Any) -> Any:
+    return "" if value is None else value
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Prepare DALI vocal-melody/audio contrastive data. The script writes one "
-            "canonical frame-based melody .npz per unique DALI lyric line and a segment manifest."
+            "canonical frame-based melody .npz per retained DALI lyric-line occurrence "
+            "and a segment manifest."
         )
     )
     parser.add_argument("--dali-data-dir", type=Path, default=Path("data/DALI_v1"))
@@ -491,6 +550,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--melody-frame-rate", type=float, default=50.0, help="Number of frames per second.")
     parser.add_argument("--max-tracks", type=int, default=0, help="0 means no track limit.")
     parser.add_argument("--max-segments", type=int, default=0, help="0 means no segment limit.")
+    parser.add_argument(
+        "--repeat-groupings",
+        type=Path,
+        default=None,
+        help=(
+            "Optional find_dali_repeats.py results directory or segments.jsonl.gz. "
+            "Grouped songs retain all line occurrences and write lyric/melody class IDs."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--train-ratio", type=float, default=0.8)
     parser.add_argument("--val-ratio", type=float, default=0.1)
@@ -504,6 +572,18 @@ def main() -> None:
     args.output_dir = resolve_user_path(args.output_dir)
     if args.gt_file is not None:
         args.gt_file = resolve_user_path(args.gt_file)
+    repeat_groupings_path = None
+    repeat_groupings: dict[tuple[str, int], dict[str, Any]] = {}
+    grouped_song_ids: set[str] = set()
+    if args.repeat_groupings is not None:
+        repeat_groupings_path = repeat_segments_path(args.repeat_groupings)
+        repeat_groupings, grouped_song_ids = load_line_repeat_groupings(
+            repeat_groupings_path
+        )
+        print(
+            f"Loaded {len(repeat_groupings)} line group assignments for "
+            f"{len(grouped_song_ids)} songs from {repeat_groupings_path}."
+        )
     if args.prepared_audio_dir is None:
         args.prepared_audio_dir = args.output_dir / f"audio_{args.sample_rate // 1000}k"
     args.prepared_audio_dir = resolve_user_path(args.prepared_audio_dir)
@@ -555,6 +635,16 @@ def main() -> None:
         if not lines:
             skipped["no_lines"] += 1
             continue
+        has_repeat_groupings = dali_id in grouped_song_ids
+        if has_repeat_groupings:
+            for line in lines:
+                grouping = repeat_groupings.get((dali_id, int(line["line_index"])))
+                if grouping is None:
+                    raise SystemExit(
+                        "Repeat groupings are incomplete for "
+                        f"{dali_id} line {line['line_index']}"
+                    )
+                line["repeat_grouping"] = grouping
 
         annotation_duration = annotation_duration_seconds(notes)
         try:
@@ -594,6 +684,7 @@ def main() -> None:
                 "audio_path": prepared_audio_path,
                 "notes": notes,
                 "lines": lines,
+                "has_repeat_groupings": has_repeat_groupings,
                 "duration": duration,
                 "artist": entry.info.get("artist", ""),
                 "title": entry.info.get("title", ""),
@@ -618,6 +709,7 @@ def main() -> None:
         line_segments, line_skips = unique_line_segments(
             track["lines"],
             audio_duration=track["duration"],
+            trim_repeated_text=not track["has_repeat_groupings"],
         )
         skipped_segments.update(line_skips)
         for line in line_segments:
@@ -630,6 +722,7 @@ def main() -> None:
                 frame_rate=args.melody_frame_rate,
             )
             voiced_ratio = float(np.mean(voiced)) if voiced.size else 0.0
+            grouping = line.get("repeat_grouping", {})
 
             sample_id = stable_sample_id(
                 track["dali_id"],
@@ -657,6 +750,19 @@ def main() -> None:
                 "voiced_ratio": voiced_ratio,
                 "line_index": line["line_index"],
                 "line_text": line["text"],
+                "lyric_class": grouping.get("lyric_class"),
+                "melody_class": grouping.get("melody_class"),
+                "parent_index": grouping.get("parent_index"),
+                "transposition_to_representative": grouping.get(
+                    "transposition_to_representative"
+                ),
+                "onset_mae_to_representative": grouping.get(
+                    "onset_mae_to_representative"
+                ),
+                "duration_mae_to_representative": grouping.get(
+                    "duration_mae_to_representative"
+                ),
+                "group_quality_flags": grouping.get("quality_flags", []),
                 "note_count": count_segment_notes(
                     track["notes"],
                     start_seconds=start_seconds,
@@ -704,8 +810,21 @@ def main() -> None:
         "audio_format": args.audio_format,
         "skip_audio_prep": args.skip_audio_prep,
         "sample_rate": args.sample_rate,
-        "segmentation_strategy": "one_unique_dali_line_per_segment",
-        "repeated_line_policy": "keep_first_casefolded_nfkc_text",
+        "segmentation_strategy": "one_dali_line_occurrence_per_segment",
+        "repeated_line_policy": (
+            "retain_grouped_occurrences_else_keep_first_normalized_text"
+            if repeat_groupings_path is not None
+            else "keep_first_casefolded_nfkc_text"
+        ),
+        "repeat_groupings": (
+            manifest_relative_path(repeat_groupings_path, metadata_path.parent)
+            if repeat_groupings_path is not None
+            else None
+        ),
+        "num_grouped_songs_available": len(grouped_song_ids),
+        "num_grouped_tracks_prepared": sum(
+            bool(track["has_repeat_groupings"]) for track in usable_tracks
+        ),
         "melody_frame_rate": args.melody_frame_rate,
         "seed": args.seed,
         "train_ratio": args.train_ratio,

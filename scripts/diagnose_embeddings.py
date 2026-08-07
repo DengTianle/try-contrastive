@@ -121,14 +121,12 @@ def extract_embeddings(
             finite_mean_log_f0_semitones(batch["melody_f0_hz"], batch["melody_voiced"])
         )
 
-        targets = batch["target"].detach().cpu().tolist()
-        for row_index, target_index in enumerate(targets):
-            positive_row = batch["metadata"][row_index][int(target_index)]
-            sample_ids.append(str(positive_row["sample_id"]))
-            song_ids.append(str(positive_row["dali_id"]))
-            starts_seconds.append(safe_float(positive_row.get("start_seconds")))
-            voiced_ratios.append(safe_float(positive_row.get("voiced_ratio")))
-            note_counts.append(safe_float(positive_row.get("note_count")))
+        for anchor_row in batch["anchor_metadata"]:
+            sample_ids.append(str(anchor_row["sample_id"]))
+            song_ids.append(str(anchor_row["dali_id"]))
+            starts_seconds.append(safe_float(anchor_row.get("start_seconds")))
+            voiced_ratios.append(safe_float(anchor_row.get("voiced_ratio")))
+            note_counts.append(safe_float(anchor_row.get("note_count")))
 
     if not melody_embeddings:
         raise SystemExit("No examples found for diagnostics.")
@@ -516,6 +514,13 @@ def main() -> None:
         manifest_path=args.manifest,
         split=args.split,
         max_negatives=0,
+        positive_variant_policy=str(
+            checkpoint_arg(checkpoint_args, "positive_variant_policy", "self")
+        ),
+        candidate_window_policy=str(
+            checkpoint_arg(checkpoint_args, "candidate_window_policy", "line")
+        ),
+        randomize_candidate_windows=False,
         seed=seed,
     )
     if len(dataset) == 0:

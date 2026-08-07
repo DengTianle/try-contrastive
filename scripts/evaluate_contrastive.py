@@ -78,36 +78,59 @@ def segment_length_probe_for_example(
     candidate_rows: list[dict[str, Any]],
     target_index: int,
     scores: torch.Tensor,
+    anchor_row: dict[str, Any] | None = None,
+    candidate_window_seconds: torch.Tensor | list[float] | None = None,
     tolerance_seconds: float = SEGMENT_LENGTH_TOLERANCE_SECONDS,
 ) -> dict[str, float]:
-    """Measure how well duration alone identifies the paired audio candidate."""
+    """Measure retrieval using only observed-window distance from anchor duration."""
     if not candidate_rows:
         raise ValueError("Segment-length probe requires at least one candidate")
     if not 0 <= target_index < len(candidate_rows):
         raise ValueError("Segment-length probe target is outside the candidate list")
 
-    lengths = torch.tensor(
-        [row_segment_seconds(row) for row in candidate_rows],
-        dtype=torch.float64,
-    )
+    if candidate_window_seconds is None:
+        lengths = torch.tensor(
+            [row_segment_seconds(row) for row in candidate_rows],
+            dtype=torch.float64,
+        )
+    else:
+        lengths = torch.as_tensor(candidate_window_seconds, dtype=torch.float64).cpu()
+        if lengths.ndim != 1 or lengths.shape[0] != len(candidate_rows):
+            raise ValueError("Observed candidate durations must match the candidate rows")
     scores = scores.detach().cpu().to(dtype=torch.float64)
     if scores.ndim != 1 or scores.shape[0] != lengths.shape[0]:
         raise ValueError("Segment-length probe scores must match the candidate rows")
 
-    target_length = lengths[target_index]
-    length_errors = (lengths - target_length).abs()
+    anchor_length = row_segment_seconds(
+        anchor_row if anchor_row is not None else candidate_rows[target_index]
+    )
+    length_errors = (lengths - anchor_length).abs()
     minimum_error = length_errors.min()
     nearest_mask = length_errors <= minimum_error + tolerance_seconds
-    matching_candidates = int(nearest_mask.sum().item())
+    nearest_candidates = int(nearest_mask.sum().item())
     target_is_nearest = bool(nearest_mask[target_index])
     expected_top1 = (
-        1.0 / matching_candidates if target_is_nearest and matching_candidates else 0.0
+        1.0 / nearest_candidates if target_is_nearest and nearest_candidates else 0.0
     )
+
+    target_error = length_errors[target_index]
+    closer_candidates = int(
+        (length_errors < target_error - tolerance_seconds).sum().item()
+    )
+    tied_candidates = int(
+        ((length_errors - target_error).abs() <= tolerance_seconds).sum().item()
+    )
+    expected_rank = closer_candidates + (tied_candidates + 1.0) / 2.0
+    expected_reciprocal_rank = sum(
+        1.0 / (closer_candidates + tie_position)
+        for tie_position in range(1, tied_candidates + 1)
+    ) / tied_candidates
 
     top_index = int(scores.argmax().item())
     model_top1_length_match = float(
         length_errors[top_index] <= tolerance_seconds
     )
+    model_top1_is_nearest = float(nearest_mask[top_index])
 
     correlation = float("nan")
     if len(candidate_rows) >= 2:
@@ -125,9 +148,14 @@ def segment_length_probe_for_example(
     return {
         "expected_top1_accuracy": expected_top1,
         "chance_top1_accuracy": 1.0 / len(candidate_rows),
-        "unique_match": float(matching_candidates == 1),
-        "matching_candidates": float(matching_candidates),
+        "expected_reciprocal_rank": expected_reciprocal_rank,
+        "expected_rank": expected_rank,
+        "unique_match": float(target_is_nearest and nearest_candidates == 1),
+        "matching_candidates": float(nearest_candidates),
+        "closer_candidates": float(closer_candidates),
+        "tied_candidates": float(tied_candidates),
         "model_top1_length_match": model_top1_length_match,
+        "model_top1_is_nearest": model_top1_is_nearest,
         "score_proximity_correlation": correlation,
     }
 
@@ -154,10 +182,15 @@ def evaluate_retrieval(
     predictions: list[dict[str, Any]] = []
     length_probe_expected_top1 = 0.0
     length_probe_chance_top1 = 0.0
+    length_probe_expected_reciprocal_rank = 0.0
+    length_probe_expected_rank = 0.0
     length_probe_unique_matches = 0.0
     length_probe_matching_candidates = 0.0
     length_probe_model_top1_matches = 0.0
+    length_probe_model_top1_nearest = 0.0
     length_probe_correlations: list[float] = []
+    length_probe_recall_hits = {k: 0.0 for k in recall_k}
+    positive_variant_counts = {"aligned": 0, "repeated": 0, "retexted": 0}
 
     for batch in loader:
         batch = move_batch_to_device(batch, device)
@@ -195,18 +228,40 @@ def evaluate_retrieval(
         logits_cpu = logits.detach().cpu()
         targets_cpu = batch["target"].detach().cpu().tolist()
         candidate_counts_cpu = candidate_counts.detach().cpu().tolist()
+        candidate_window_seconds_cpu = batch["candidate_window_seconds"].detach().cpu()
         for batch_index, target_index in enumerate(targets_cpu):
             valid_count = int(candidate_counts_cpu[batch_index])
+            positive_type = batch["candidate_types"][batch_index][int(target_index)]
+            variant_name = positive_type.removeprefix("positive_")
+            if variant_name in positive_variant_counts:
+                positive_variant_counts[variant_name] += 1
             probe = segment_length_probe_for_example(
                 candidate_rows=batch["metadata"][batch_index][:valid_count],
                 target_index=int(target_index),
                 scores=logits_cpu[batch_index, :valid_count],
+                anchor_row=batch["anchor_metadata"][batch_index],
+                candidate_window_seconds=candidate_window_seconds_cpu[
+                    batch_index,
+                    :valid_count,
+                ],
             )
             length_probe_expected_top1 += probe["expected_top1_accuracy"]
             length_probe_chance_top1 += probe["chance_top1_accuracy"]
+            length_probe_expected_reciprocal_rank += probe[
+                "expected_reciprocal_rank"
+            ]
+            length_probe_expected_rank += probe["expected_rank"]
             length_probe_unique_matches += probe["unique_match"]
             length_probe_matching_candidates += probe["matching_candidates"]
             length_probe_model_top1_matches += probe["model_top1_length_match"]
+            length_probe_model_top1_nearest += probe["model_top1_is_nearest"]
+            closer = int(probe["closer_candidates"])
+            tied = int(probe["tied_candidates"])
+            for k in recall_k:
+                length_probe_recall_hits[k] += min(
+                    max(k - closer, 0),
+                    tied,
+                ) / tied
             correlation = probe["score_proximity_correlation"]
             if correlation == correlation:
                 length_probe_correlations.append(correlation)
@@ -245,6 +300,12 @@ def evaluate_retrieval(
         "segment_length_probe_chance_top1_accuracy": (
             length_probe_chance_top1 / total_examples
         ),
+        "segment_length_probe_expected_mrr": (
+            length_probe_expected_reciprocal_rank / total_examples
+        ),
+        "segment_length_probe_expected_mean_rank": (
+            length_probe_expected_rank / total_examples
+        ),
         "segment_length_probe_unique_match_rate": (
             length_probe_unique_matches / total_examples
         ),
@@ -253,6 +314,9 @@ def evaluate_retrieval(
         ),
         "segment_length_probe_model_top1_match_rate": (
             length_probe_model_top1_matches / total_examples
+        ),
+        "segment_length_probe_model_top1_nearest_rate": (
+            length_probe_model_top1_nearest / total_examples
         ),
         "segment_length_probe_score_proximity_correlation": (
             sum(length_probe_correlations) / len(length_probe_correlations)
@@ -267,6 +331,18 @@ def evaluate_retrieval(
         metrics[f"recall@{k}"] = (
             total_top1 / total_examples if k == 1 else recall_hits[k] / total_examples
         )
+        metrics[f"segment_length_probe_expected_recall@{k}"] = (
+            length_probe_recall_hits[k] / total_examples
+        )
+    metrics["duration_only_top1_accuracy"] = metrics[
+        "segment_length_probe_expected_top1_accuracy"
+    ]
+    metrics["duration_only_mrr"] = metrics["segment_length_probe_expected_mrr"]
+    metrics["duration_only_mean_rank"] = metrics[
+        "segment_length_probe_expected_mean_rank"
+    ]
+    for variant_name, count in positive_variant_counts.items():
+        metrics[f"positive_variant_{variant_name}_fraction"] = count / total_examples
     return metrics, predictions
 
 
@@ -282,6 +358,7 @@ def prediction_rows(
     targets_cpu = batch["target"].detach().cpu().tolist()
     candidate_counts_cpu = candidate_counts.detach().cpu().tolist()
     candidate_mask_cpu = batch["candidate_mask"].detach().cpu()
+    candidate_window_seconds_cpu = batch["candidate_window_seconds"].detach().cpu()
 
     for batch_index, melody_sample_id in enumerate(batch["melody_sample_id"]):
         valid_count = int(candidate_counts_cpu[batch_index])
@@ -291,15 +368,26 @@ def prediction_rows(
         top_index = int(order[0]) if order else -1
         top_row = batch["metadata"][batch_index][top_index] if top_index >= 0 else {}
         positive_row = batch["metadata"][batch_index][target_index]
+        anchor_row = batch["anchor_metadata"][batch_index]
         top_start = float(top_row["start_seconds"]) if top_row else ""
-        positive_start = float(positive_row["start_seconds"])
+        anchor_start = float(anchor_row["start_seconds"])
         top_segment_seconds = row_segment_seconds(top_row) if top_row else ""
         positive_segment_seconds = row_segment_seconds(positive_row)
+        anchor_segment_seconds = row_segment_seconds(anchor_row)
+        top_window_seconds = (
+            float(candidate_window_seconds_cpu[batch_index, top_index])
+            if top_index >= 0
+            else ""
+        )
+        positive_window_seconds = float(
+            candidate_window_seconds_cpu[batch_index, target_index]
+        )
         rows.append(
             {
                 "melody_sample_id": melody_sample_id,
-                "melody_start_seconds": positive_start,
-                "melody_end_seconds": float(positive_row["end_seconds"]),
+                "melody_start_seconds": anchor_start,
+                "melody_end_seconds": float(anchor_row["end_seconds"]),
+                "melody_segment_seconds": anchor_segment_seconds,
                 "rank": int(ranks_cpu[batch_index]),
                 "num_candidates": valid_count,
                 "positive_score": float(logits_cpu[batch_index, target_index]),
@@ -316,10 +404,11 @@ def prediction_rows(
                 "top_candidate_sample_id": top_row.get("sample_id", ""),
                 "top_candidate_start_seconds": top_start,
                 "top_candidate_end_seconds": float(top_row["end_seconds"]) if top_row else "",
-                "top_candidate_offset_seconds": top_start - positive_start if top_row else "",
+                "top_candidate_offset_seconds": top_start - anchor_start if top_row else "",
                 "top_candidate_segment_seconds": top_segment_seconds,
+                "top_candidate_window_seconds": top_window_seconds,
                 "top_candidate_length_error_seconds": (
-                    abs(float(top_segment_seconds) - positive_segment_seconds)
+                    abs(float(top_window_seconds) - anchor_segment_seconds)
                     if top_row
                     else ""
                 ),
@@ -328,9 +417,10 @@ def prediction_rows(
                 else "",
                 "positive_candidate_id": batch["candidate_ids"][batch_index][target_index],
                 "positive_candidate_sample_id": positive_row["sample_id"],
-                "positive_candidate_start_seconds": positive_start,
+                "positive_candidate_start_seconds": float(positive_row["start_seconds"]),
                 "positive_candidate_end_seconds": float(positive_row["end_seconds"]),
                 "positive_candidate_segment_seconds": positive_segment_seconds,
+                "positive_candidate_window_seconds": positive_window_seconds,
                 "correct_top1": bool(top_index == target_index),
                 "valid_mask": " ".join(
                     "1" if bool(value) else "0" for value in candidate_mask_cpu[batch_index].tolist()
@@ -346,6 +436,7 @@ def write_predictions(path: Path, rows: list[dict[str, Any]]) -> None:
         "melody_sample_id",
         "melody_start_seconds",
         "melody_end_seconds",
+        "melody_segment_seconds",
         "rank",
         "num_candidates",
         "positive_score",
@@ -358,6 +449,7 @@ def write_predictions(path: Path, rows: list[dict[str, Any]]) -> None:
         "top_candidate_end_seconds",
         "top_candidate_offset_seconds",
         "top_candidate_segment_seconds",
+        "top_candidate_window_seconds",
         "top_candidate_length_error_seconds",
         "top_candidate_type",
         "positive_candidate_id",
@@ -365,6 +457,7 @@ def write_predictions(path: Path, rows: list[dict[str, Any]]) -> None:
         "positive_candidate_start_seconds",
         "positive_candidate_end_seconds",
         "positive_candidate_segment_seconds",
+        "positive_candidate_window_seconds",
         "correct_top1",
         "valid_mask",
     ]
@@ -382,6 +475,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-negatives", type=int, default=4)
+    parser.add_argument(
+        "--positive-variant-policy",
+        choices=["self", "any", "retexted", "retexted-first"],
+        default=None,
+        help=(
+            "Override the checkpoint's repeat-group positive policy. Defaults to "
+            "the checkpoint setting, or self for older checkpoints."
+        ),
+    )
+    parser.add_argument(
+        "--candidate-window-policy",
+        choices=["line", "match-positive"],
+        default=None,
+        help=(
+            "Override the checkpoint's candidate context policy. Defaults to the "
+            "checkpoint setting, or line for older checkpoints."
+        ),
+    )
     parser.add_argument(
         "--min-negative-offset-seconds",
         type=float,
@@ -416,12 +527,29 @@ def main() -> None:
     temperature = args.temperature
     if temperature is None:
         temperature = checkpoint_arg(checkpoint_args, "temperature", 0.07)
+    positive_variant_policy = args.positive_variant_policy
+    if positive_variant_policy is None:
+        positive_variant_policy = checkpoint_arg(
+            checkpoint_args,
+            "positive_variant_policy",
+            "self",
+        )
+    candidate_window_policy = args.candidate_window_policy
+    if candidate_window_policy is None:
+        candidate_window_policy = checkpoint_arg(
+            checkpoint_args,
+            "candidate_window_policy",
+            "line",
+        )
 
     dataset = GroupedContrastiveDataset(
         manifest_path=args.manifest,
         split=args.split,
         max_negatives=args.max_negatives,
         min_negative_offset_seconds=args.min_negative_offset_seconds,
+        positive_variant_policy=str(positive_variant_policy),
+        candidate_window_policy=str(candidate_window_policy),
+        randomize_candidate_windows=False,
         seed=checkpoint_arg(checkpoint_args, "seed", 13),
     )
     if len(dataset) == 0:
@@ -452,6 +580,8 @@ def main() -> None:
         "manifest": str(args.manifest),
         "split": args.split,
         "max_negatives": args.max_negatives,
+        "positive_variant_policy": positive_variant_policy,
+        "candidate_window_policy": candidate_window_policy,
         "temperature": float(temperature),
         "segment_length_probe_tolerance_seconds": SEGMENT_LENGTH_TOLERANCE_SECONDS,
         "metrics": metrics,

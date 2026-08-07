@@ -4,7 +4,8 @@ __pycache__/
 
 data/
 checkpoints/
-tests/
+tests/*
+!tests/test_candidate_windows.py
 .vscode/
 *.npz
 *.wav
