@@ -14,6 +14,9 @@ def normalize_waveforms(
 
     This mirrors Wav2Vec2FeatureExtractor normalization while excluding padded
     samples from the statistics and restoring padding to zero afterwards.
+
+    Note that we did not use their provided feature extractor since that will
+    mean moving to CPU numpy operations then move back to GPU.
     """
 
     if input_values.ndim != 2:

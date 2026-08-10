@@ -88,6 +88,14 @@ def resolve_user_path(path: Path) -> Path:
     return expanded.resolve(strict=False)
 
 
+def read_keep_file(path: Path) -> list[str]:
+    return [
+        line.split("#", 1)[0].strip()
+        for line in resolve_user_path(path).read_text(encoding="utf-8").splitlines()
+        if line.split("#", 1)[0].strip()
+    ]
+
+
 def prepare_input_dirs(dali_data_dir: Path, audio_dir: Path) -> None:
     created_dirs = []
     for label, path in (("DALI annotation", dali_data_dir), ("audio", audio_dir)):
@@ -525,6 +533,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=Path("data/prepared/dali"))
     parser.add_argument("--gt-file", type=Path, default=None, help="Optional DALI ground-truth gzip file.")
     parser.add_argument(
+        "--keep-file",
+        type=Path,
+        default=None,
+        help="Prepare only DALI ids listed in this text file (one id per line).",
+    )
+    parser.add_argument(
         "--ground-truth-only",
         action="store_true",
         help="Use only DALI ids present in --gt-file. Useful for small aligned experiments.",
@@ -572,6 +586,8 @@ def main() -> None:
     args.output_dir = resolve_user_path(args.output_dir)
     if args.gt_file is not None:
         args.gt_file = resolve_user_path(args.gt_file)
+    if args.keep_file is not None:
+        args.keep_file = resolve_user_path(args.keep_file)
     repeat_groupings_path = None
     repeat_groupings: dict[tuple[str, int], dict[str, Any]] = {}
     grouped_song_ids: set[str] = set()
@@ -603,10 +619,24 @@ def main() -> None:
     validate_input_files(args.dali_data_dir, args.audio_dir, audio_files, args.gt_file)
 
     keep_ids = None
+    if args.keep_file is not None:
+        keep_ids = set(read_keep_file(args.keep_file))
+        if not keep_ids:
+            raise SystemExit(f"Keep file contains no DALI ids: {args.keep_file}")
     if args.ground_truth_only:
         if args.gt_file is None:
             raise SystemExit("--ground-truth-only requires --gt-file")
-        keep_ids = read_ground_truth_ids(args.gt_file)
+        ground_truth_ids = read_ground_truth_ids(args.gt_file)
+        keep_ids = (
+            ground_truth_ids
+            if keep_ids is None
+            else keep_ids.intersection(ground_truth_ids)
+        )
+        if not keep_ids:
+            raise SystemExit(
+                "No DALI ids remain after applying --keep-file and "
+                "--ground-truth-only"
+            )
 
     print("Loading DALI annotations...")
     dali_data = load_dali(args.dali_data_dir, args.gt_file, keep_ids=keep_ids)
@@ -806,6 +836,11 @@ def main() -> None:
         "source": "DALI",
         "dali_data_dir": manifest_relative_path(args.dali_data_dir, metadata_path.parent),
         "audio_dir": manifest_relative_path(args.audio_dir, metadata_path.parent),
+        "keep_file": (
+            manifest_relative_path(args.keep_file, metadata_path.parent)
+            if args.keep_file is not None
+            else None
+        ),
         "prepared_audio_dir": manifest_relative_path(args.prepared_audio_dir, metadata_path.parent),
         "audio_format": args.audio_format,
         "skip_audio_prep": args.skip_audio_prep,

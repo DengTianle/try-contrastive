@@ -19,6 +19,10 @@ conda run -n try-contrastive python scripts/prepare_dali_dataset.py \
   --repeat-groupings data/repeat_groupings
 ```
 
+To prepare only a specific set of songs, put one DALI id per line in a text
+file and pass `--keep-file path/to/song_ids.txt`. Blank lines and `#` comments
+are ignored.
+
 For songs covered by the grouping results, the manifest retains every line occurrence
 and records its lyric and melody classes. Training never uses another member of the
 anchor's melody class as a negative. By default it chooses a positive occurrence with
