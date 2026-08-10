@@ -120,6 +120,62 @@ class CandidateWindowTest(unittest.TestCase):
             [negative["sample_id"] for negative in anchor_group["negatives"]],
         )
 
+    def test_rounding_infeasible_context_is_removed_before_loading(self) -> None:
+        rows = [
+            self._row(
+                "protected_before",
+                0.0,
+                0.01849878271358074,
+                melody_class=1,
+                lyric_class=2,
+            ),
+            self._row(
+                "candidate",
+                0.12542893938926097,
+                0.44621940941630167,
+                melody_class=2,
+                lyric_class=3,
+            ),
+            self._row(
+                "protected_after",
+                0.5531495660919818,
+                0.7,
+                melody_class=1,
+                lyric_class=4,
+            ),
+            self._row(
+                "anchor",
+                1.6688398423883077,
+                2.2034875747168066,
+                melody_class=1,
+                lyric_class=1,
+            ),
+        ]
+        with self.manifest_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+
+        dataset = GroupedContrastiveDataset(
+            self.manifest_path,
+            split="train",
+            positive_variant_policy="self",
+            candidate_window_policy="match-positive",
+        )
+        anchor_index = next(
+            index
+            for index, group in enumerate(dataset.groups)
+            if group["anchor"]["sample_id"] == "anchor"
+        )
+        anchor_group = dataset.groups[anchor_index]
+
+        self.assertNotIn(
+            "candidate",
+            [negative["sample_id"] for negative in anchor_group["negative_pool"]],
+        )
+        item = dataset[anchor_index]
+        self.assertEqual(item["candidate_input_values"].shape[0], 1)
+
     def test_epoch_changes_positive_variant_and_negative_subset_reproducibly(self) -> None:
         rows = [
             self._row("anchor", 0.0, 0.5, melody_class=1, lyric_class=1),

@@ -176,6 +176,7 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         self.epoch = 0
         self.max_negatives = max_negatives
         self.transform = transform
+        self._audio_frames_by_path: dict[str, int] = {}
 
         with self.manifest_path.open(newline="", encoding="utf-8") as handle:
             rows = list(csv.DictReader(handle))
@@ -184,7 +185,7 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         if split is not None:
             rows = [row for row in rows if row["split"] == split]
         if self.candidate_window_policy == "match-positive":
-            self._backfill_audio_durations(rows)
+            self._cache_audio_metadata(rows)
         self.rows = rows
 
         self.groups = self._build_groups_from_segment_rows(rows)
@@ -196,21 +197,27 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
                 resolved[key] = resolve_manifest_path(resolved[key], self.manifest_dir)
         return resolved
 
-    def _backfill_audio_durations(self, rows: list[dict[str, str]]) -> None:
-        missing_by_path: dict[str, list[dict[str, str]]] = defaultdict(list)
-        for row in rows:
-            if not row.get("audio_duration_seconds"):
-                missing_by_path[row["audio_path"]].append(row)
-        if not missing_by_path:
-            return
+    def _audio_frame_count(self, audio_path: str | Path) -> int:
+        path = str(Path(audio_path))
+        if path not in self._audio_frames_by_path:
+            import soundfile as sf
 
-        import soundfile as sf
+            info = sf.info(path)
+            if info.samplerate != self.audio_config.sample_rate:
+                raise ValueError(
+                    f"Expected {self.audio_config.sample_rate} Hz prepared audio, "
+                    f"got {info.samplerate} Hz: {path}"
+                )
+            self._audio_frames_by_path[path] = int(info.frames)
+        return self._audio_frames_by_path[path]
 
-        for audio_path, path_rows in missing_by_path.items():
-            info = sf.info(audio_path)
-            duration_seconds = info.frames / info.samplerate
+    def _cache_audio_metadata(self, rows: list[dict[str, str]]) -> None:
+        for audio_path, path_rows in self._rows_by_audio_path(rows).items():
+            frame_count = self._audio_frame_count(audio_path)
+            duration_seconds = frame_count / self.audio_config.sample_rate
             for row in path_rows:
-                row["audio_duration_seconds"] = str(duration_seconds)
+                if not row.get("audio_duration_seconds"):
+                    row["audio_duration_seconds"] = str(duration_seconds)
 
     def _build_groups_from_segment_rows(
         self,
@@ -346,43 +353,31 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
     ) -> bool:
         if self.candidate_window_policy == "line":
             return True
-        target_seconds = segment_duration_seconds(positive)
-        if segment_duration_seconds(candidate) >= target_seconds:
+        target_samples = self._segment_sample_count(positive)
+        if self._segment_sample_count(candidate) >= target_samples:
             return True
 
-        audio_duration = float(candidate.get("audio_duration_seconds") or "inf")
-        lower, upper = self._safe_window_start_bounds(
+        lower_sample, upper_sample = self._safe_window_start_sample_bounds(
             candidate=candidate,
             protected_rows=protected_rows,
-            target_seconds=target_seconds,
-            audio_duration_seconds=audio_duration,
+            target_samples=target_samples,
+            total_audio_samples=self._audio_frame_count(candidate["audio_path"]),
         )
-        return lower <= upper + 1e-9
+        return lower_sample <= upper_sample
 
-    def _safe_window_start_bounds(
+    def _segment_sample_bounds(
         self,
-        candidate: dict[str, str],
-        protected_rows: list[dict[str, str]],
-        target_seconds: float,
-        audio_duration_seconds: float,
-    ) -> tuple[float, float]:
-        candidate_start = audio_start_seconds(candidate)
-        candidate_end = audio_end_seconds(candidate)
-        safe_region_start = 0.0
-        safe_region_end = audio_duration_seconds
-        for protected in protected_rows:
-            if audio_sample_id(protected) == audio_sample_id(candidate):
-                continue
-            if audio_end_seconds(protected) <= candidate_start:
-                safe_region_start = max(safe_region_start, audio_end_seconds(protected))
-            elif audio_start_seconds(protected) >= candidate_end:
-                safe_region_end = min(safe_region_end, audio_start_seconds(protected))
-            elif segments_overlap(protected, candidate):
-                return 1.0, 0.0
+        row: dict[str, str],
+    ) -> tuple[int, int]:
+        sample_rate = self.audio_config.sample_rate
+        return (
+            int(round(audio_start_seconds(row) * sample_rate)),
+            int(round(audio_end_seconds(row) * sample_rate)),
+        )
 
-        lower = max(safe_region_start, candidate_end - target_seconds)
-        upper = min(candidate_start, safe_region_end - target_seconds)
-        return lower, upper
+    def _segment_sample_count(self, row: dict[str, str]) -> int:
+        start_sample, end_sample = self._segment_sample_bounds(row)
+        return max(1, end_sample - start_sample)
 
     def __len__(self) -> int:
         return len(self.groups)
@@ -530,19 +525,14 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         loaded_by_path: dict[str, tuple[np.ndarray, int]] = {}
         windows_by_sample_id: dict[str, tuple[int, int]] = {}
         for audio_path, path_rows in self._rows_by_audio_path(candidate_rows).items():
-            info = sf.info(audio_path)
-            if info.samplerate != self.audio_config.sample_rate:
-                raise ValueError(
-                    f"Expected {self.audio_config.sample_rate} Hz prepared audio, "
-                    f"got {info.samplerate} Hz: {audio_path}"
-                )
+            total_audio_samples = self._audio_frame_count(audio_path)
 
             path_windows = [
                 self._candidate_audio_window(
                     positive=positive,
                     candidate=row,
                     protected_rows=protected_rows,
-                    total_audio_samples=info.frames,
+                    total_audio_samples=total_audio_samples,
                 )
                 for row in path_rows
             ]
@@ -551,7 +541,7 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
             starts = [window[0] for window in path_windows]
             ends = [start + expected for start, expected in path_windows]
             read_start = max(min(starts), 0)
-            read_end = min(max(ends), info.frames)
+            read_end = min(max(ends), total_audio_samples)
             audio, _ = sf.read(
                 audio_path,
                 start=read_start,
@@ -579,16 +569,12 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         protected_rows: list[dict[str, str]],
         total_audio_samples: int,
     ) -> tuple[int, int]:
-        sample_rate = self.audio_config.sample_rate
-        candidate_start = int(round(audio_start_seconds(candidate) * sample_rate))
-        candidate_end = int(round(audio_end_seconds(candidate) * sample_rate))
-        candidate_samples = max(1, candidate_end - candidate_start)
+        candidate_start, candidate_end = self._segment_sample_bounds(candidate)
+        candidate_samples = self._segment_sample_count(candidate)
         if self.candidate_window_policy == "line":
             return max(candidate_start, 0), candidate_samples
 
-        positive_start = int(round(audio_start_seconds(positive) * sample_rate))
-        positive_end = int(round(audio_end_seconds(positive) * sample_rate))
-        target_samples = max(1, positive_end - positive_start)
+        target_samples = self._segment_sample_count(positive)
         if candidate_samples >= target_samples:
             maximum_offset = candidate_samples - target_samples
             offset = self._select_window_offset(maximum_offset)
@@ -616,8 +602,7 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         total_audio_samples: int,
     ) -> tuple[int, int]:
         sample_rate = self.audio_config.sample_rate
-        candidate_start = int(round(audio_start_seconds(candidate) * sample_rate))
-        candidate_end = int(round(audio_end_seconds(candidate) * sample_rate))
+        candidate_start, candidate_end = self._segment_sample_bounds(candidate)
         safe_region_start = 0
         safe_region_end = total_audio_samples
         for protected in protected_rows:
