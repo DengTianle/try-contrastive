@@ -7,6 +7,7 @@ checkpoints/
 tests/*
 !tests/test_candidate_windows.py
 !tests/test_prepare_dali_dataset.py
+!tests/test_training_updates.py
 .vscode/
 *.npz
 *.wav

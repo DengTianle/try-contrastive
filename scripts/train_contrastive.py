@@ -416,6 +416,21 @@ class StagedWarmupCosineScheduler:
         }
 
 
+def step_optimizer_and_scheduler(
+    scaler: torch.amp.GradScaler,
+    optimizer: torch.optim.Optimizer,
+    scheduler: StagedWarmupCosineScheduler,
+) -> bool:
+    """Advance the scheduler only when GradScaler performs the optimizer step."""
+    scale_before = scaler.get_scale()
+    scaler.step(optimizer)
+    scaler.update()
+    step_succeeded = scaler.get_scale() >= scale_before
+    if step_succeeded:
+        scheduler.step()
+    return step_succeeded
+
+
 def train_one_epoch(
     model: MelodyAudioContrastiveModel,
     loader: DataLoader,
@@ -499,9 +514,7 @@ def train_one_epoch(
         if grad_clip_norm is not None:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
-        scaler.step(optimizer)
-        scaler.update()
-        scheduler.step()
+        step_optimizer_and_scheduler(scaler, optimizer, scheduler)
 
         targets = batch["target"].to(dtype=torch.long)
         total_loss += float(loss.detach().cpu()) * batch_size
