@@ -41,6 +41,8 @@ longer negative is cropped inside its annotated line. Training randomizes the co
 placement; validation and evaluation use the center deterministically. Windows that
 would have to cross a known congruent/repeated positive occurrence are excluded. Use
 `--candidate-window-policy line` for the original variable-line-duration behavior.
+Training also selects a reproducible, epoch-specific positive variant and capped
+same-song negative subset; validation and evaluation retain the epoch-zero selection.
 
 ## Evaluation
 

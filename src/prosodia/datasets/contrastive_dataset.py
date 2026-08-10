@@ -173,6 +173,8 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         self.candidate_window_policy = candidate_window_policy
         self.randomize_candidate_windows = randomize_candidate_windows
         self.seed = seed
+        self.epoch = 0
+        self.max_negatives = max_negatives
         self.transform = transform
 
         with self.manifest_path.open(newline="", encoding="utf-8") as handle:
@@ -185,7 +187,7 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
             self._backfill_audio_durations(rows)
         self.rows = rows
 
-        self.groups = self._build_groups_from_segment_rows(rows, max_negatives=max_negatives)
+        self.groups = self._build_groups_from_segment_rows(rows)
 
     def _resolve_row_paths(self, row: dict[str, str]) -> dict[str, str]:
         resolved = dict(row)
@@ -213,7 +215,6 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
     def _build_groups_from_segment_rows(
         self,
         rows: list[dict[str, str]],
-        max_negatives: int | None,
     ) -> list[dict[str, Any]]:
         rows_by_song: dict[str, list[dict[str, str]]] = defaultdict(list)
         for row in rows:
@@ -223,49 +224,47 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         for song_rows in rows_by_song.values():
             song_rows.sort(key=lambda row: (audio_start_seconds(row), audio_sample_id(row)))
             for anchor in song_rows:
-                positive = self._select_positive_variant(anchor, song_rows)
+                positive_variants = self._positive_variant_pool(anchor, song_rows)
                 protected_rows = [
                     candidate
                     for candidate in song_rows
                     if self._possible_false_negative(anchor, candidate)
                 ]
-                negatives = [
+                negative_pool = [
                     candidate
                     for candidate in song_rows
                     if not self._possible_false_negative(anchor, candidate)
-                    and self._valid_negative(
-                        anchor,
-                        positive,
-                        candidate,
-                        protected_rows,
+                    and any(
+                        self._valid_negative(
+                            anchor,
+                            positive,
+                            candidate,
+                            protected_rows,
+                        )
+                        for positive in positive_variants
                     )
                 ]
-                if max_negatives is not None and len(negatives) > max_negatives:
-                    rng = stable_row_rng(self.seed, audio_sample_id(anchor))
-                    negatives = list(negatives)
-                    rng.shuffle(negatives)
-                    negatives = sorted(
-                        negatives[:max_negatives],
-                        key=lambda row: (audio_start_seconds(row), audio_sample_id(row)),
-                    )
                 built_groups.append(
                     {
                         "melody_sample_id": melody_sample_id(anchor),
                         "anchor": anchor,
-                        "positive": positive,
+                        "positive_variants": positive_variants,
                         "protected_rows": protected_rows,
-                        "negatives": negatives,
+                        "negative_pool": negative_pool,
                     }
                 )
+                positive, negatives = self._select_group_candidates(built_groups[-1])
+                built_groups[-1]["positive"] = positive
+                built_groups[-1]["negatives"] = negatives
         return built_groups
 
-    def _select_positive_variant(
+    def _positive_variant_pool(
         self,
         anchor: dict[str, str],
         song_rows: list[dict[str, str]],
-    ) -> dict[str, str]:
+    ) -> list[dict[str, str]]:
         if self.positive_variant_policy == "self":
-            return anchor
+            return [anchor]
 
         alternatives = [
             candidate
@@ -285,12 +284,25 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         else:
             pool = alternatives
         if not pool:
-            return anchor
-        rng = stable_row_rng(
-            self.seed,
+            return [anchor]
+        return pool
+
+    def _selection_rng(self, row_id: str) -> random.Random:
+        if self.epoch > 0:
+            row_id = f"{row_id}:epoch:{self.epoch}"
+        return stable_row_rng(self.seed, row_id)
+
+    def _select_positive_variant(
+        self,
+        anchor: dict[str, str],
+        positive_variants: list[dict[str, str]],
+    ) -> dict[str, str]:
+        if len(positive_variants) == 1:
+            return positive_variants[0]
+        rng = self._selection_rng(
             f"{audio_sample_id(anchor)}:positive_variant:{self.positive_variant_policy}",
         )
-        return pool[rng.randrange(len(pool))]
+        return positive_variants[rng.randrange(len(positive_variants))]
 
     def _possible_false_negative(
         self,
@@ -375,22 +387,57 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
     def __len__(self) -> int:
         return len(self.groups)
 
+    def set_epoch(self, epoch: int) -> None:
+        """Select reproducible positive variants and negatives for an epoch."""
+        if epoch < 0:
+            raise ValueError("epoch must be non-negative")
+        self.epoch = epoch
+
+    def _select_group_candidates(
+        self,
+        group: dict[str, Any],
+    ) -> tuple[dict[str, str], list[dict[str, str]]]:
+        anchor = group["anchor"]
+        positive = self._select_positive_variant(anchor, group["positive_variants"])
+        negatives = [
+            candidate
+            for candidate in group["negative_pool"]
+            if self._valid_negative(
+                anchor,
+                positive,
+                candidate,
+                group["protected_rows"],
+            )
+        ]
+        if self.max_negatives is not None and len(negatives) > self.max_negatives:
+            rng = self._selection_rng(audio_sample_id(anchor))
+            rng.shuffle(negatives)
+            negatives = sorted(
+                negatives[: self.max_negatives],
+                key=lambda row: (audio_start_seconds(row), audio_sample_id(row)),
+            )
+        return positive, negatives
+
     def positive_variant_counts(self) -> dict[str, int]:
         counts = {"aligned": 0, "repeated": 0, "retexted": 0}
         for group in self.groups:
-            variant = self._positive_variant_type(group["anchor"], group["positive"])
+            positive = self._select_positive_variant(
+                group["anchor"],
+                group["positive_variants"],
+            )
+            variant = self._positive_variant_type(group["anchor"], positive)
             counts[variant] += 1
         return counts
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         group = self.groups[index]
         anchor = group["anchor"]
-        positive = group["positive"]
-        candidate_rows = [positive, *group["negatives"]]
+        positive, negatives = self._select_group_candidates(group)
+        candidate_rows = [positive, *negatives]
         target = 0
         if len(candidate_rows) > 1:
             order = list(range(len(candidate_rows)))
-            rng = stable_row_rng(self.seed, f"{group['melody_sample_id']}:candidate_order")
+            rng = self._selection_rng(f"{group['melody_sample_id']}:candidate_order")
             rng.shuffle(order)
             target = order.index(0)
             candidate_rows = [candidate_rows[index] for index in order]

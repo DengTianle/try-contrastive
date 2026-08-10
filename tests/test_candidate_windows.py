@@ -120,6 +120,74 @@ class CandidateWindowTest(unittest.TestCase):
             [negative["sample_id"] for negative in anchor_group["negatives"]],
         )
 
+    def test_epoch_changes_positive_variant_and_negative_subset_reproducibly(self) -> None:
+        rows = [
+            self._row("anchor", 0.0, 0.5, melody_class=1, lyric_class=1),
+            self._row("variant_a", 1.0, 1.5, melody_class=1, lyric_class=2),
+            self._row("variant_b", 2.0, 2.5, melody_class=1, lyric_class=3),
+            self._row("variant_c", 3.0, 3.5, melody_class=1, lyric_class=4),
+            *[
+                self._row(
+                    f"negative_{index}",
+                    4.0 + index,
+                    4.5 + index,
+                    melody_class=10 + index,
+                    lyric_class=10 + index,
+                )
+                for index in range(6)
+            ],
+        ]
+        with self.manifest_path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+            writer.writeheader()
+            writer.writerows(rows)
+
+        dataset = GroupedContrastiveDataset(
+            self.manifest_path,
+            split="train",
+            max_negatives=2,
+            positive_variant_policy="any",
+            candidate_window_policy="line",
+            seed=13,
+        )
+        anchor_index = next(
+            index
+            for index, group in enumerate(dataset.groups)
+            if group["anchor"]["sample_id"] == "anchor"
+        )
+
+        selections: list[tuple[str, frozenset[str]]] = []
+        epoch_zero_selection: tuple[list[str], int] | None = None
+        for epoch in range(24):
+            dataset.set_epoch(epoch)
+            item = dataset[anchor_index]
+            target = int(item["target"])
+            positive_id = item["metadata"][target]["sample_id"]
+            negative_ids = frozenset(
+                row["sample_id"]
+                for index, row in enumerate(item["metadata"])
+                if index != target
+            )
+            selections.append((positive_id, negative_ids))
+            if epoch == 0:
+                epoch_zero_selection = (
+                    [row["sample_id"] for row in item["metadata"]],
+                    target,
+                )
+
+        self.assertGreater(len({positive for positive, _ in selections}), 1)
+        self.assertGreater(len({negatives for _, negatives in selections}), 1)
+
+        dataset.set_epoch(0)
+        repeated_epoch_zero = dataset[anchor_index]
+        self.assertEqual(
+            (
+                [row["sample_id"] for row in repeated_epoch_zero["metadata"]],
+                int(repeated_epoch_zero["target"]),
+            ),
+            epoch_zero_selection,
+        )
+
 
 class DurationProbeTest(unittest.TestCase):
     def test_probe_uses_observed_candidate_windows(self) -> None:
