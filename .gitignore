@@ -6,7 +6,9 @@ data/
 checkpoints/
 tests/*
 !tests/test_candidate_windows.py
+!tests/test_plan_song_batches.py
 !tests/test_prepare_dali_dataset.py
+!tests/test_song_batch_sampler.py
 !tests/test_training_updates.py
 .vscode/
 *.npz

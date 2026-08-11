@@ -5,6 +5,23 @@ only the first occurrence of each normalized lyric line is retained.
 I have used a variant based on the InfoNCE loss: L_{hard negatives} + L_{in-batch}, where hard negatives are other segments from the same song, and in-batch compares with other positive samples in the batch. 
 Evaluation is against hard negatives (only). 
 
+## Training batch planning
+
+Training with the global in-batch loss plans each epoch so that a batch contains at
+most one segment from a song. Inspect the exact batch-size distribution before
+training with the same manifest, split, and batch size you intend to use:
+
+```bash
+conda run -n try-contrastive python scripts/plan_song_batches.py \
+  --manifest data/prepared/dali/segments_manifest.csv \
+  --train-split train \
+  --batch-size 8
+```
+
+Pass `--drop-incomplete-batches` to both the planning script and
+`scripts/train_contrastive.py` to retain only complete training batches. The planner
+selects the maximum feasible number of full batches while keeping songs distinct.
+
 ## Dataset preparation
 
 Prepare line-aligned melody and audio segments:
