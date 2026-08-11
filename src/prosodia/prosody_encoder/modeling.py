@@ -5,6 +5,57 @@ import torch.nn.functional as F
 from torch import nn
 
 
+def normalize_waveforms(
+    input_values: torch.Tensor,
+    attention_mask: torch.Tensor | None = None,
+    epsilon: float = 1e-7,
+) -> torch.Tensor:
+    """Apply per-waveform zero-mean, unit-variance normalization.
+
+    This mirrors Wav2Vec2FeatureExtractor normalization while excluding padded
+    samples from the statistics and restoring padding to zero afterwards.
+
+    Note that we did not use their provided feature extractor since that will
+    mean moving to CPU numpy operations then move back to GPU.
+    """
+
+    if input_values.ndim != 2:
+        raise ValueError(
+            f"Expected input_values with shape [batch, samples], got {input_values.shape}"
+        )
+    if input_values.shape[-1] == 0:
+        raise ValueError("Expected input_values to contain at least one sample")
+    if not torch.is_floating_point(input_values):
+        raise ValueError("Expected floating-point waveform input_values")
+    if epsilon <= 0.0:
+        raise ValueError("epsilon must be positive")
+
+    working_dtype = (
+        torch.float32
+        if input_values.dtype in {torch.float16, torch.bfloat16}
+        else input_values.dtype
+    )
+    working = input_values.to(dtype=working_dtype)
+    if attention_mask is None:
+        mean = working.mean(dim=-1, keepdim=True)
+        variance = working.var(dim=-1, keepdim=True, unbiased=False)
+        normalized = (working - mean) * torch.rsqrt(variance + epsilon)
+        return normalized.to(dtype=input_values.dtype)
+
+    if attention_mask.shape != input_values.shape:
+        raise ValueError(
+            "Expected attention_mask to match input_values shape, "
+            f"got {attention_mask.shape} and {input_values.shape}"
+        )
+    valid = attention_mask.to(device=working.device, dtype=working.dtype)
+    counts = valid.sum(dim=-1, keepdim=True).clamp_min(1.0)
+    mean = (working * valid).sum(dim=-1, keepdim=True) / counts
+    centered = working - mean
+    variance = (centered.square() * valid).sum(dim=-1, keepdim=True) / counts
+    normalized = centered * torch.rsqrt(variance + epsilon)
+    normalized = normalized * valid
+    return normalized.to(dtype=input_values.dtype)
+
 class HubertEncoder(nn.Module):
     def __init__(
         self,
@@ -15,7 +66,7 @@ class HubertEncoder(nn.Module):
         pooling: str = "mean",
     ) -> None:
         super().__init__()
-        from transformers import AutoModel
+        from transformers import AutoFeatureExtractor, AutoModel
 
         if pooling != "mean":
             raise ValueError(f"Unsupported pooling: {pooling}")
@@ -23,6 +74,13 @@ class HubertEncoder(nn.Module):
         self.model_name = model_name
         self.projection_dim = projection_dim
         self.pooling = pooling
+        feature_extractor = AutoFeatureExtractor.from_pretrained(model_name)
+        self.normalize_input_waveforms = bool(
+            getattr(feature_extractor, "do_normalize", False)
+        )
+        self.hubert_uses_attention_mask = bool(
+            getattr(feature_extractor, "return_attention_mask", False)
+        )
         self.hubert = AutoModel.from_pretrained(model_name)
         hidden_size = self.hubert.config.hidden_size
         self.dropout = nn.Dropout(dropout)
@@ -211,17 +269,46 @@ class HubertEncoder(nn.Module):
         lengths = mask.sum(dim=1).clamp_min(1)
         return summed / lengths
 
+    def _prepare_input_values(
+        self,
+        input_values: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if self.normalize_input_waveforms:
+            return normalize_waveforms(input_values, attention_mask=attention_mask)
+        if attention_mask is None:
+            return input_values
+        if attention_mask.shape != input_values.shape:
+            raise ValueError(
+                "Expected attention_mask to match input_values shape, "
+                f"got {attention_mask.shape} and {input_values.shape}"
+            )
+        return input_values.masked_fill(
+            ~attention_mask.to(device=input_values.device, dtype=torch.bool),
+            0.0,
+        )
+
     def forward(
         self,
         input_values: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         normalize: bool = True,
     ) -> torch.Tensor:
+        prepared_input_values = self._prepare_input_values(input_values, attention_mask)
+        hubert_attention_mask = (
+            attention_mask if self.hubert_uses_attention_mask else None
+        )
         if self.hubert_trainable:
-            outputs = self.hubert(input_values=input_values, attention_mask=attention_mask)
+            outputs = self.hubert(
+                input_values=prepared_input_values,
+                attention_mask=hubert_attention_mask,
+            )
         else:
             with torch.no_grad():
-                outputs = self.hubert(input_values=input_values, attention_mask=attention_mask)
+                outputs = self.hubert(
+                    input_values=prepared_input_values,
+                    attention_mask=hubert_attention_mask,
+                )
         hidden_states = self.dropout(outputs.last_hidden_state)
         pooled = self._pool_hidden_states(hidden_states, attention_mask)
         embeddings = self.projection(pooled)

@@ -101,26 +101,6 @@ def masked_rms(audio: torch.Tensor, mask: torch.Tensor, keepdim: bool = False) -
     count = mask_float.sum(dim=-1, keepdim=keepdim).clamp_min(1.0)
     return (summed / count).clamp_min(1e-12).sqrt()
 
-
-def apply_random_audio_gain(
-    audio: torch.Tensor,
-    valid_mask: torch.Tensor,
-    max_abs_gain_db: float,
-) -> torch.Tensor:
-    if max_abs_gain_db <= 0.0:
-        return audio
-
-    gain_db = torch.empty(
-        *audio.shape[:2],
-        1,
-        device=audio.device,
-        dtype=audio.dtype,
-    ).uniform_(-max_abs_gain_db, max_abs_gain_db)
-    gain = torch.pow(audio.new_tensor(10.0), gain_db / 20.0)
-    augmented = audio * torch.where(valid_mask.unsqueeze(-1), gain, torch.ones_like(gain))
-    return augmented.clamp(-1.0, 1.0)
-
-
 def add_soft_audio_noise(
     audio: torch.Tensor,
     sample_mask: torch.Tensor,
@@ -191,20 +171,14 @@ def augment_candidate_audio(
     candidate_input_values: torch.Tensor,
     candidate_audio_attention_mask: torch.Tensor,
     candidate_mask: torch.Tensor,
-    gain_db: float,
     noise_snr_db: float | None,
     background_mix_prob: float,
     background_mix_snr_db: float,
 ) -> torch.Tensor:
     sample_mask = candidate_audio_attention_mask.to(dtype=torch.bool)
     valid_mask = candidate_mask.to(dtype=torch.bool)
-    augmented = apply_random_audio_gain(
-        audio=candidate_input_values,
-        valid_mask=valid_mask,
-        max_abs_gain_db=gain_db,
-    )
     augmented = add_soft_audio_noise(
-        audio=augmented,
+        audio=candidate_input_values,
         sample_mask=sample_mask,
         valid_mask=valid_mask,
         snr_db=noise_snr_db,
@@ -448,7 +422,6 @@ def train_one_epoch(
     temperature: float,
     global_loss_weight: float,
     symmetric_global_loss: bool,
-    audio_gain_db: float,
     audio_noise_snr_db: float | None,
     audio_background_mix_prob: float,
     audio_background_mix_snr_db: float,
@@ -478,7 +451,6 @@ def train_one_epoch(
                 candidate_input_values=batch["candidate_input_values"],
                 candidate_audio_attention_mask=batch["candidate_audio_attention_mask"],
                 candidate_mask=batch["candidate_mask"],
-                gain_db=audio_gain_db,
                 noise_snr_db=audio_noise_snr_db,
                 background_mix_prob=audio_background_mix_prob,
                 background_mix_snr_db=audio_background_mix_snr_db,
@@ -918,15 +890,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--audio-gain-db",
-        type=float,
-        default=0.0,
-        help=(
-            "Training-only audio augmentation. Randomly scale each candidate waveform "
-            "within +/- this many dB. 0 disables it; try 3."
-        ),
-    )
-    parser.add_argument(
         "--audio-noise-snr-db",
         type=float,
         default=None,
@@ -997,8 +960,6 @@ def main() -> None:
         args.global_loss_weight = 0.0
     if args.melody_transpose_semitones < 0.0:
         raise SystemExit("--melody-transpose-semitones must be non-negative")
-    if args.audio_gain_db < 0.0:
-        raise SystemExit("--audio-gain-db must be non-negative")
     if args.audio_noise_snr_db is not None and args.audio_noise_snr_db <= 0.0:
         raise SystemExit("--audio-noise-snr-db must be positive")
     if not 0.0 <= args.audio_background_mix_prob <= 1.0:
@@ -1186,7 +1147,6 @@ def main() -> None:
             temperature=args.temperature,
             global_loss_weight=args.global_loss_weight,
             symmetric_global_loss=args.symmetric_global_loss,
-            audio_gain_db=args.audio_gain_db,
             audio_noise_snr_db=args.audio_noise_snr_db,
             audio_background_mix_prob=args.audio_background_mix_prob,
             audio_background_mix_snr_db=args.audio_background_mix_snr_db,
