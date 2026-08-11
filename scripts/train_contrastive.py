@@ -3,16 +3,13 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import random
 import sys
-from collections import defaultdict
-from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Sampler
+from torch.utils.data import DataLoader
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
@@ -21,6 +18,7 @@ if str(SRC_DIR) not in sys.path:
 
 from prosodia.datasets import GroupedContrastiveDataset, grouped_contrastive_collate
 from prosodia.training import (
+    DifferentSongBatchSampler,
     MelodyAudioContrastiveModel,
     global_in_batch_info_nce_loss,
     grouped_info_nce_loss,
@@ -190,51 +188,6 @@ def augment_candidate_audio(
         probability=background_mix_prob,
         snr_db=background_mix_snr_db,
     )
-
-
-class DifferentSongBatchSampler(Sampler[list[int]]):
-    """Yield batches with at most one segment per song while possible."""
-
-    def __init__(
-        self,
-        dataset: GroupedContrastiveDataset,
-        batch_size: int,
-        seed: int,
-        drop_last: bool = False,
-    ) -> None:
-        if batch_size <= 0:
-            raise ValueError("batch_size must be positive")
-        self.dataset = dataset
-        self.batch_size = batch_size
-        self.seed = seed
-        self.drop_last = drop_last
-        self.epoch = 0
-
-    def __iter__(self) -> Iterator[list[int]]:
-        rng = random.Random(self.seed + self.epoch)
-        self.epoch += 1
-
-        indices_by_song: dict[str, list[int]] = defaultdict(list)
-        for index, group in enumerate(self.dataset.groups):
-            indices_by_song[group["positive"]["dali_id"]].append(index)
-        for indices in indices_by_song.values():
-            rng.shuffle(indices)
-
-        active_songs = [song for song, indices in indices_by_song.items() if indices]
-        while active_songs:
-            rng.shuffle(active_songs)
-            chosen_songs = active_songs[: self.batch_size]
-            if self.drop_last and len(chosen_songs) < self.batch_size:
-                break
-
-            batch = [indices_by_song[song].pop() for song in chosen_songs]
-            active_songs = [song for song in active_songs if indices_by_song[song]]
-            yield batch
-
-    def __len__(self) -> int:
-        if self.drop_last:
-            return len(self.dataset) // self.batch_size
-        return (len(self.dataset) + self.batch_size - 1) // self.batch_size
 
 
 def parameter_uses_weight_decay(name: str, parameter: torch.Tensor) -> bool:
@@ -991,14 +944,16 @@ def main() -> None:
     if len(train_dataset) == 0:
         raise SystemExit(f"No grouped training examples found for split={args.train_split}")
 
+    train_batch_sampler = None
     if args.global_loss_weight > 0.0 and not args.disable_song_balanced_batches:
+        train_batch_sampler = DifferentSongBatchSampler(
+            dataset=train_dataset,
+            batch_size=args.batch_size,
+            seed=args.seed,
+        )
         train_loader = DataLoader(
             train_dataset,
-            batch_sampler=DifferentSongBatchSampler(
-                dataset=train_dataset,
-                batch_size=args.batch_size,
-                seed=args.seed,
-            ),
+            batch_sampler=train_batch_sampler,
             num_workers=args.num_workers,
             collate_fn=grouped_contrastive_collate,
         )
@@ -1119,6 +1074,8 @@ def main() -> None:
     best_metric_direction = checkpoint_metric_direction(best_metric_name)
     best_metric_value = float("inf") if best_metric_direction == "min" else -float("inf")
     for epoch in range(1, args.epochs + 1):
+        if train_batch_sampler is not None:
+            train_batch_sampler.set_epoch(epoch - 1)
         desired_hubert_trainable_layers = (
             eventual_hubert_trainable_layers
             if epoch > args.hubert_freeze_epochs

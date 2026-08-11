@@ -6,8 +6,10 @@ from .losses import (
     symmetric_global_in_batch_info_nce_loss,
 )
 from .modeling import MelodyAudioContrastiveModel
+from .samplers import DifferentSongBatchSampler
 
 __all__ = [
+    "DifferentSongBatchSampler",
     "MelodyAudioContrastiveModel",
     "build_contrastive_model_from_checkpoint_args",
     "checkpoint_arg",
