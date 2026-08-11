@@ -65,6 +65,7 @@ def random_span_mask(
     attention_mask: torch.Tensor,
     mask_prob: float,
     mask_span_frames: int,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     if not 0.0 < mask_prob < 1.0:
         raise ValueError("mask_prob must be in (0, 1)")
@@ -82,7 +83,7 @@ def random_span_mask(
             low=0,
             high=valid_length,
             size=(num_spans,),
-            device=attention_mask.device,
+            generator=generator,
         )
         for start_tensor in starts:
             start = int(start_tensor.detach().cpu())
@@ -153,12 +154,14 @@ def pretrain_step(
     pitch_dropout_prob: float,
     delta_loss_weight: float,
     voiced_loss_weight: float,
+    mask_generator: torch.Generator | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     attention_mask = batch["melody_attention_mask"].to(dtype=torch.bool)
     frame_mask = random_span_mask(
         attention_mask=attention_mask,
         mask_prob=mask_prob,
         mask_span_frames=mask_span_frames,
+        generator=mask_generator,
     )
     melody_inputs = augment_melody_inputs(
         melody_features=batch["melody_features"],
@@ -297,6 +300,7 @@ def evaluate(
         "voiced_accuracy": 0.0,
     }
     total_examples = 0
+    mask_generator = torch.Generator().manual_seed(args.seed)
 
     progress_bar = maybe_progress(loader, enabled=progress, desc=desc, leave=False)
     for batch in progress_bar:
@@ -307,11 +311,12 @@ def evaluate(
                 batch=batch,
                 mask_prob=args.mask_prob,
                 mask_span_frames=args.mask_span_frames,
-                transpose_semitones=args.transpose_semitones,
-                pitch_noise_std=args.pitch_noise_std,
-                pitch_dropout_prob=args.pitch_dropout_prob,
+                transpose_semitones=0.0,
+                pitch_noise_std=0.0,
+                pitch_dropout_prob=0.0,
                 delta_loss_weight=args.delta_loss_weight,
                 voiced_loss_weight=args.voiced_loss_weight,
+                mask_generator=mask_generator,
             )
 
         batch_size = batch["melody_features"].shape[0]
@@ -341,7 +346,11 @@ def save_checkpoint(
     checkpoint = {
         "epoch": epoch,
         "model_state_dict": model.state_dict(),
-        "melody_encoder_state_dict": model.encoder.state_dict(),
+        "melody_encoder_state_dict": {
+            key: value
+            for key, value in model.encoder.state_dict().items()
+            if not key.startswith("projection.")
+        },
         "optimizer_state_dict": optimizer.state_dict(),
         "args": vars(args),
         "metrics": metrics,
@@ -358,7 +367,6 @@ def parse_args() -> argparse.Namespace:
         default=Path("data/prepared/dali/segments_manifest.csv"),
     )
     parser.add_argument("--output-dir", type=Path, default=Path("checkpoints/melody_pretrain"))
-    parser.add_argument("--projection-dim", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -446,7 +454,6 @@ def main() -> None:
             )
 
     model = MelodyMaskedProsodyModel(
-        projection_dim=args.projection_dim,
         d_model=args.melody_d_model,
         num_layers=args.melody_num_layers,
         num_heads=args.melody_num_heads,

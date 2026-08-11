@@ -6,6 +6,7 @@ from .losses import (
     symmetric_global_in_batch_info_nce_loss,
 )
 from .modeling import MelodyAudioContrastiveModel
+from .reporting import sanitize_json_value
 from .samplers import DifferentSongBatchSampler
 
 __all__ = [
@@ -16,5 +17,6 @@ __all__ = [
     "global_in_batch_info_nce_loss",
     "grouped_info_nce_loss",
     "positive_audio_embeddings",
+    "sanitize_json_value",
     "symmetric_global_in_batch_info_nce_loss",
 ]

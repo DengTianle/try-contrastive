@@ -21,6 +21,7 @@ from prosodia.training import (
     build_contrastive_model_from_checkpoint_args,
     checkpoint_arg,
     grouped_info_nce_loss,
+    sanitize_json_value,
 )
 
 
@@ -493,14 +494,23 @@ def parse_args() -> argparse.Namespace:
             "checkpoint setting, or line for older checkpoints."
         ),
     )
-    parser.add_argument(
+    offset_group = parser.add_mutually_exclusive_group()
+    offset_group.add_argument(
         "--min-negative-offset-seconds",
         type=float,
-        default=None,
+        default=argparse.SUPPRESS,
         help=(
-            "Optional minimum difference between same-song segment start times. "
-            "By default, all non-overlapping DALI line segments are eligible negatives."
+            "Override the checkpoint's minimum difference between same-song segment "
+            "start times. Defaults to the checkpoint setting."
         ),
+    )
+    offset_group.add_argument(
+        "--no-min-negative-offset",
+        dest="min_negative_offset_seconds",
+        action="store_const",
+        const=None,
+        default=argparse.SUPPRESS,
+        help="Disable a minimum-offset policy stored in the checkpoint.",
     )
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--recall-k", type=parse_recall_k, default=parse_recall_k("1,2,3,5"))
@@ -541,12 +551,17 @@ def main() -> None:
             "candidate_window_policy",
             "line",
         )
+    min_negative_offset_seconds = getattr(
+        args,
+        "min_negative_offset_seconds",
+        checkpoint_args.get("min_negative_offset_seconds"),
+    )
 
     dataset = GroupedContrastiveDataset(
         manifest_path=args.manifest,
         split=args.split,
         max_negatives=args.max_negatives,
-        min_negative_offset_seconds=args.min_negative_offset_seconds,
+        min_negative_offset_seconds=min_negative_offset_seconds,
         positive_variant_policy=str(positive_variant_policy),
         candidate_window_policy=str(candidate_window_policy),
         randomize_candidate_windows=False,
@@ -580,6 +595,7 @@ def main() -> None:
         "manifest": str(args.manifest),
         "split": args.split,
         "max_negatives": args.max_negatives,
+        "min_negative_offset_seconds": min_negative_offset_seconds,
         "positive_variant_policy": positive_variant_policy,
         "candidate_window_policy": candidate_window_policy,
         "temperature": float(temperature),
@@ -587,11 +603,12 @@ def main() -> None:
         "metrics": metrics,
     }
 
-    print(json.dumps(report, indent=2, sort_keys=True))
+    report = sanitize_json_value(report)
+    print(json.dumps(report, indent=2, sort_keys=True, allow_nan=False))
     if args.output_json is not None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         with args.output_json.open("w", encoding="utf-8") as handle:
-            json.dump(report, handle, indent=2, sort_keys=True)
+            json.dump(report, handle, indent=2, sort_keys=True, allow_nan=False)
     if args.predictions_csv is not None:
         write_predictions(args.predictions_csv, predictions)
 

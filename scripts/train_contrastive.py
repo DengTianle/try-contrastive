@@ -635,29 +635,36 @@ def load_pretrained_melody_encoder(
     model: MelodyAudioContrastiveModel,
     checkpoint_path: Path,
     strict: bool,
-    load_projection: bool,
 ) -> None:
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = melody_encoder_state_from_checkpoint(checkpoint)
-    if not load_projection:
-        projection_keys = [key for key in state_dict if key.startswith("projection.")]
-        state_dict = {
-            key: value
-            for key, value in state_dict.items()
-            if not key.startswith("projection.")
-        }
-        if projection_keys:
-            print(
-                "Skipped melody pretrain projection keys "
-                f"({len(projection_keys)}); contrastive projection starts from scratch."
-            )
+    projection_keys = [key for key in state_dict if key.startswith("projection.")]
+    state_dict = {
+        key: value
+        for key, value in state_dict.items()
+        if not key.startswith("projection.")
+    }
+    if projection_keys:
+        print(
+            "Skipped melody pretrain projection keys "
+            f"({len(projection_keys)}); contrastive projection starts from scratch."
+        )
 
     incompatible = model.melody_encoder.load_state_dict(
         state_dict,
-        strict=strict and load_projection,
+        strict=False,
     )
-    if incompatible.missing_keys:
-        print(f"Missing melody pretrain keys: {incompatible.missing_keys}")
+    missing_trunk_keys = [
+        key for key in incompatible.missing_keys if not key.startswith("projection.")
+    ]
+    if strict and (missing_trunk_keys or incompatible.unexpected_keys):
+        raise RuntimeError(
+            "Strict melody pretrain loading failed: "
+            f"missing trunk keys={missing_trunk_keys}, "
+            f"unexpected keys={incompatible.unexpected_keys}"
+        )
+    if missing_trunk_keys:
+        print(f"Missing melody pretrain trunk keys: {missing_trunk_keys}")
     if incompatible.unexpected_keys:
         print(f"Unexpected melody pretrain keys: {incompatible.unexpected_keys}")
     print(f"Loaded melody encoder pretrain from {checkpoint_path}")
@@ -868,14 +875,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--melody-pretrained-strict",
         action="store_true",
-        help="Require an exact key match when loading --melody-pretrained-checkpoint.",
-    )
-    parser.add_argument(
-        "--load-melody-pretrained-projection",
-        action="store_true",
         help=(
-            "Also load the melody encoder projection head from pretraining. "
-            "By default it is trained from scratch for the contrastive space."
+            "Require an exact key match for the transferable melody encoder trunk. "
+            "The contrastive projection head is always initialized from scratch."
         ),
     )
     parser.add_argument(
@@ -1055,7 +1057,6 @@ def main() -> None:
             model=model,
             checkpoint_path=args.melody_pretrained_checkpoint,
             strict=args.melody_pretrained_strict,
-            load_projection=args.load_melody_pretrained_projection,
         )
 
     num_hubert_layers = model.audio_encoder.num_hubert_transformer_layers

@@ -27,6 +27,7 @@ from prosodia.training import (
     build_contrastive_model_from_checkpoint_args,
     checkpoint_arg,
     positive_audio_embeddings,
+    sanitize_json_value,
 )
 
 
@@ -561,11 +562,12 @@ def main() -> None:
         "metrics": metrics,
     }
 
-    print(json.dumps(report, indent=2, sort_keys=True))
+    report = sanitize_json_value(report)
+    print(json.dumps(report, indent=2, sort_keys=True, allow_nan=False))
     if args.output_json is not None:
         args.output_json.parent.mkdir(parents=True, exist_ok=True)
         with args.output_json.open("w", encoding="utf-8") as handle:
-            json.dump(report, handle, indent=2, sort_keys=True)
+            json.dump(report, handle, indent=2, sort_keys=True, allow_nan=False)
 
 
 if __name__ == "__main__":

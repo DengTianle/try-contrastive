@@ -32,7 +32,7 @@ class SinusoidalPositionalEncoding(nn.Module):
 class MelodyEncoderOutput:
     frame_embeddings: torch.Tensor
     pooled_embedding: torch.Tensor
-    projected_embedding: torch.Tensor
+    projected_embedding: torch.Tensor | None
 
 
 class MelodyTransformerEncoder(nn.Module):
@@ -45,7 +45,7 @@ class MelodyTransformerEncoder(nn.Module):
     def __init__(
         self,
         input_dim: int = 2,
-        projection_dim: int = 256,
+        projection_dim: int | None = 256,
         d_model: int = 256,
         num_layers: int = 4,
         num_heads: int = 4,
@@ -86,13 +86,15 @@ class MelodyTransformerEncoder(nn.Module):
             enable_nested_tensor=False,
         )
         self.output_norm = nn.LayerNorm(d_model)
-        self.projection = nn.Sequential(
-            #nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, projection_dim),
-        )
+        self.projection = None
+        if projection_dim is not None:
+            self.projection = nn.Sequential(
+                #nn.LayerNorm(d_model),
+                nn.Linear(d_model, d_model),
+                nn.GELU(),
+                nn.Dropout(dropout),
+                nn.Linear(d_model, projection_dim),
+            )
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -104,6 +106,7 @@ class MelodyTransformerEncoder(nn.Module):
         melody_attention_mask: torch.Tensor | None = None,
         frame_mask: torch.Tensor | None = None,
         normalize: bool = True,
+        project: bool = True,
     ) -> MelodyEncoderOutput:
         if melody_features.ndim != 3:
             raise ValueError(
@@ -155,8 +158,14 @@ class MelodyTransformerEncoder(nn.Module):
             lengths = mask.sum(dim=1).clamp_min(1)
             pooled = summed / lengths
 
-        embeddings = self.projection(pooled)
-        if normalize:
+        if project and self.projection is None:
+            raise RuntimeError("This melody encoder has no projection head")
+        embeddings = (
+            self.projection(pooled)
+            if project and self.projection is not None
+            else None
+        )
+        if normalize and embeddings is not None:
             embeddings = F.normalize(embeddings, dim=-1)
         return MelodyEncoderOutput(
             frame_embeddings=frame_embeddings,
@@ -170,11 +179,14 @@ class MelodyTransformerEncoder(nn.Module):
         melody_attention_mask: torch.Tensor | None = None,
         normalize: bool = True,
     ) -> torch.Tensor:
-        return self.encode(
+        projected_embedding = self.encode(
             melody_features=melody_features,
             melody_attention_mask=melody_attention_mask,
             normalize=normalize,
         ).projected_embedding
+        if projected_embedding is None:
+            raise RuntimeError("Melody projection was unexpectedly disabled")
+        return projected_embedding
 
 
 class MelodyMaskedProsodyModel(nn.Module):
@@ -183,7 +195,6 @@ class MelodyMaskedProsodyModel(nn.Module):
     def __init__(
         self,
         input_dim: int = 2,
-        projection_dim: int = 256,
         d_model: int = 256,
         num_layers: int = 4,
         num_heads: int = 4,
@@ -195,7 +206,7 @@ class MelodyMaskedProsodyModel(nn.Module):
         super().__init__()
         self.encoder = MelodyTransformerEncoder(
             input_dim=input_dim,
-            projection_dim=projection_dim,
+            projection_dim=None,
             d_model=d_model,
             num_layers=num_layers,
             num_heads=num_heads,
@@ -228,10 +239,10 @@ class MelodyMaskedProsodyModel(nn.Module):
             melody_attention_mask=melody_attention_mask,
             frame_mask=frame_mask,
             normalize=False,
+            project=False,
         )
         frame_embeddings = encoded.frame_embeddings
         return {
             "delta_log_f0": self.delta_head(frame_embeddings).squeeze(-1),
             "voiced_logits": self.voiced_head(frame_embeddings).squeeze(-1),
-            "pooled_embedding": encoded.projected_embedding,
         }
