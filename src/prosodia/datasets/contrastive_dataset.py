@@ -96,6 +96,8 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         self.melody_config = melody_config or MelodyConfig()
         self.min_negative_offset_seconds = min_negative_offset_seconds
         self.seed = seed
+        self.epoch = 0
+        self.max_negatives = max_negatives
         self.transform = transform
 
         with self.manifest_path.open(newline="", encoding="utf-8") as handle:
@@ -106,7 +108,7 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
             rows = [row for row in rows if row["split"] == split]
         self.rows = rows
 
-        self.groups = self._build_groups_from_segment_rows(rows, max_negatives=max_negatives)
+        self.groups = self._build_groups_from_segment_rows(rows)
 
     def _resolve_row_paths(self, row: dict[str, str]) -> dict[str, str]:
         resolved = dict(row)
@@ -118,7 +120,6 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
     def _build_groups_from_segment_rows(
         self,
         rows: list[dict[str, str]],
-        max_negatives: int | None,
     ) -> list[dict[str, Any]]:
         rows_by_song: dict[str, list[dict[str, str]]] = defaultdict(list)
         for row in rows:
@@ -131,25 +132,17 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
                 min_offset = self.min_negative_offset_seconds
                 if min_offset is None:
                     min_offset = float(anchor["segment_seconds"])
-                negatives = [
+                negative_pool = [
                     candidate
                     for candidate in song_rows
                     if audio_sample_id(candidate) != audio_sample_id(anchor)
                     and abs(audio_start_seconds(candidate) - audio_start_seconds(anchor)) >= min_offset
                 ]
-                if max_negatives is not None and len(negatives) > max_negatives:
-                    rng = stable_row_rng(self.seed, audio_sample_id(anchor))
-                    negatives = list(negatives)
-                    rng.shuffle(negatives)
-                    negatives = sorted(
-                        negatives[:max_negatives],
-                        key=lambda row: (audio_start_seconds(row), audio_sample_id(row)),
-                    )
                 built_groups.append(
                     {
                         "melody_sample_id": melody_sample_id(anchor),
                         "positive": anchor,
-                        "negatives": negatives,
+                        "negative_pool": negative_pool,
                     }
                 )
         return built_groups
@@ -157,14 +150,44 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
     def __len__(self) -> int:
         return len(self.groups)
 
+    def set_epoch(self, epoch: int) -> None:
+        """Select a reproducible negative subset and candidate order for an epoch."""
+        if epoch < 0:
+            raise ValueError("epoch must be non-negative")
+        self.epoch = epoch
+
+    def _selection_rng(self, row_id: str) -> random.Random:
+        if self.epoch > 0:
+            row_id = f"{row_id}:epoch:{self.epoch}"
+        return stable_row_rng(self.seed, row_id)
+
+    def _select_group_negatives(
+        self,
+        anchor: dict[str, str],
+        negative_pool: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        negatives = list(negative_pool)
+        if self.max_negatives is not None and len(negatives) > self.max_negatives:
+            rng = self._selection_rng(audio_sample_id(anchor))
+            rng.shuffle(negatives)
+            negatives = sorted(
+                negatives[: self.max_negatives],
+                key=lambda row: (audio_start_seconds(row), audio_sample_id(row)),
+            )
+        return negatives
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         group = self.groups[index]
         positive = group["positive"]
-        candidate_rows = [positive, *group["negatives"]]
+        negatives = self._select_group_negatives(
+            anchor=positive,
+            negative_pool=group["negative_pool"],
+        )
+        candidate_rows = [positive, *negatives]
         target = 0
         if len(candidate_rows) > 1:
             order = list(range(len(candidate_rows)))
-            rng = stable_row_rng(self.seed, f"{group['melody_sample_id']}:candidate_order")
+            rng = self._selection_rng(f"{group['melody_sample_id']}:candidate_order")
             rng.shuffle(order)
             target = order.index(0)
             candidate_rows = [candidate_rows[index] for index in order]

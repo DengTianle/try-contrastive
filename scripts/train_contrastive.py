@@ -1074,6 +1074,7 @@ def main() -> None:
     best_metric_direction = checkpoint_metric_direction(best_metric_name)
     best_metric_value = float("inf") if best_metric_direction == "min" else -float("inf")
     for epoch in range(1, args.epochs + 1):
+        train_dataset.set_epoch(epoch - 1)
         if train_batch_sampler is not None:
             train_batch_sampler.set_epoch(epoch - 1)
         desired_hubert_trainable_layers = (
