@@ -23,6 +23,11 @@ To prepare only a specific set of songs, put one DALI id per line in a text
 file and pass `--keep-file path/to/song_ids.txt`. Blank lines and `#` comments
 are ignored.
 
+Preparation discards line segments longer than 10 seconds or containing fewer
+than three overlapping notes by default. Override these gates with
+`--max-segment-seconds` and `--min-segment-notes`; a maximum duration of 0
+disables the duration limit.
+
 For songs covered by the grouping results, the manifest retains every line occurrence
 and records its lyric and melody classes. Training never uses another member of the
 anchor's melody class as a negative. By default it chooses a positive occurrence with

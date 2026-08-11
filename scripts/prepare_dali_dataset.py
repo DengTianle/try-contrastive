@@ -443,6 +443,19 @@ def count_segment_notes(
     )
 
 
+def segment_quality_skip_reason(
+    segment_seconds: float,
+    note_count: int,
+    max_segment_seconds: float,
+    min_segment_notes: int,
+) -> str | None:
+    if max_segment_seconds > 0 and segment_seconds > max_segment_seconds:
+        return "too_long"
+    if note_count < min_segment_notes:
+        return "too_few_notes"
+    return None
+
+
 def write_melody_npz(
     melody_dir: Path,
     sample_id: str,
@@ -565,6 +578,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tracks", type=int, default=0, help="0 means no track limit.")
     parser.add_argument("--max-segments", type=int, default=0, help="0 means no segment limit.")
     parser.add_argument(
+        "--max-segment-seconds",
+        type=float,
+        default=10.0,
+        help="Discard line segments longer than this duration. 0 disables the limit.",
+    )
+    parser.add_argument(
+        "--min-segment-notes",
+        type=int,
+        default=3,
+        help="Discard line segments with fewer than this many overlapping notes.",
+    )
+    parser.add_argument(
         "--repeat-groupings",
         type=Path,
         default=None,
@@ -605,6 +630,10 @@ def main() -> None:
     args.prepared_audio_dir = resolve_user_path(args.prepared_audio_dir)
     if args.melody_frame_rate <= 0:
         raise SystemExit("--melody-frame-rate must be positive")
+    if args.max_segment_seconds < 0:
+        raise SystemExit("--max-segment-seconds must be nonnegative")
+    if args.min_segment_notes < 0:
+        raise SystemExit("--min-segment-notes must be nonnegative")
     if args.train_ratio <= 0 or args.val_ratio < 0 or args.train_ratio + args.val_ratio >= 1:
         raise SystemExit("--train-ratio and --val-ratio must leave a positive test split")
 
@@ -745,6 +774,20 @@ def main() -> None:
         for line in line_segments:
             start_seconds = line["start_seconds"]
             segment_seconds = line["segment_seconds"]
+            note_count = count_segment_notes(
+                track["notes"],
+                start_seconds=start_seconds,
+                segment_seconds=segment_seconds,
+            )
+            skip_reason = segment_quality_skip_reason(
+                segment_seconds=segment_seconds,
+                note_count=note_count,
+                max_segment_seconds=args.max_segment_seconds,
+                min_segment_notes=args.min_segment_notes,
+            )
+            if skip_reason is not None:
+                skipped_segments[skip_reason] += 1
+                continue
             frame_times, f0_hz, voiced = render_melody_frames(
                 track["notes"],
                 start_seconds=start_seconds,
@@ -793,11 +836,7 @@ def main() -> None:
                     "duration_mae_to_representative"
                 ),
                 "group_quality_flags": grouping.get("quality_flags", []),
-                "note_count": count_segment_notes(
-                    track["notes"],
-                    start_seconds=start_seconds,
-                    segment_seconds=segment_seconds,
-                ),
+                "note_count": note_count,
             }
             all_segments.append(segment)
             if args.max_segments > 0 and len(all_segments) >= args.max_segments:
@@ -861,6 +900,8 @@ def main() -> None:
             bool(track["has_repeat_groupings"]) for track in usable_tracks
         ),
         "melody_frame_rate": args.melody_frame_rate,
+        "max_segment_seconds": args.max_segment_seconds,
+        "min_segment_notes": args.min_segment_notes,
         "seed": args.seed,
         "train_ratio": args.train_ratio,
         "val_ratio": args.val_ratio,
