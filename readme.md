@@ -52,9 +52,16 @@ different lyrics when available, then an ordinary repeated occurrence, and final
 the aligned audio. Songs absent from a partial grouping file retain the older behavior
 of keeping the first normalized lyric occurrence.
 
-The manifest retains `voiced_ratio` for diagnostics, but vocal ratio is no longer used
-to filter segments. Melody frames and audio waveforms are padded per batch and masked
-during training, pretraining, diagnostics, and evaluation.
+Each melody segment is represented as a note sequence using the 177-dimensional scheme
+from [Wang et al.](https://arxiv.org/html/2508.00123): 129 dimensions for MIDI pitch
+change relative to the first note (128-way magnitude plus sign), 24 for quantized
+log-duration, and 24 for quantized log inter-onset interval. Duration and onset shift
+are min-max normalized within each segment before quantization, matching the authors'
+[reference implementation](https://github.com/changhongw/mlm). The manifest retains
+`voiced_ratio` as note-coverage metadata, but it is not used to filter segments. Melody
+notes and audio waveforms are padded per batch and masked during training, pretraining,
+diagnostics, and evaluation. Prepared frame-level `.npz` files are incompatible; rerun
+the preparation command after upgrading.
 
 Contrastive training defaults to `--candidate-window-policy match-positive`. Within
 each retrieval set, every audio candidate is presented at the selected positive's
@@ -83,7 +90,8 @@ congruent-repeat retrieval explicitly.
 
 ## Melody encoder pretraining
 
-Pretrain the melody encoder with a masked prosody objective before contrastive training:
+Pretrain the melody encoder by masking notes and classifying their pitch-change,
+pitch-sign, duration, and onset-shift attributes before contrastive training:
 
 ```bash
 conda run -n try-contrastive python scripts/pretrain_melody_encoder.py

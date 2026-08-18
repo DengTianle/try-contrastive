@@ -18,6 +18,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from prosodia.datasets import GroupedContrastiveDataset, grouped_contrastive_collate
+from prosodia.melody_encoder import MELODY_REPRESENTATION
 from prosodia.training import (
     DifferentSongBatchSampler,
     MelodyAudioContrastiveModel,
@@ -59,33 +60,6 @@ def choose_device(requested: str) -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
-
-
-class RandomMelodyTransposition:
-    """Randomly shift voiced melody pitch by a uniform number of semitones."""
-
-    def __init__(self, max_semitones: float) -> None:
-        if max_semitones < 0:
-            raise ValueError("max_semitones must be non-negative")
-        self.max_semitones = max_semitones
-
-    def __call__(self, item: dict[str, Any]) -> dict[str, Any]:
-        if self.max_semitones <= 0.0:
-            return item
-
-        semitones = float(torch.empty(()).uniform_(-self.max_semitones, self.max_semitones))
-        log2_shift = semitones / 12.0
-        voiced = item["melody_voiced"].to(dtype=torch.bool)
-
-        melody_features = item["melody_features"].clone()
-        melody_features[voiced, 0] += log2_shift
-        item["melody_features"] = melody_features
-
-        f0_hz = item["melody_f0_hz"].clone()
-        f0_hz[voiced] *= 2.0 ** log2_shift
-        item["melody_f0_hz"] = f0_hz
-        item["melody_transposition_semitones"] = torch.tensor(semitones, dtype=torch.float32)
-        return item
 
 
 def maybe_progress(iterable: Any, enabled: bool, **kwargs: Any) -> Any:
@@ -592,6 +566,7 @@ def save_checkpoint(
         "scaler_state_dict": scaler.state_dict(),
         "args": vars(args),
         "metrics": metrics,
+        "melody_representation": MELODY_REPRESENTATION,
     }
     torch.save(checkpoint, output_dir / name)
 
@@ -881,15 +856,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--melody-transpose-semitones",
-        type=float,
-        default=0.0,
-        help=(
-            "Training-only melody augmentation. Randomly shift voiced melody log-F0 "
-            "within +/- this many semitones. 0 disables it."
-        ),
-    )
-    parser.add_argument(
         "--audio-noise-snr-db",
         type=float,
         default=None,
@@ -958,8 +924,6 @@ def main() -> None:
         )
     if args.no_in_batch_negatives:
         args.global_loss_weight = 0.0
-    if args.melody_transpose_semitones < 0.0:
-        raise SystemExit("--melody-transpose-semitones must be non-negative")
     if args.audio_noise_snr_db is not None and args.audio_noise_snr_db <= 0.0:
         raise SystemExit("--audio-noise-snr-db must be positive")
     if not 0.0 <= args.audio_background_mix_prob <= 1.0:
@@ -975,12 +939,6 @@ def main() -> None:
     if progress and tqdm is None:
         print("tqdm is not installed; continuing without progress bars.")
 
-    train_transform = None
-    if args.melody_transpose_semitones > 0.0:
-        train_transform = RandomMelodyTransposition(
-            max_semitones=args.melody_transpose_semitones,
-        )
-
     train_dataset = GroupedContrastiveDataset(
         manifest_path=args.manifest,
         split=args.train_split,
@@ -990,7 +948,6 @@ def main() -> None:
         candidate_window_policy=args.candidate_window_policy,
         randomize_candidate_windows=args.candidate_window_policy == "match-positive",
         seed=args.seed,
-        transform=train_transform,
     )
     if len(train_dataset) == 0:
         raise SystemExit(f"No grouped training examples found for split={args.train_split}")

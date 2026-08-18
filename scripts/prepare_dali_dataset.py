@@ -8,12 +8,25 @@ import json
 import os
 import pickle
 import random
+import sys
 import unicodedata
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+from prosodia.melody_encoder import (
+    MELODY_FEATURE_DIM,
+    MELODY_REPRESENTATION,
+    hz_to_midi_pitch,
+)
 
 
 AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".aac"}
@@ -374,7 +387,7 @@ def extract_dali_notes(entry: Any) -> list[dict[str, Any]]:
             continue
         if float(times[-1]) <= float(times[0]):
             continue
-        if float(np.nanmax(freqs)) <= 0.0:
+        if float(freqs[0]) <= 0.0:
             continue
         valid_notes.append(
             {
@@ -388,39 +401,66 @@ def extract_dali_notes(entry: Any) -> list[dict[str, Any]]:
     return valid_notes
 
 
-def render_melody_frames(
+def extract_segment_note_arrays(
     notes: list[dict[str, Any]],
     start_seconds: float,
     segment_seconds: float,
-    frame_rate: float,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    num_frames = max(1, int(round(segment_seconds * frame_rate)))
-    frame_times = start_seconds + (np.arange(num_frames, dtype=np.float32) + 0.5) / frame_rate
-    f0_hz = np.zeros(num_frames, dtype=np.float32)
-    voiced = np.zeros(num_frames, dtype=np.bool_)
-
     segment_end = start_seconds + segment_seconds
-    for note in notes:
-        times = note["time"]
-        freqs = note["freq"]
-        note_start = float(times[0])
-        note_end = float(times[-1])
-        if note_end <= start_seconds or note_start >= segment_end:
-            continue
-        mask = (frame_times >= note_start) & (frame_times < note_end)
-        if not np.any(mask):
-            continue
-        values = np.interp(frame_times[mask], times, freqs).astype(np.float32)
-        valid = np.isfinite(values) & (values > 0.0)
-        if not np.any(valid):
-            continue
-        masked_indices = np.flatnonzero(mask)
-        valid_indices = masked_indices[valid]
-        f0_hz[valid_indices] = values[valid]
-        voiced[valid_indices] = True
+    overlapping = [
+        note
+        for note in notes
+        if float(note["time"][-1]) > start_seconds
+        and float(note["time"][0]) < segment_end
+    ]
+    midi_pitches = np.asarray(
+        [hz_to_midi_pitch(float(note["freq"][0])) for note in overlapping],
+        dtype=np.int16,
+    )
+    onset_seconds = np.asarray(
+        [float(note["time"][0]) - start_seconds for note in overlapping],
+        dtype=np.float32,
+    )
+    duration_seconds = np.asarray(
+        [float(note["time"][-1]) - float(note["time"][0]) for note in overlapping],
+        dtype=np.float32,
+    )
+    return midi_pitches, onset_seconds, duration_seconds
 
-    relative_times = frame_times - start_seconds
-    return relative_times.astype(np.float32), f0_hz, voiced
+
+def note_coverage_ratio(
+    notes: list[dict[str, Any]],
+    start_seconds: float,
+    segment_seconds: float,
+) -> float:
+    """Return the fraction of a segment covered by the union of note intervals."""
+    if segment_seconds <= 0.0:
+        return 0.0
+    segment_end = start_seconds + segment_seconds
+    intervals = sorted(
+        (
+            max(start_seconds, float(note["time"][0])),
+            min(segment_end, float(note["time"][-1])),
+        )
+        for note in notes
+        if float(note["time"][-1]) > start_seconds
+        and float(note["time"][0]) < segment_end
+    )
+    covered = 0.0
+    current_start: float | None = None
+    current_end: float | None = None
+    for interval_start, interval_end in intervals:
+        if current_start is None:
+            current_start, current_end = interval_start, interval_end
+        elif current_end is not None and interval_start <= current_end:
+            current_end = max(current_end, interval_end)
+        else:
+            assert current_end is not None
+            covered += current_end - current_start
+            current_start, current_end = interval_start, interval_end
+    if current_start is not None and current_end is not None:
+        covered += current_end - current_start
+    return float(np.clip(covered / segment_seconds, 0.0, 1.0))
 
 
 def annotation_duration_seconds(notes: list[dict[str, Any]]) -> float:
@@ -451,7 +491,7 @@ def segment_quality_skip_reason(
 ) -> str | None:
     if max_segment_seconds > 0 and segment_seconds > max_segment_seconds:
         return "too_long"
-    if note_count < min_segment_notes:
+    if note_count == 0 or note_count < min_segment_notes:
         return "too_few_notes"
     return None
 
@@ -459,22 +499,20 @@ def segment_quality_skip_reason(
 def write_melody_npz(
     melody_dir: Path,
     sample_id: str,
-    frame_times: np.ndarray,
-    f0_hz: np.ndarray,
-    voiced: np.ndarray,
-    frame_rate: float,
+    midi_pitches: np.ndarray,
+    onset_seconds: np.ndarray,
+    note_duration_seconds: np.ndarray,
     start_seconds: float,
     segment_seconds: float,
 ) -> Path:
     melody_path = melody_dir / f"{sample_id}.npz"
     np.savez_compressed(
         melody_path,
-        frame_times=frame_times,
-        f0_hz=f0_hz,
-        voiced=voiced.astype(np.uint8),
-        frame_rate=np.asarray(frame_rate, dtype=np.float32),
+        midi_pitches=midi_pitches,
+        onset_seconds=onset_seconds,
+        note_duration_seconds=note_duration_seconds,
         start_seconds=np.asarray(start_seconds, dtype=np.float32),
-        duration_seconds=np.asarray(segment_seconds, dtype=np.float32),
+        segment_duration_seconds=np.asarray(segment_seconds, dtype=np.float32),
     )
     return melody_path.resolve(strict=False)
 
@@ -498,7 +536,6 @@ def row_for_segment(
         "start_seconds": f"{segment['start_seconds']:.6f}",
         "end_seconds": f"{segment['end_seconds']:.6f}",
         "segment_seconds": f"{segment['segment_seconds']:.6f}",
-        "melody_frame_rate": f"{segment['frame_rate']:.6f}",
         "voiced_ratio": f"{segment['voiced_ratio']:.6f}",
         "note_count": str(segment["note_count"]),
         "line_index": str(segment["line_index"]),
@@ -537,7 +574,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Prepare DALI vocal-melody/audio contrastive data. The script writes one "
-            "canonical frame-based melody .npz per retained DALI lyric-line occurrence "
+            "canonical note-level melody .npz per retained DALI lyric-line occurrence "
             "and a segment manifest."
         )
     )
@@ -574,7 +611,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Regenerate prepared audio files even if they already exist.",
     )
-    parser.add_argument("--melody-frame-rate", type=float, default=50.0, help="Number of frames per second.")
     parser.add_argument("--max-tracks", type=int, default=0, help="0 means no track limit.")
     parser.add_argument("--max-segments", type=int, default=0, help="0 means no segment limit.")
     parser.add_argument(
@@ -628,8 +664,6 @@ def main() -> None:
     if args.prepared_audio_dir is None:
         args.prepared_audio_dir = args.output_dir / f"audio_{args.sample_rate // 1000}k"
     args.prepared_audio_dir = resolve_user_path(args.prepared_audio_dir)
-    if args.melody_frame_rate <= 0:
-        raise SystemExit("--melody-frame-rate must be positive")
     if args.max_segment_seconds < 0:
         raise SystemExit("--max-segment-seconds must be nonnegative")
     if args.min_segment_notes < 0:
@@ -788,13 +822,20 @@ def main() -> None:
             if skip_reason is not None:
                 skipped_segments[skip_reason] += 1
                 continue
-            frame_times, f0_hz, voiced = render_melody_frames(
+            (
+                midi_pitches,
+                onset_seconds,
+                note_duration_seconds,
+            ) = extract_segment_note_arrays(
                 track["notes"],
                 start_seconds=start_seconds,
                 segment_seconds=segment_seconds,
-                frame_rate=args.melody_frame_rate,
             )
-            voiced_ratio = float(np.mean(voiced)) if voiced.size else 0.0
+            voiced_ratio = note_coverage_ratio(
+                track["notes"],
+                start_seconds=start_seconds,
+                segment_seconds=segment_seconds,
+            )
             grouping = line.get("repeat_grouping", {})
 
             sample_id = stable_sample_id(
@@ -805,10 +846,9 @@ def main() -> None:
             melody_path = write_melody_npz(
                 melody_dir=melody_dir,
                 sample_id=sample_id,
-                frame_times=frame_times,
-                f0_hz=f0_hz,
-                voiced=voiced,
-                frame_rate=args.melody_frame_rate,
+                midi_pitches=midi_pitches,
+                onset_seconds=onset_seconds,
+                note_duration_seconds=note_duration_seconds,
                 start_seconds=start_seconds,
                 segment_seconds=segment_seconds,
             )
@@ -819,7 +859,6 @@ def main() -> None:
                 "start_seconds": start_seconds,
                 "end_seconds": line["end_seconds"],
                 "segment_seconds": segment_seconds,
-                "frame_rate": args.melody_frame_rate,
                 "voiced_ratio": voiced_ratio,
                 "line_index": line["line_index"],
                 "line_text": line["text"],
@@ -899,7 +938,14 @@ def main() -> None:
         "num_grouped_tracks_prepared": sum(
             bool(track["has_repeat_groupings"]) for track in usable_tracks
         ),
-        "melody_frame_rate": args.melody_frame_rate,
+        "melody_representation": {
+            "name": MELODY_REPRESENTATION,
+            "level": "note",
+            "feature_dimension": MELODY_FEATURE_DIM,
+            "pitch_change_bins": 128,
+            "duration_bins": 24,
+            "onset_shift_bins": 24,
+        },
         "max_segment_seconds": args.max_segment_seconds,
         "min_segment_notes": args.min_segment_notes,
         "seed": args.seed,

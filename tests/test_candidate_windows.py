@@ -55,9 +55,9 @@ class CandidateWindowTest(unittest.TestCase):
         melody_path = self.root / f"{sample_id}.npz"
         np.savez_compressed(
             melody_path,
-            f0_hz=np.asarray([440.0], dtype=np.float32),
-            voiced=np.asarray([1], dtype=np.uint8),
-            frame_times=np.asarray([0.0], dtype=np.float32),
+            midi_pitches=np.asarray([69], dtype=np.int16),
+            onset_seconds=np.asarray([0.0], dtype=np.float32),
+            note_duration_seconds=np.asarray([end - start], dtype=np.float32),
         )
         return {
             "sample_id": sample_id,

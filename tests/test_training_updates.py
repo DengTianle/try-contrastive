@@ -16,6 +16,8 @@ from train_contrastive import (
     StagedWarmupCosineScheduler,
     step_optimizer_and_scheduler,
 )
+from pretrain_melody_encoder import pretrain_step
+from prosodia.melody_encoder import MELODY_FEATURE_DIM, MelodyMaskedProsodyModel
 
 
 class OptimizerUpdateTest(unittest.TestCase):
@@ -63,6 +65,41 @@ class OptimizerUpdateTest(unittest.TestCase):
         self.assertTrue(succeeded)
         self.assertEqual(scheduler.update_step, 1)
         self.assertLess(float(parameter.detach()), 1.0)
+
+
+class MaskedNotePretrainingTest(unittest.TestCase):
+    def test_pretraining_classifies_all_four_note_attributes(self) -> None:
+        features = torch.zeros(1, 2, MELODY_FEATURE_DIM)
+        features[0, :, 0] = 1.0
+        features[0, :, 128] = 1.0
+        features[0, :, 129] = 1.0
+        features[0, :, 153] = 1.0
+        batch = {
+            "melody_features": features,
+            "melody_attention_mask": torch.ones(1, 2, dtype=torch.bool),
+        }
+        model = MelodyMaskedProsodyModel(
+            d_model=8,
+            num_layers=1,
+            num_heads=2,
+            dim_feedforward=16,
+            dropout=0.0,
+        )
+
+        loss, metrics = pretrain_step(
+            model=model,
+            batch=batch,
+            mask_prob=0.5,
+            mask_span_notes=1,
+            mask_generator=torch.Generator().manual_seed(0),
+        )
+        loss.backward()
+
+        self.assertTrue(torch.isfinite(loss))
+        self.assertGreater(metrics["pitch_change_loss"], 0.0)
+        self.assertGreater(metrics["duration_loss"], 0.0)
+        self.assertGreater(metrics["onset_shift_loss"], 0.0)
+        self.assertGreater(metrics["masked_notes"], 0.0)
 
 
 if __name__ == "__main__":

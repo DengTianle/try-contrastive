@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 from torch import nn
 
-from prosodia.melody_encoder import MelodyTransformerEncoder
+from prosodia.melody_encoder import MELODY_FEATURE_DIM, MelodyTransformerEncoder
 from prosodia.prosody_encoder import HubertProsodyEncoder
 
 
@@ -13,7 +13,7 @@ class MelodyAudioContrastiveModel(nn.Module):
         hubert_model_name: str,
         projection_dim: int = 256,
         freeze_hubert: bool = False,
-        melody_input_dim: int = 2,
+        melody_input_dim: int = MELODY_FEATURE_DIM,
         melody_d_model: int = 256,
         melody_num_layers: int = 4,
         melody_num_heads: int = 4,

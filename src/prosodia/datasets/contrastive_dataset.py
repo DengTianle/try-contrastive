@@ -12,6 +12,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from prosodia.melody_encoder import MELODY_FEATURE_DIM, encode_note_sequence
+
 
 POSITIVE_VARIANT_POLICIES = {"self", "any", "retexted", "retexted-first"}
 CANDIDATE_WINDOW_POLICIES = {"line", "match-positive"}
@@ -26,8 +28,7 @@ class AudioConfig:
 
 @dataclass(frozen=True)
 class MelodyConfig:
-    log_f0_reference_hz: float = 440.0
-    include_voiced_feature: bool = True
+    feature_dim: int = MELODY_FEATURE_DIM
 
 
 def audio_start_seconds(row: dict[str, str]) -> float:
@@ -105,24 +106,33 @@ def resolve_manifest_path(path: str, manifest_dir: Path) -> str:
 
 def load_melody(path: str | Path, melody_config: MelodyConfig) -> dict[str, torch.Tensor]:
     with np.load(path) as melody:
-        f0_hz = melody["f0_hz"].astype(np.float32)
-        voiced = melody["voiced"].astype(bool)
-        frame_times = melody["frame_times"].astype(np.float32)
+        required = {"midi_pitches", "onset_seconds", "note_duration_seconds"}
+        missing = required.difference(melody.files)
+        if missing:
+            raise ValueError(
+                f"{path} uses the obsolete frame-level melody format or is incomplete; "
+                "rerun scripts/prepare_dali_dataset.py to create note-level features "
+                f"(missing {sorted(missing)})"
+            )
+        midi_pitches = melody["midi_pitches"].astype(np.int64)
+        onset_seconds = melody["onset_seconds"].astype(np.float32)
+        duration_seconds = melody["note_duration_seconds"].astype(np.float32)
 
-    log_f0 = np.zeros_like(f0_hz, dtype=np.float32)
-    valid = voiced & np.isfinite(f0_hz) & (f0_hz > 0.0)
-    log_f0[valid] = np.log2(f0_hz[valid] / melody_config.log_f0_reference_hz)
-
-    feature_parts = [log_f0[:, None]]
-    if melody_config.include_voiced_feature:
-        feature_parts.append(voiced.astype(np.float32)[:, None])
-    features = np.concatenate(feature_parts, axis=1).astype(np.float32)
+    features = encode_note_sequence(
+        midi_pitches=midi_pitches,
+        onset_seconds=onset_seconds,
+        duration_seconds=duration_seconds,
+    )
+    if features.shape[1] != melody_config.feature_dim:
+        raise ValueError(
+            f"Expected {melody_config.feature_dim} melody features, got {features.shape[1]}"
+        )
 
     return {
         "features": torch.from_numpy(features),
-        "f0_hz": torch.from_numpy(f0_hz),
-        "voiced": torch.from_numpy(voiced),
-        "frame_times": torch.from_numpy(frame_times),
+        "midi_pitches": torch.from_numpy(midi_pitches),
+        "onset_seconds": torch.from_numpy(onset_seconds),
+        "duration_seconds": torch.from_numpy(duration_seconds),
     }
 
 
@@ -451,9 +461,9 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
 
         item: dict[str, Any] = {
             "melody_features": melody["features"],
-            "melody_f0_hz": melody["f0_hz"],
-            "melody_voiced": melody["voiced"],
-            "melody_frame_times": melody["frame_times"],
+            "melody_midi_pitches": melody["midi_pitches"],
+            "melody_note_onsets": melody["onset_seconds"],
+            "melody_note_durations": melody["duration_seconds"],
             "melody_attention_mask": torch.ones(
                 melody["features"].shape[0],
                 dtype=torch.bool,
@@ -722,9 +732,9 @@ class MelodyOnlyDataset(Dataset[dict[str, Any]]):
         melody = load_melody(row["melody_path"], self.melody_config)
         item: dict[str, Any] = {
             "melody_features": melody["features"],
-            "melody_f0_hz": melody["f0_hz"],
-            "melody_voiced": melody["voiced"],
-            "melody_frame_times": melody["frame_times"],
+            "melody_midi_pitches": melody["midi_pitches"],
+            "melody_note_onsets": melody["onset_seconds"],
+            "melody_note_durations": melody["duration_seconds"],
             "melody_attention_mask": torch.ones(
                 melody["features"].shape[0],
                 dtype=torch.bool,
@@ -738,29 +748,29 @@ class MelodyOnlyDataset(Dataset[dict[str, Any]]):
 
 
 def melody_only_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    max_frames = max(item["melody_features"].shape[0] for item in batch)
+    max_notes = max(item["melody_features"].shape[0] for item in batch)
     batch_size = len(batch)
     feature_dim = batch[0]["melody_features"].shape[-1]
 
-    melody_features = torch.zeros(batch_size, max_frames, feature_dim)
-    melody_f0_hz = torch.zeros(batch_size, max_frames)
-    melody_voiced = torch.zeros(batch_size, max_frames, dtype=torch.bool)
-    melody_frame_times = torch.zeros(batch_size, max_frames)
-    melody_attention_mask = torch.zeros(batch_size, max_frames, dtype=torch.bool)
+    melody_features = torch.zeros(batch_size, max_notes, feature_dim)
+    melody_midi_pitches = torch.zeros(batch_size, max_notes, dtype=torch.long)
+    melody_note_onsets = torch.zeros(batch_size, max_notes)
+    melody_note_durations = torch.zeros(batch_size, max_notes)
+    melody_attention_mask = torch.zeros(batch_size, max_notes, dtype=torch.bool)
 
     for batch_index, item in enumerate(batch):
-        frame_count = item["melody_features"].shape[0]
-        melody_features[batch_index, :frame_count] = item["melody_features"]
-        melody_f0_hz[batch_index, :frame_count] = item["melody_f0_hz"]
-        melody_voiced[batch_index, :frame_count] = item["melody_voiced"]
-        melody_frame_times[batch_index, :frame_count] = item["melody_frame_times"]
-        melody_attention_mask[batch_index, :frame_count] = item["melody_attention_mask"]
+        note_count = item["melody_features"].shape[0]
+        melody_features[batch_index, :note_count] = item["melody_features"]
+        melody_midi_pitches[batch_index, :note_count] = item["melody_midi_pitches"]
+        melody_note_onsets[batch_index, :note_count] = item["melody_note_onsets"]
+        melody_note_durations[batch_index, :note_count] = item["melody_note_durations"]
+        melody_attention_mask[batch_index, :note_count] = item["melody_attention_mask"]
 
     return {
         "melody_features": melody_features,
-        "melody_f0_hz": melody_f0_hz,
-        "melody_voiced": melody_voiced,
-        "melody_frame_times": melody_frame_times,
+        "melody_midi_pitches": melody_midi_pitches,
+        "melody_note_onsets": melody_note_onsets,
+        "melody_note_durations": melody_note_durations,
         "melody_attention_mask": melody_attention_mask,
         "melody_sample_id": [item["melody_sample_id"] for item in batch],
         "metadata": [item["metadata"] for item in batch],
@@ -809,9 +819,9 @@ def grouped_contrastive_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "melody_features": melody_batch["melody_features"],
         "melody_attention_mask": melody_batch["melody_attention_mask"],
-        "melody_f0_hz": melody_batch["melody_f0_hz"],
-        "melody_voiced": melody_batch["melody_voiced"],
-        "melody_frame_times": melody_batch["melody_frame_times"],
+        "melody_midi_pitches": melody_batch["melody_midi_pitches"],
+        "melody_note_onsets": melody_batch["melody_note_onsets"],
+        "melody_note_durations": melody_batch["melody_note_durations"],
         "candidate_input_values": candidate_input_values,
         "candidate_audio_attention_mask": candidate_audio_attention_mask,
         "candidate_mask": candidate_mask,

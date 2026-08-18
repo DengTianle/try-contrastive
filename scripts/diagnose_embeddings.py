@@ -69,19 +69,20 @@ def finite_mean_and_std(values: np.ndarray) -> tuple[float, float]:
     return float(np.mean(finite)), float(np.std(finite))
 
 
-def finite_mean_log_f0_semitones(
-    f0_hz: torch.Tensor,
-    voiced: torch.Tensor,
-    reference_hz: float = 440.0,
+def finite_mean_midi_semitones(
+    midi_pitches: torch.Tensor,
+    attention_mask: torch.Tensor,
 ) -> list[float]:
     values: list[float] = []
-    for sample_f0, sample_voiced in zip(f0_hz.detach().cpu(), voiced.detach().cpu()):
-        valid = sample_voiced.to(dtype=torch.bool) & torch.isfinite(sample_f0) & (sample_f0 > 0)
+    for sample_pitches, sample_mask in zip(
+        midi_pitches.detach().cpu(),
+        attention_mask.detach().cpu(),
+    ):
+        valid = sample_mask.to(dtype=torch.bool)
         if not bool(valid.any()):
             values.append(float("nan"))
             continue
-        mean_log2 = torch.log2(sample_f0[valid] / reference_hz).mean()
-        values.append(float(mean_log2 * 12.0))
+        values.append(float(sample_pitches[valid].float().mean() - 69.0))
     return values
 
 
@@ -119,7 +120,10 @@ def extract_embeddings(
         melody_embeddings.append(batch_melody_embeddings.detach().cpu())
         audio_embeddings.append(batch_audio_embeddings.detach().cpu())
         pitch_semitones.extend(
-            finite_mean_log_f0_semitones(batch["melody_f0_hz"], batch["melody_voiced"])
+            finite_mean_midi_semitones(
+                batch["melody_midi_pitches"],
+                batch["melody_attention_mask"],
+            )
         )
 
         for anchor_row in batch["anchor_metadata"]:
