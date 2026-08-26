@@ -25,13 +25,21 @@ class DifferentSongBatchSampler(Sampler[list[int]]):
         batch_size: int,
         seed: int,
         drop_last: bool = False,
+        num_replicas: int = 1,
+        rank: int = 0,
     ) -> None:
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        if num_replicas <= 0:
+            raise ValueError("num_replicas must be positive")
+        if not 0 <= rank < num_replicas:
+            raise ValueError("rank must be between 0 and num_replicas - 1")
         self.dataset = dataset
         self.batch_size = batch_size
         self.seed = seed
         self.drop_last = drop_last
+        self.num_replicas = num_replicas
+        self.rank = rank
         self.epoch = 0
 
         self.indices_by_song: dict[str, list[int]] = defaultdict(list)
@@ -120,7 +128,12 @@ class DifferentSongBatchSampler(Sampler[list[int]]):
         return batches
 
     def __iter__(self) -> Iterator[list[int]]:
-        yield from self._plan_batches()
+        batches = self._plan_batches()
+        if batches and len(batches) % self.num_replicas:
+            padding = self.num_replicas - len(batches) % self.num_replicas
+            repeats = math.ceil(padding / len(batches))
+            batches.extend((batches * repeats)[:padding])
+        yield from batches[self.rank :: self.num_replicas]
 
     def __len__(self) -> int:
-        return self._batch_count()
+        return math.ceil(self._batch_count() / self.num_replicas)

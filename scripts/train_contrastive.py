@@ -3,14 +3,19 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import sys
 from pathlib import Path
 from typing import Any
 
 import torch
+import torch.distributed as dist
+from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_DIR = PROJECT_ROOT / "src"
@@ -60,6 +65,52 @@ def choose_device(requested: str) -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+def initialize_distributed(requested_device: str) -> tuple[torch.device, int, int]:
+    """Initialize torchrun's process group and select this process's GPU."""
+
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size == 1:
+        return choose_device(requested_device), 0, 1
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    device = choose_device(requested_device)
+    if device.type == "cuda":
+        device = torch.device("cuda", local_rank)
+        torch.cuda.set_device(device)
+        backend = "nccl"
+    elif device.type == "cpu":
+        backend = "gloo"
+    else:
+        raise SystemExit("Distributed training supports CUDA or CPU devices only")
+    dist.init_process_group(backend=backend)
+    return device, dist.get_rank(), dist.get_world_size()
+
+
+def unwrap_model(model: nn.Module) -> MelodyAudioContrastiveModel:
+    if isinstance(model, DistributedDataParallel):
+        return model.module
+    return model
+
+
+def wrap_distributed_model(model: nn.Module, device: torch.device) -> nn.Module:
+    if not dist.is_initialized():
+        return model
+    if device.type == "cuda":
+        return DistributedDataParallel(
+            model,
+            device_ids=[device.index],
+            output_device=device.index,
+        )
+    return DistributedDataParallel(model)
+
+
+def distributed_totals(values: list[float], device: torch.device) -> list[float]:
+    totals = torch.tensor(values, dtype=torch.float64, device=device)
+    if dist.is_initialized():
+        dist.all_reduce(totals, op=dist.ReduceOp.SUM)
+    return totals.cpu().tolist()
 
 
 def maybe_progress(iterable: Any, enabled: bool, **kwargs: Any) -> Any:
@@ -360,7 +411,7 @@ def step_optimizer_and_scheduler(
 
 
 def train_one_epoch(
-    model: MelodyAudioContrastiveModel,
+    model: nn.Module,
     loader: DataLoader,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
@@ -418,6 +469,8 @@ def train_one_epoch(
             global_audio_logits = None
             batch_size = batch["melody_features"].shape[0]
             if global_loss_weight > 0.0 and batch_size > 1:
+                # DDP does not gather forward outputs, so this remains local to
+                # the current GPU; only the resulting gradients are synchronized.
                 batch_positive_audio_embeddings = positive_audio_embeddings(
                     candidate_audio_embeddings=audio_embeddings,
                     targets=batch["target"],
@@ -467,6 +520,28 @@ def train_one_epoch(
                 acc=total_correct / max(total_examples, 1),
             )
 
+    (
+        total_loss,
+        total_hard_loss,
+        total_global_loss,
+        total_correct,
+        total_global_correct,
+        total_global_audio_correct,
+        total_examples,
+        total_global_examples,
+    ) = distributed_totals(
+        [
+            total_loss,
+            total_hard_loss,
+            total_global_loss,
+            total_correct,
+            total_global_correct,
+            total_global_audio_correct,
+            total_examples,
+            total_global_examples,
+        ],
+        device,
+    )
     return {
         "loss": total_loss / max(total_examples, 1),
         "hard_loss": total_hard_loss / max(total_examples, 1),
@@ -479,7 +554,7 @@ def train_one_epoch(
 
 @torch.no_grad()
 def evaluate(
-    model: MelodyAudioContrastiveModel,
+    model: nn.Module,
     loader: DataLoader,
     device: torch.device,
     temperature: float,
@@ -548,7 +623,7 @@ def evaluate(
 def save_checkpoint(
     output_dir: Path,
     name: str,
-    model: MelodyAudioContrastiveModel,
+    model: nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: StagedWarmupCosineScheduler,
     scaler: torch.amp.GradScaler,
@@ -557,6 +632,7 @@ def save_checkpoint(
     metrics: dict[str, Any],
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
+    model = unwrap_model(model)
     checkpoint = {
         "epoch": epoch,
         "global_step": scheduler.update_step,
@@ -931,11 +1007,12 @@ def main() -> None:
     if args.audio_background_mix_snr_db <= 0.0:
         raise SystemExit("--audio-background-mix-snr-db must be positive")
 
-    random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    device = choose_device(args.device)
+    device, rank, world_size = initialize_distributed(args.device)
+    is_main_process = rank == 0
+    random.seed(args.seed + rank)
+    torch.manual_seed(args.seed + rank)
     use_amp = args.amp and device.type == "cuda"
-    progress = not args.no_progress
+    progress = not args.no_progress and is_main_process
     if progress and tqdm is None:
         print("tqdm is not installed; continuing without progress bars.")
 
@@ -951,15 +1028,24 @@ def main() -> None:
     )
     if len(train_dataset) == 0:
         raise SystemExit(f"No grouped training examples found for split={args.train_split}")
-    print(f"Training positive variants: {train_dataset.positive_variant_counts()}")
+    if is_main_process:
+        print(f"Training positive variants: {train_dataset.positive_variant_counts()}")
+        if world_size > 1:
+            print(
+                f"Distributed training on {world_size} processes; "
+                f"batch size is {args.batch_size} per GPU."
+            )
 
     train_batch_sampler = None
+    train_sampler = None
     if args.global_loss_weight > 0.0 and not args.disable_song_balanced_batches:
         train_batch_sampler = DifferentSongBatchSampler(
             dataset=train_dataset,
             batch_size=args.batch_size,
             seed=args.seed,
             drop_last=args.drop_incomplete_batches,
+            num_replicas=world_size,
+            rank=rank,
         )
         train_loader = DataLoader(
             train_dataset,
@@ -968,17 +1054,27 @@ def main() -> None:
             collate_fn=grouped_contrastive_collate,
         )
     else:
+        if world_size > 1:
+            train_sampler = DistributedSampler(
+                train_dataset,
+                num_replicas=world_size,
+                rank=rank,
+                shuffle=True,
+                seed=args.seed,
+                drop_last=args.drop_incomplete_batches,
+            )
         train_loader = DataLoader(
             train_dataset,
             batch_size=args.batch_size,
-            shuffle=True,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
             drop_last=args.drop_incomplete_batches,
             num_workers=args.num_workers,
             collate_fn=grouped_contrastive_collate,
         )
 
     val_loader = None
-    if not args.no_val:
+    if not args.no_val and is_main_process:
         val_dataset = GroupedContrastiveDataset(
             manifest_path=args.manifest,
             split=args.val_split,
@@ -1083,10 +1179,17 @@ def main() -> None:
     args.head_warmup_steps = scheduler.head_warmup_steps
     args.hubert_warmup_steps = scheduler.hubert_warmup_steps
     args.effective_hubert_trainable_layers = eventual_hubert_trainable_layers
+    args.world_size = world_size
+    args.effective_global_batch_size = args.batch_size * world_size
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    with (args.output_dir / "config.json").open("w", encoding="utf-8") as handle:
-        json.dump(vars(args), handle, indent=2, sort_keys=True, default=str)
+    if is_main_process:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        with (args.output_dir / "config.json").open("w", encoding="utf-8") as handle:
+            json.dump(vars(args), handle, indent=2, sort_keys=True, default=str)
+    if dist.is_initialized():
+        dist.barrier()
+
+    model = wrap_distributed_model(model, device)
 
     best_metric_name = args.best_checkpoint_metric
     best_metric_direction = checkpoint_metric_direction(best_metric_name)
@@ -1096,6 +1199,8 @@ def main() -> None:
         train_dataset.set_epoch(epoch_index)
         if train_batch_sampler is not None:
             train_batch_sampler.set_epoch(epoch_index)
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch_index)
         desired_hubert_trainable_layers = (
             eventual_hubert_trainable_layers
             if epoch > args.hubert_freeze_epochs
@@ -1103,18 +1208,24 @@ def main() -> None:
         )
         if args.freeze_hubert:
             desired_hubert_trainable_layers = 0
+        base_model = unwrap_model(model)
         if (
-            model.audio_encoder.hubert_trainable_layers
+            base_model.audio_encoder.hubert_trainable_layers
             != desired_hubert_trainable_layers
         ):
-            model.audio_encoder.set_hubert_trainable_layers(
+            # DDP records the trainable parameter set when it is constructed, so
+            # rebuild the lightweight wrapper when the staged HuBERT freeze ends.
+            model = base_model
+            base_model.audio_encoder.set_hubert_trainable_layers(
                 desired_hubert_trainable_layers
             )
-            print(
-                f"epoch={epoch} unfreezing top "
-                f"{desired_hubert_trainable_layers}/{num_hubert_layers} "
-                "HuBERT transformer blocks"
-            )
+            model = wrap_distributed_model(base_model, device)
+            if is_main_process:
+                print(
+                    f"epoch={epoch} unfreezing top "
+                    f"{desired_hubert_trainable_layers}/{num_hubert_layers} "
+                    "HuBERT transformer blocks"
+                )
 
         train_metrics = train_one_epoch(
             model=model,
@@ -1136,13 +1247,16 @@ def main() -> None:
         )
 
         learning_rates = scheduler.learning_rates()
+        base_model = unwrap_model(model)
         metrics: dict[str, Any] = {
             "train": train_metrics,
             "optimization": {
                 "global_step": scheduler.update_step,
                 "head_lr": learning_rates.get("head", 0.0),
                 "hubert_lr": learning_rates.get("hubert", 0.0),
-                "hubert_trainable_layers": model.audio_encoder.hubert_trainable_layers,
+                "hubert_trainable_layers": (
+                    base_model.audio_encoder.hubert_trainable_layers
+                ),
             },
         }
         message = (
@@ -1153,7 +1267,7 @@ def main() -> None:
             f"train_acc={train_metrics['accuracy']:.4f} "
             f"head_lr={learning_rates.get('head', 0.0):.2e} "
             f"hubert_lr={learning_rates.get('hubert', 0.0):.2e} "
-            f"hubert_layers={model.audio_encoder.hubert_trainable_layers}"
+            f"hubert_layers={base_model.audio_encoder.hubert_trainable_layers}"
         )
         if args.global_loss_weight > 0.0:
             message += f" train_global_acc={train_metrics['global_accuracy']:.4f}"
@@ -1164,7 +1278,7 @@ def main() -> None:
 
         if val_loader is not None:
             val_metrics = evaluate(
-                model=model,
+                model=base_model,
                 loader=val_loader,
                 device=device,
                 temperature=args.temperature,
@@ -1204,18 +1318,24 @@ def main() -> None:
                     metrics,
                 )
 
-        print(message)
-        save_checkpoint(
-            args.output_dir,
-            "last.pt",
-            model,
-            optimizer,
-            scheduler,
-            scaler,
-            epoch,
-            args,
-            metrics,
-        )
+        if is_main_process:
+            print(message)
+            save_checkpoint(
+                args.output_dir,
+                "last.pt",
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch,
+                args,
+                metrics,
+            )
+        if dist.is_initialized():
+            dist.barrier()
+
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

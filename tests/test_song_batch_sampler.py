@@ -116,6 +116,39 @@ class DifferentSongBatchSamplerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "epoch must be non-negative"):
             sampler.set_epoch(-1)
 
+    def test_distributed_ranks_receive_equal_song_distinct_batch_counts(self) -> None:
+        dataset = FakeGroupedDataset({"a": 5, "b": 5, "c": 5, "d": 5})
+        samplers = [
+            DifferentSongBatchSampler(
+                dataset,
+                batch_size=4,
+                seed=13,
+                num_replicas=3,
+                rank=rank,
+            )
+            for rank in range(3)
+        ]
+
+        rank_batches = [list(sampler) for sampler in samplers]
+
+        self.assertEqual([len(batches) for batches in rank_batches], [2, 2, 2])
+        self.assertEqual([len(sampler) for sampler in samplers], [2, 2, 2])
+        for batches in rank_batches:
+            self.assert_song_distinct(dataset, batches)
+        # Five planned batches require one repeated batch so every DDP rank takes
+        # the same number of optimizer steps.
+        self.assertEqual(sum(map(len, rank_batches)), 6)
+        sampled_indices = {
+            index
+            for batches in rank_batches
+            for batch in batches
+            for index in batch
+        }
+        self.assertEqual(
+            sampled_indices,
+            set(range(len(dataset))),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

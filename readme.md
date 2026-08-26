@@ -22,6 +22,20 @@ Pass `--drop-incomplete-batches` to both the planning script and
 `scripts/train_contrastive.py` to retain only complete training batches. The planner
 selects the maximum feasible number of full batches while keeping songs distinct.
 
+## Multi-GPU training
+
+Launch one process per GPU with `torchrun`; no additional training flag is needed:
+
+```bash
+conda run -n try-contrastive torchrun --standalone --nproc-per-node=4 \
+  scripts/train_contrastive.py --batch-size 8
+```
+
+`--batch-size` is per GPU, so this example has an effective global batch size of 32.
+Gradients are synchronized with DistributedDataParallel, while the global in-batch
+loss and its negatives remain local to each GPU. Validation, logging, and checkpoint
+writes run only on rank 0.
+
 ## Dataset preparation
 
 Prepare line-aligned melody and audio segments:
