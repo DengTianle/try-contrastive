@@ -456,6 +456,9 @@ def train_one_epoch(
                 melody_attention_mask=batch["melody_attention_mask"],
                 candidate_input_values=candidate_input_values,
                 candidate_audio_attention_mask=batch["candidate_audio_attention_mask"],
+                candidate_note_onsets=batch["candidate_note_onsets"],
+                candidate_note_durations=batch["candidate_note_durations"],
+                candidate_note_attention_mask=batch["candidate_note_attention_mask"],
             )
             hard_loss, hard_logits = grouped_info_nce_loss(
                 melody_embeddings=melody_embeddings,
@@ -581,6 +584,9 @@ def evaluate(
                 melody_attention_mask=batch["melody_attention_mask"],
                 candidate_input_values=batch["candidate_input_values"],
                 candidate_audio_attention_mask=batch["candidate_audio_attention_mask"],
+                candidate_note_onsets=batch["candidate_note_onsets"],
+                candidate_note_durations=batch["candidate_note_durations"],
+                candidate_note_attention_mask=batch["candidate_note_attention_mask"],
             )
             loss, logits = grouped_info_nce_loss(
                 melody_embeddings=melody_embeddings,

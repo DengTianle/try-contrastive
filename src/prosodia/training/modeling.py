@@ -4,7 +4,7 @@ import torch
 from torch import nn
 
 from prosodia.melody_encoder import MELODY_FEATURE_DIM, MelodyTransformerEncoder
-from prosodia.prosody_encoder import HubertProsodyEncoder
+from prosodia.prosody_encoder import HubertEncoderOutput, HubertProsodyEncoder
 
 
 class MelodyAudioContrastiveModel(nn.Module):
@@ -51,10 +51,18 @@ class MelodyAudioContrastiveModel(nn.Module):
         self,
         input_values: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        note_onsets: torch.Tensor | None = None,
+        note_durations: torch.Tensor | None = None,
+        note_attention_mask: torch.Tensor | None = None,
+        return_note_embeddings: bool = False,
+    ) -> torch.Tensor | HubertEncoderOutput:
         return self.audio_encoder(
             input_values=input_values,
             attention_mask=attention_mask,
+            note_onsets=note_onsets,
+            note_durations=note_durations,
+            note_attention_mask=note_attention_mask,
+            return_note_embeddings=return_note_embeddings,
         )
 
     def forward(
@@ -63,6 +71,9 @@ class MelodyAudioContrastiveModel(nn.Module):
         candidate_input_values: torch.Tensor,
         melody_attention_mask: torch.Tensor | None = None,
         candidate_audio_attention_mask: torch.Tensor | None = None,
+        candidate_note_onsets: torch.Tensor | None = None,
+        candidate_note_durations: torch.Tensor | None = None,
+        candidate_note_attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         melody_embeddings = self.encode_melody(
             melody_features=melody_features,
@@ -77,9 +88,38 @@ class MelodyAudioContrastiveModel(nn.Module):
                 batch_size * num_candidates,
                 num_samples,
             )
+        flat_note_onsets = None
+        flat_note_durations = None
+        flat_note_mask = None
+        note_inputs = (
+            candidate_note_onsets,
+            candidate_note_durations,
+            candidate_note_attention_mask,
+        )
+        if all(value is not None for value in note_inputs):
+            flat_note_onsets = candidate_note_onsets.reshape(
+                batch_size * num_candidates,
+                -1,
+            )
+            flat_note_durations = candidate_note_durations.reshape(
+                batch_size * num_candidates,
+                -1,
+            )
+            flat_note_mask = candidate_note_attention_mask.reshape(
+                batch_size * num_candidates,
+                -1,
+            )
+        elif any(value is not None for value in note_inputs):
+            raise ValueError(
+                "Candidate note onsets, durations, and attention mask must be "
+                "provided together"
+            )
         flat_audio_embeddings = self.encode_audio(
             input_values=flat_audio,
             attention_mask=flat_audio_mask,
+            note_onsets=flat_note_onsets,
+            note_durations=flat_note_durations,
+            note_attention_mask=flat_note_mask,
         )
         candidate_audio_embeddings = flat_audio_embeddings.reshape(batch_size, num_candidates, -1)
         return melody_embeddings, candidate_audio_embeddings

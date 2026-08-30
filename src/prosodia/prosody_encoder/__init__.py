@@ -1,3 +1,3 @@
-from .modeling import HubertEncoder, HubertProsodyEncoder
+from .modeling import HubertEncoder, HubertEncoderOutput, HubertProsodyEncoder
 
-__all__ = ["HubertEncoder", "HubertProsodyEncoder"]
+__all__ = ["HubertEncoder", "HubertEncoderOutput", "HubertProsodyEncoder"]

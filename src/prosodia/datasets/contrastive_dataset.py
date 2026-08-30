@@ -447,7 +447,7 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
             target = order.index(0)
             candidate_rows = [candidate_rows[index] for index in order]
         melody = load_melody(anchor["melody_path"], self.melody_config)
-        candidate_audio = self._load_candidate_audio(
+        candidate_audio, candidate_windows = self._load_candidate_audio(
             positive=positive,
             candidate_rows=candidate_rows,
             protected_rows=group["protected_rows"],
@@ -456,6 +456,15 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
             candidate_audio,
             minimum_samples=self.audio_config.minimum_input_samples,
         )
+        candidate_note_timings = [
+            self._candidate_note_timing(row, window)
+            for row, window in zip(candidate_rows, candidate_windows)
+        ]
+        (
+            candidate_note_onsets,
+            candidate_note_durations,
+            candidate_note_attention_mask,
+        ) = pad_candidate_notes(candidate_note_timings)
         candidate_ids = self._candidate_ids(anchor, positive, candidate_rows)
         candidate_types = self._candidate_types(anchor, positive, candidate_rows)
 
@@ -470,6 +479,9 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
             ),
             "candidate_input_values": candidate_input_values,
             "candidate_audio_attention_mask": candidate_audio_attention_mask,
+            "candidate_note_onsets": candidate_note_onsets,
+            "candidate_note_durations": candidate_note_durations,
+            "candidate_note_attention_mask": candidate_note_attention_mask,
             "candidate_window_seconds": torch.tensor(
                 [audio.shape[0] / self.audio_config.sample_rate for audio in candidate_audio],
                 dtype=torch.float32,
@@ -529,7 +541,7 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         positive: dict[str, str],
         candidate_rows: list[dict[str, str]],
         protected_rows: list[dict[str, str]],
-    ) -> list[torch.Tensor]:
+    ) -> tuple[list[torch.Tensor], list[tuple[int, int]]]:
         import soundfile as sf
 
         loaded_by_path: dict[str, tuple[np.ndarray, int]] = {}
@@ -564,13 +576,44 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
                 audio_array = np.mean(audio_array, axis=1, dtype=np.float32)
             loaded_by_path[audio_path] = (audio_array, read_start)
 
-        return [
+        candidate_windows = [
+            windows_by_sample_id[audio_sample_id(row)] for row in candidate_rows
+        ]
+        candidate_audio = [
             self._crop_loaded_audio(
                 *loaded_by_path[str(Path(row["audio_path"]))],
-                *windows_by_sample_id[audio_sample_id(row)],
+                *window,
             )
-            for row in candidate_rows
+            for row, window in zip(candidate_rows, candidate_windows)
         ]
+        return candidate_audio, candidate_windows
+
+    def _candidate_note_timing(
+        self,
+        row: dict[str, str],
+        window: tuple[int, int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the row's annotated notes clipped and shifted into an audio window."""
+
+        melody = load_melody(row["melody_path"], self.melody_config)
+        sample_rate = self.audio_config.sample_rate
+        window_start_seconds = window[0] / sample_rate
+        window_end_seconds = (window[0] + window[1]) / sample_rate
+        note_starts = melody["onset_seconds"] + audio_start_seconds(row)
+        note_ends = note_starts + melody["duration_seconds"]
+        clipped_starts = note_starts.clamp(
+            min=window_start_seconds,
+            max=window_end_seconds,
+        )
+        clipped_ends = note_ends.clamp(
+            min=window_start_seconds,
+            max=window_end_seconds,
+        )
+        valid = clipped_ends > clipped_starts
+        return (
+            clipped_starts[valid] - window_start_seconds,
+            clipped_ends[valid] - clipped_starts[valid],
+        )
 
     def _candidate_audio_window(
         self,
@@ -696,6 +739,28 @@ def pad_candidate_audio(
     return values, attention_mask
 
 
+def pad_candidate_notes(
+    candidate_note_timings: list[tuple[torch.Tensor, torch.Tensor]],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if not candidate_note_timings:
+        raise ValueError("Expected note timing for at least one audio candidate")
+    max_notes = max(onsets.shape[0] for onsets, _ in candidate_note_timings)
+    num_candidates = len(candidate_note_timings)
+    onsets = torch.zeros(num_candidates, max_notes)
+    durations = torch.zeros(num_candidates, max_notes)
+    attention_mask = torch.zeros(num_candidates, max_notes, dtype=torch.bool)
+    for candidate_index, (candidate_onsets, candidate_durations) in enumerate(
+        candidate_note_timings
+    ):
+        if candidate_onsets.shape != candidate_durations.shape:
+            raise ValueError("Candidate note onsets and durations must have equal shapes")
+        note_count = candidate_onsets.shape[0]
+        onsets[candidate_index, :note_count] = candidate_onsets
+        durations[candidate_index, :note_count] = candidate_durations
+        attention_mask[candidate_index, :note_count] = True
+    return onsets, durations, attention_mask
+
+
 class MelodyOnlyDataset(Dataset[dict[str, Any]]):
     """Manifest-backed melody segments without loading paired audio."""
 
@@ -781,6 +846,9 @@ def grouped_contrastive_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     max_candidates = max(item["candidate_input_values"].shape[0] for item in batch)
     batch_size = len(batch)
     max_samples = max(item["candidate_input_values"].shape[-1] for item in batch)
+    max_candidate_notes = max(
+        item["candidate_note_onsets"].shape[-1] for item in batch
+    )
 
     candidate_input_values = torch.zeros(batch_size, max_candidates, max_samples)
     candidate_audio_attention_mask = torch.zeros(
@@ -791,6 +859,18 @@ def grouped_contrastive_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
     )
     candidate_mask = torch.zeros(batch_size, max_candidates, dtype=torch.bool)
     candidate_window_seconds = torch.zeros(batch_size, max_candidates)
+    candidate_note_onsets = torch.zeros(
+        batch_size,
+        max_candidates,
+        max_candidate_notes,
+    )
+    candidate_note_durations = torch.zeros_like(candidate_note_onsets)
+    candidate_note_attention_mask = torch.zeros(
+        batch_size,
+        max_candidates,
+        max_candidate_notes,
+        dtype=torch.bool,
+    )
 
     for batch_index, item in enumerate(batch):
         num_candidates = item["candidate_input_values"].shape[0]
@@ -813,6 +893,22 @@ def grouped_contrastive_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         candidate_window_seconds[batch_index, :num_candidates] = item[
             "candidate_window_seconds"
         ]
+        note_count = item["candidate_note_onsets"].shape[-1]
+        candidate_note_onsets[
+            batch_index,
+            :num_candidates,
+            :note_count,
+        ] = item["candidate_note_onsets"]
+        candidate_note_durations[
+            batch_index,
+            :num_candidates,
+            :note_count,
+        ] = item["candidate_note_durations"]
+        candidate_note_attention_mask[
+            batch_index,
+            :num_candidates,
+            :note_count,
+        ] = item["candidate_note_attention_mask"]
 
     melody_batch = melody_only_collate(batch)
 
@@ -824,6 +920,9 @@ def grouped_contrastive_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "melody_note_durations": melody_batch["melody_note_durations"],
         "candidate_input_values": candidate_input_values,
         "candidate_audio_attention_mask": candidate_audio_attention_mask,
+        "candidate_note_onsets": candidate_note_onsets,
+        "candidate_note_durations": candidate_note_durations,
+        "candidate_note_attention_mask": candidate_note_attention_mask,
         "candidate_mask": candidate_mask,
         "candidate_window_seconds": candidate_window_seconds,
         "target": torch.stack([item["target"] for item in batch]),

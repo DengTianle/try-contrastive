@@ -111,6 +111,9 @@ def extract_embeddings(
                 melody_attention_mask=batch["melody_attention_mask"],
                 candidate_input_values=batch["candidate_input_values"],
                 candidate_audio_attention_mask=batch["candidate_audio_attention_mask"],
+                candidate_note_onsets=batch["candidate_note_onsets"],
+                candidate_note_durations=batch["candidate_note_durations"],
+                candidate_note_attention_mask=batch["candidate_note_attention_mask"],
             )
             batch_audio_embeddings = positive_audio_embeddings(
                 candidate_audio_embeddings=candidate_audio_embeddings,

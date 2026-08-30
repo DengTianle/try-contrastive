@@ -108,6 +108,14 @@ notes and audio waveforms are padded per batch and masked during training, pretr
 diagnostics, and evaluation. Prepared frame-level `.npz` files are incompatible; rerun
 the preparation command after upgrading.
 
+The audio tower uses the note boundaries from each audio candidate, including repeated
+positives and same-song negatives. HuBERT frames whose centers fall inside a note are
+mean-pooled into one projected note embedding; those note embeddings are then equally
+mean-pooled into the normalized vector used by contrastive training. Notes are clipped
+and shifted when a candidate window is cropped or extended. The audio encoder can also
+return the projected note sequence and its mask with `return_note_embeddings=True` for
+downstream note-level tasks.
+
 Contrastive training defaults to `--candidate-window-policy match-positive`. Within
 each retrieval set, every audio candidate is presented at the selected positive's
 duration. A shorter negative is extended with real surrounding song context, while a

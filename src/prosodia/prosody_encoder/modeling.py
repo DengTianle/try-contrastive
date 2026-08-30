@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+
+@dataclass
+class HubertEncoderOutput:
+    """Clip embedding plus the projected note sequence used to construct it."""
+
+    embeddings: torch.Tensor
+    note_embeddings: torch.Tensor
+    note_attention_mask: torch.Tensor
 
 
 def normalize_waveforms(
@@ -79,6 +90,7 @@ class HubertEncoder(nn.Module):
         self.normalize_input_waveforms = bool(
             getattr(feature_extractor, "do_normalize", False)
         )
+        self.sampling_rate = int(getattr(feature_extractor, "sampling_rate", 16_000))
         self.hubert_uses_attention_mask = bool(
             getattr(feature_extractor, "return_attention_mask", False)
         )
@@ -253,22 +265,139 @@ class HubertEncoder(nn.Module):
         self._apply_hubert_module_modes(mode)
         return self
 
-    def _pool_hidden_states(
+    def _feature_frame_centers(
+        self,
+        num_frames: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Return HuBERT feature-frame centers measured in waveform samples."""
+
+        kernels = getattr(self.hubert.config, "conv_kernel", None)
+        strides = getattr(self.hubert.config, "conv_stride", None)
+        if kernels is None or strides is None or len(kernels) != len(strides):
+            raise ValueError("HuBERT config must define matching conv_kernel/conv_stride")
+
+        receptive_field = 1
+        total_stride = 1
+        for kernel, stride in zip(kernels, strides):
+            receptive_field += (int(kernel) - 1) * total_stride
+            total_stride *= int(stride)
+        first_center = (receptive_field - 1) / 2.0
+        return (
+            torch.arange(num_frames, device=device, dtype=dtype) * total_stride
+            + first_center
+        )
+
+    def _pool_frames_to_notes(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None,
-    ) -> torch.Tensor:
-        if attention_mask is None:
-            return hidden_states.mean(dim=1)
+        note_onsets: torch.Tensor,
+        note_durations: torch.Tensor,
+        note_attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if note_onsets.shape != note_durations.shape:
+            raise ValueError("note_onsets and note_durations must have equal shapes")
+        if note_attention_mask.shape != note_onsets.shape:
+            raise ValueError("note_attention_mask must match the note timing shape")
+        if note_onsets.ndim != 2 or note_onsets.shape[0] != hidden_states.shape[0]:
+            raise ValueError(
+                "Expected note timing with shape [batch, notes], got "
+                f"{note_onsets.shape}"
+            )
 
-        feature_attention_mask = self.hubert._get_feature_vector_attention_mask(
+        if attention_mask is None:
+            feature_attention_mask = torch.ones(
+                hidden_states.shape[:2],
+                device=hidden_states.device,
+                dtype=torch.bool,
+            )
+        else:
+            feature_attention_mask = self.hubert._get_feature_vector_attention_mask(
+                hidden_states.shape[1],
+                attention_mask,
+            ).to(device=hidden_states.device, dtype=torch.bool)
+
+        timing_dtype = hidden_states.dtype
+        if timing_dtype in {torch.float16, torch.bfloat16}:
+            timing_dtype = torch.float32
+        frame_centers = self._feature_frame_centers(
             hidden_states.shape[1],
-            attention_mask,
+            device=hidden_states.device,
+            dtype=timing_dtype,
         )
-        mask = feature_attention_mask.to(hidden_states.device).unsqueeze(-1)
-        summed = (hidden_states * mask).sum(dim=1)
-        lengths = mask.sum(dim=1).clamp_min(1)
-        return summed / lengths
+        starts = note_onsets.to(device=hidden_states.device, dtype=timing_dtype)
+        ends = starts + note_durations.to(
+            device=hidden_states.device,
+            dtype=timing_dtype,
+        )
+        valid_notes = note_attention_mask.to(
+            device=hidden_states.device,
+            dtype=torch.bool,
+        ) & (ends > starts)
+        frame_membership = (
+            (frame_centers[None, None, :] >= starts[:, :, None] * self.sampling_rate)
+            & (frame_centers[None, None, :] < ends[:, :, None] * self.sampling_rate)
+            & feature_attention_mask[:, None, :]
+            & valid_notes[:, :, None]
+        )
+
+        # Very short notes can fall between adjacent HuBERT frame centers. Assign
+        # their closest valid frame so every annotated note contributes once.
+        notes_without_frames = valid_notes & ~frame_membership.any(dim=-1)
+        if bool(notes_without_frames.any()):
+            midpoints = (starts + ends) * (0.5 * self.sampling_rate)
+            distances = (frame_centers[None, None, :] - midpoints[:, :, None]).abs()
+            distances = distances.masked_fill(
+                ~feature_attention_mask[:, None, :],
+                torch.inf,
+            )
+            nearest_frames = distances.argmin(dim=-1)
+            nearest_membership = F.one_hot(
+                nearest_frames,
+                num_classes=hidden_states.shape[1],
+            ).to(dtype=torch.bool)
+            frame_membership = frame_membership | (
+                nearest_membership
+                & feature_attention_mask[:, None, :]
+                & notes_without_frames[:, :, None]
+            )
+
+        pooled_note_mask = valid_notes & frame_membership.any(dim=-1)
+        waveform_mask = feature_attention_mask.any(dim=-1)
+        missing_note_rows = waveform_mask & ~pooled_note_mask.any(dim=-1)
+        if bool(missing_note_rows.any()):
+            raise ValueError("Every non-empty waveform must contain an annotated note")
+
+        weights = frame_membership.to(dtype=hidden_states.dtype)
+        note_sums = torch.einsum("bnt,bth->bnh", weights, hidden_states)
+        frame_counts = weights.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        note_hidden_states = note_sums / frame_counts
+        note_hidden_states = note_hidden_states * pooled_note_mask.unsqueeze(-1)
+        return note_hidden_states, pooled_note_mask
+
+    def _default_single_note_timing(
+        self,
+        input_values: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Preserve compatibility by treating an unannotated waveform as one note."""
+
+        if attention_mask is None:
+            sample_counts = input_values.new_full(
+                (input_values.shape[0],),
+                input_values.shape[1],
+            )
+        else:
+            sample_counts = attention_mask.to(
+                device=input_values.device,
+                dtype=input_values.dtype,
+            ).sum(dim=-1)
+        onsets = input_values.new_zeros(input_values.shape[0], 1)
+        durations = sample_counts[:, None] / self.sampling_rate
+        note_mask = sample_counts[:, None] > 0
+        return onsets, durations, note_mask
 
     def _prepare_input_values(
         self,
@@ -293,8 +422,23 @@ class HubertEncoder(nn.Module):
         self,
         input_values: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
+        note_onsets: torch.Tensor | None = None,
+        note_durations: torch.Tensor | None = None,
+        note_attention_mask: torch.Tensor | None = None,
         normalize: bool = True,
-    ) -> torch.Tensor:
+        return_note_embeddings: bool = False,
+    ) -> torch.Tensor | HubertEncoderOutput:
+        note_inputs = (note_onsets, note_durations, note_attention_mask)
+        if all(value is None for value in note_inputs):
+            note_onsets, note_durations, note_attention_mask = (
+                self._default_single_note_timing(input_values, attention_mask)
+            )
+        elif any(value is None for value in note_inputs):
+            raise ValueError(
+                "note_onsets, note_durations, and note_attention_mask must be "
+                "provided together"
+            )
+
         prepared_input_values = self._prepare_input_values(input_values, attention_mask)
         hubert_attention_mask = (
             attention_mask if self.hubert_uses_attention_mask else None
@@ -311,10 +455,25 @@ class HubertEncoder(nn.Module):
                     attention_mask=hubert_attention_mask,
                 )
         hidden_states = self.dropout(outputs.last_hidden_state)
-        pooled = self._pool_hidden_states(hidden_states, attention_mask)
-        embeddings = self.projection(pooled)
+        note_hidden_states, pooled_note_mask = self._pool_frames_to_notes(
+            hidden_states,
+            attention_mask,
+            note_onsets,
+            note_durations,
+            note_attention_mask,
+        )
+        note_embeddings = self.projection(note_hidden_states)
+        note_embeddings = note_embeddings * pooled_note_mask.unsqueeze(-1)
+        note_counts = pooled_note_mask.sum(dim=-1, keepdim=True).clamp_min(1)
+        embeddings = note_embeddings.sum(dim=1) / note_counts
         if normalize:
             embeddings = F.normalize(embeddings, dim=-1)
+        if return_note_embeddings:
+            return HubertEncoderOutput(
+                embeddings=embeddings,
+                note_embeddings=note_embeddings,
+                note_attention_mask=pooled_note_mask,
+            )
         return embeddings
 
 

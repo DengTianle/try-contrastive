@@ -96,6 +96,27 @@ class CandidateWindowTest(unittest.TestCase):
         batch = grouped_contrastive_collate([item])
         self.assertTrue(torch.all(batch["candidate_window_seconds"][0, :3] == 2.0))
 
+        timing_by_id = {
+            row["sample_id"]: (
+                item["candidate_note_onsets"][index][
+                    item["candidate_note_attention_mask"][index]
+                ],
+                item["candidate_note_durations"][index][
+                    item["candidate_note_attention_mask"][index]
+                ],
+            )
+            for index, row in enumerate(item["metadata"])
+        }
+        torch.testing.assert_close(timing_by_id["long"][0], torch.tensor([0.0]))
+        torch.testing.assert_close(timing_by_id["long"][1], torch.tensor([2.0]))
+        torch.testing.assert_close(timing_by_id["anchor"][0], torch.tensor([0.0]))
+        torch.testing.assert_close(timing_by_id["anchor"][1], torch.tensor([2.0]))
+        torch.testing.assert_close(timing_by_id["short"][0], torch.tensor([0.5]))
+        torch.testing.assert_close(timing_by_id["short"][1], torch.tensor([1.0]))
+
+        self.assertEqual(batch["candidate_note_onsets"].shape, (1, 3, 1))
+        self.assertTrue(batch["candidate_note_attention_mask"][0, :3].all())
+
     def test_segment_policy_preserves_complete_prepared_intervals(self) -> None:
         dataset = GroupedContrastiveDataset(
             self.manifest_path,
