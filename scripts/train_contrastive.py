@@ -835,12 +835,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--candidate-window-policy",
-        choices=["line", "match-positive"],
+        choices=["line", "segment", "match-positive"],
         default="match-positive",
         help=(
             "Audio context shown to the model. The default makes every candidate "
             "match the selected positive's duration: shorter negatives receive "
-            "random surrounding context and longer negatives are randomly cropped."
+            "random surrounding context and longer negatives are randomly cropped. "
+            "Use segment (or the legacy name line) to preserve every complete "
+            "prepared candidate interval."
         ),
     )
     parser.add_argument(
@@ -882,7 +884,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional minimum difference between same-song segment start times. "
-            "By default, all non-overlapping DALI line segments are eligible negatives."
+            "By default, all non-overlapping prepared segments are eligible negatives."
         ),
     )
     parser.add_argument("--train-split", default="train")

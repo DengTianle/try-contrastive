@@ -16,7 +16,7 @@ from prosodia.melody_encoder import MELODY_FEATURE_DIM, encode_note_sequence
 
 
 POSITIVE_VARIANT_POLICIES = {"self", "any", "retexted", "retexted-first"}
-CANDIDATE_WINDOW_POLICIES = {"line", "match-positive"}
+CANDIDATE_WINDOW_POLICIES = {"line", "segment", "match-positive"}
 
 
 @dataclass(frozen=True)
@@ -361,7 +361,7 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         candidate: dict[str, str],
         protected_rows: list[dict[str, str]],
     ) -> bool:
-        if self.candidate_window_policy == "line":
+        if self.candidate_window_policy in {"line", "segment"}:
             return True
         target_samples = self._segment_sample_count(positive)
         if self._segment_sample_count(candidate) >= target_samples:
@@ -581,7 +581,7 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
     ) -> tuple[int, int]:
         candidate_start, candidate_end = self._segment_sample_bounds(candidate)
         candidate_samples = self._segment_sample_count(candidate)
-        if self.candidate_window_policy == "line":
+        if self.candidate_window_policy in {"line", "segment"}:
             return max(candidate_start, 0), candidate_samples
 
         target_samples = self._segment_sample_count(positive)

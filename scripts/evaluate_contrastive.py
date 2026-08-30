@@ -487,11 +487,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--candidate-window-policy",
-        choices=["line", "match-positive"],
+        choices=["line", "segment", "match-positive"],
         default=None,
         help=(
             "Override the checkpoint's candidate context policy. Defaults to the "
-            "checkpoint setting, or line for older checkpoints."
+            "checkpoint setting, or line for older checkpoints. segment and line "
+            "both preserve the complete prepared interval."
         ),
     )
     offset_group = parser.add_mutually_exclusive_group()

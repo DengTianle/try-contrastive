@@ -96,6 +96,25 @@ class CandidateWindowTest(unittest.TestCase):
         batch = grouped_contrastive_collate([item])
         self.assertTrue(torch.all(batch["candidate_window_seconds"][0, :3] == 2.0))
 
+    def test_segment_policy_preserves_complete_prepared_intervals(self) -> None:
+        dataset = GroupedContrastiveDataset(
+            self.manifest_path,
+            split="train",
+            candidate_window_policy="segment",
+            randomize_candidate_windows=False,
+        )
+        anchor_index = next(
+            index
+            for index, group in enumerate(dataset.groups)
+            if group["anchor"]["sample_id"] == "anchor"
+        )
+        item = dataset[anchor_index]
+
+        self.assertEqual(
+            sorted(item["candidate_window_seconds"].tolist()),
+            [1.0, 2.0, 3.0],
+        )
+
     def test_negative_is_removed_when_context_would_cross_positive_class(self) -> None:
         repeat = self._row("repeat", 7.5, 9.0, melody_class=2, lyric_class=4)
         squeezed = self._row("squeezed", 6.2, 7.0, melody_class=4, lyric_class=5)

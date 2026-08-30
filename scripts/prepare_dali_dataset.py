@@ -271,10 +271,13 @@ def stable_sample_id(
     dali_id: str,
     start_seconds: float,
     line_index: int | None = None,
+    end_line_index: int | None = None,
 ) -> str:
     identity = f"{dali_id}:{start_seconds:.3f}"
     if line_index is not None:
         identity = f"{dali_id}:{start_seconds:.6f}:{line_index}"
+    if end_line_index is not None and end_line_index != line_index:
+        identity = f"{identity}:{end_line_index}"
     digest = hashlib.sha1(identity.encode("utf-8")).hexdigest()[:10]
     return f"{dali_id}_{int(round(start_seconds * 1000)):09d}_{digest}"
 
@@ -496,6 +499,208 @@ def segment_quality_skip_reason(
     return None
 
 
+def _composite_grouping_signature(
+    lines: list[dict[str, Any]],
+    key: str,
+) -> tuple[int, ...] | None:
+    values: list[int] = []
+    for line in lines:
+        value = line.get("repeat_grouping", {}).get(key)
+        if value is None:
+            return None
+        values.append(int(value))
+    return tuple(values)
+
+
+def _shared_parent_index(lines: list[dict[str, Any]]) -> int | None:
+    parent_indices = {
+        line.get("repeat_grouping", {}).get("parent_index") for line in lines
+    }
+    if len(parent_indices) != 1:
+        return None
+    parent_index = next(iter(parent_indices))
+    return int(parent_index) if parent_index is not None else None
+
+
+def _combined_quality_flags(lines: list[dict[str, Any]]) -> list[str]:
+    return sorted(
+        {
+            str(flag)
+            for line in lines
+            for flag in line.get("repeat_grouping", {}).get("quality_flags", [])
+        }
+    )
+
+
+def _assign_composite_class_ids(
+    windows: list[dict[str, Any]],
+    *,
+    preserve_single_line_ids: bool,
+) -> None:
+    """Convert line-class or text tuples into song-local segment class ids."""
+
+    for signature_key, class_key in (
+        ("_lyric_class_signature", "lyric_class"),
+        ("_melody_class_signature", "melody_class"),
+    ):
+        ids_by_signature: dict[tuple[Any, ...], int] = {}
+        for window in windows:
+            signature = window.pop(signature_key)
+            if signature is None:
+                window[class_key] = None
+                continue
+            if preserve_single_line_ids:
+                window[class_key] = signature[0]
+                continue
+            if signature not in ids_by_signature:
+                ids_by_signature[signature] = len(ids_by_signature)
+            window[class_key] = ids_by_signature[signature]
+
+
+def build_line_windows(
+    lines: list[dict[str, Any]],
+    notes: list[dict[str, Any]],
+    audio_duration: float,
+    *,
+    lines_per_segment: int,
+    segment_stride_lines: int,
+    max_line_seconds: float,
+    min_line_notes: int,
+    max_window_seconds: float = 0.0,
+    trim_repeated_text: bool = True,
+) -> tuple[list[dict[str, Any]], Counter[str]]:
+    """Build fixed-size windows from consecutive eligible lyric-line occurrences.
+
+    Line quality gates are applied before windowing. An ineligible line ends the
+    current run, so a multi-line segment never bridges a discarded occurrence.
+    Repeated text is trimmed only for the legacy one-line case; multi-line windows
+    retain every occurrence to preserve song structure and temporal continuity.
+    """
+
+    if lines_per_segment <= 0:
+        raise ValueError("lines_per_segment must be positive")
+    if segment_stride_lines <= 0:
+        raise ValueError("segment_stride_lines must be positive")
+    if max_line_seconds < 0.0:
+        raise ValueError("max_line_seconds must be nonnegative")
+    if min_line_notes < 0:
+        raise ValueError("min_line_notes must be nonnegative")
+    if max_window_seconds < 0.0:
+        raise ValueError("max_window_seconds must be nonnegative")
+
+    clipped_lines, skipped = unique_line_segments(
+        lines,
+        audio_duration=audio_duration,
+        trim_repeated_text=trim_repeated_text and lines_per_segment == 1,
+    )
+
+    eligible_runs: list[list[dict[str, Any]]] = []
+    current_run: list[dict[str, Any]] = []
+    for line in clipped_lines:
+        if current_run and int(line["line_index"]) != int(
+            current_run[-1]["line_index"]
+        ) + 1:
+            eligible_runs.append(current_run)
+            current_run = []
+        line_seconds = float(line["segment_seconds"])
+        line_note_count = count_segment_notes(
+            notes,
+            start_seconds=float(line["start_seconds"]),
+            segment_seconds=line_seconds,
+        )
+        skip_reason = segment_quality_skip_reason(
+            segment_seconds=line_seconds,
+            note_count=line_note_count,
+            max_segment_seconds=max_line_seconds,
+            min_segment_notes=min_line_notes,
+        )
+        if skip_reason is not None:
+            skipped[skip_reason] += 1
+            if current_run:
+                eligible_runs.append(current_run)
+                current_run = []
+            continue
+        current_run.append({**line, "line_note_count": line_note_count})
+    if current_run:
+        eligible_runs.append(current_run)
+
+    windows: list[dict[str, Any]] = []
+    for run in eligible_runs:
+        for start in range(
+            0,
+            len(run) - lines_per_segment + 1,
+            segment_stride_lines,
+        ):
+            segment_lines = run[start : start + lines_per_segment]
+            start_seconds = float(segment_lines[0]["start_seconds"])
+            end_seconds = float(segment_lines[-1]["end_seconds"])
+            segment_seconds = end_seconds - start_seconds
+            if max_window_seconds > 0.0 and segment_seconds > max_window_seconds:
+                skipped["window_too_long"] += 1
+                continue
+
+            line_indices = [int(line["line_index"]) for line in segment_lines]
+            lyric_signature: tuple[Any, ...] | None = _composite_grouping_signature(
+                segment_lines,
+                "lyric_class",
+            )
+            if lyric_signature is None and lines_per_segment > 1:
+                lyric_signature = tuple(
+                    str(line["normalized_text"]) for line in segment_lines
+                )
+            melody_signature = _composite_grouping_signature(
+                segment_lines,
+                "melody_class",
+            )
+            windows.append(
+                {
+                    "start_seconds": start_seconds,
+                    "end_seconds": end_seconds,
+                    "segment_seconds": segment_seconds,
+                    "line_index": line_indices[0],
+                    "line_start_index": line_indices[0],
+                    "line_end_index": line_indices[-1],
+                    "line_indices": line_indices,
+                    "line_count": len(segment_lines),
+                    "line_text": "\n".join(str(line["text"]) for line in segment_lines),
+                    "line_note_counts": [
+                        int(line["line_note_count"]) for line in segment_lines
+                    ],
+                    "_lyric_class_signature": lyric_signature,
+                    "_melody_class_signature": melody_signature,
+                    "parent_index": _shared_parent_index(segment_lines),
+                    "group_quality_flags": _combined_quality_flags(segment_lines),
+                    "transposition_to_representative": (
+                        segment_lines[0]
+                        .get("repeat_grouping", {})
+                        .get("transposition_to_representative")
+                        if lines_per_segment == 1
+                        else None
+                    ),
+                    "onset_mae_to_representative": (
+                        segment_lines[0]
+                        .get("repeat_grouping", {})
+                        .get("onset_mae_to_representative")
+                        if lines_per_segment == 1
+                        else None
+                    ),
+                    "duration_mae_to_representative": (
+                        segment_lines[0]
+                        .get("repeat_grouping", {})
+                        .get("duration_mae_to_representative")
+                        if lines_per_segment == 1
+                        else None
+                    ),
+                }
+            )
+
+    _assign_composite_class_ids(
+        windows,
+        preserve_single_line_ids=lines_per_segment == 1,
+    )
+    return windows, skipped
+
+
 def write_melody_npz(
     melody_dir: Path,
     sample_id: str,
@@ -539,6 +744,14 @@ def row_for_segment(
         "voiced_ratio": f"{segment['voiced_ratio']:.6f}",
         "note_count": str(segment["note_count"]),
         "line_index": str(segment["line_index"]),
+        "line_start_index": str(segment["line_start_index"]),
+        "line_end_index": str(segment["line_end_index"]),
+        "line_indices": json.dumps(segment["line_indices"], separators=(",", ":")),
+        "line_count": str(segment["line_count"]),
+        "line_note_counts": json.dumps(
+            segment["line_note_counts"],
+            separators=(",", ":"),
+        ),
         "line_text": segment["line_text"],
         "lyric_class": optional_manifest_value(segment.get("lyric_class")),
         "melody_class": optional_manifest_value(segment.get("melody_class")),
@@ -574,7 +787,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Prepare DALI vocal-melody/audio contrastive data. The script writes one "
-            "canonical note-level melody .npz per retained DALI lyric-line occurrence "
+            "canonical note-level melody .npz per retained fixed-size lyric-line window "
             "and a segment manifest."
         )
     )
@@ -614,16 +827,47 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tracks", type=int, default=0, help="0 means no track limit.")
     parser.add_argument("--max-segments", type=int, default=0, help="0 means no segment limit.")
     parser.add_argument(
-        "--max-segment-seconds",
-        type=float,
-        default=10.0,
-        help="Discard line segments longer than this duration. 0 disables the limit.",
+        "--lines-per-segment",
+        type=int,
+        default=1,
+        help="Number of consecutive eligible DALI lyric lines in each segment.",
     )
     parser.add_argument(
+        "--segment-stride-lines",
+        type=int,
+        default=None,
+        help=(
+            "Line stride between segment starts. Defaults to --lines-per-segment "
+            "for non-overlapping windows."
+        ),
+    )
+    parser.add_argument(
+        "--max-line-seconds",
+        "--max-segment-seconds",
+        dest="max_segment_seconds",
+        type=float,
+        default=10.0,
+        help=(
+            "Discard an individual constituent line longer than this duration. "
+            "0 disables the per-line limit."
+        ),
+    )
+    parser.add_argument(
+        "--min-line-notes",
         "--min-segment-notes",
+        dest="min_segment_notes",
         type=int,
         default=3,
-        help="Discard line segments with fewer than this many overlapping notes.",
+        help="Discard an individual line with fewer than this many overlapping notes.",
+    )
+    parser.add_argument(
+        "--max-window-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Discard a complete multi-line window longer than this duration. "
+            "0 disables the whole-window limit."
+        ),
     )
     parser.add_argument(
         "--repeat-groupings",
@@ -665,9 +909,17 @@ def main() -> None:
         args.prepared_audio_dir = args.output_dir / f"audio_{args.sample_rate // 1000}k"
     args.prepared_audio_dir = resolve_user_path(args.prepared_audio_dir)
     if args.max_segment_seconds < 0:
-        raise SystemExit("--max-segment-seconds must be nonnegative")
+        raise SystemExit("--max-line-seconds must be nonnegative")
     if args.min_segment_notes < 0:
-        raise SystemExit("--min-segment-notes must be nonnegative")
+        raise SystemExit("--min-line-notes must be nonnegative")
+    if args.lines_per_segment <= 0:
+        raise SystemExit("--lines-per-segment must be positive")
+    if args.segment_stride_lines is None:
+        args.segment_stride_lines = args.lines_per_segment
+    if args.segment_stride_lines <= 0:
+        raise SystemExit("--segment-stride-lines must be positive")
+    if args.max_window_seconds < 0:
+        raise SystemExit("--max-window-seconds must be nonnegative")
     if args.train_ratio <= 0 or args.val_ratio < 0 or args.train_ratio + args.val_ratio >= 1:
         raise SystemExit("--train-ratio and --val-ratio must leave a positive test split")
 
@@ -799,29 +1051,26 @@ def main() -> None:
     all_segments: list[dict[str, Any]] = []
     skipped_segments = Counter()
     for track in usable_tracks:
-        line_segments, line_skips = unique_line_segments(
+        line_windows, line_skips = build_line_windows(
             track["lines"],
+            notes=track["notes"],
             audio_duration=track["duration"],
+            lines_per_segment=args.lines_per_segment,
+            segment_stride_lines=args.segment_stride_lines,
+            max_line_seconds=args.max_segment_seconds,
+            min_line_notes=args.min_segment_notes,
+            max_window_seconds=args.max_window_seconds,
             trim_repeated_text=not track["has_repeat_groupings"],
         )
         skipped_segments.update(line_skips)
-        for line in line_segments:
-            start_seconds = line["start_seconds"]
-            segment_seconds = line["segment_seconds"]
+        for window in line_windows:
+            start_seconds = window["start_seconds"]
+            segment_seconds = window["segment_seconds"]
             note_count = count_segment_notes(
                 track["notes"],
                 start_seconds=start_seconds,
                 segment_seconds=segment_seconds,
             )
-            skip_reason = segment_quality_skip_reason(
-                segment_seconds=segment_seconds,
-                note_count=note_count,
-                max_segment_seconds=args.max_segment_seconds,
-                min_segment_notes=args.min_segment_notes,
-            )
-            if skip_reason is not None:
-                skipped_segments[skip_reason] += 1
-                continue
             (
                 midi_pitches,
                 onset_seconds,
@@ -836,12 +1085,12 @@ def main() -> None:
                 start_seconds=start_seconds,
                 segment_seconds=segment_seconds,
             )
-            grouping = line.get("repeat_grouping", {})
 
             sample_id = stable_sample_id(
                 track["dali_id"],
                 start_seconds,
-                line_index=line["line_index"],
+                line_index=window["line_start_index"],
+                end_line_index=window["line_end_index"],
             )
             melody_path = write_melody_npz(
                 melody_dir=melody_dir,
@@ -857,24 +1106,29 @@ def main() -> None:
                 "dali_id": track["dali_id"],
                 "melody_path": melody_path,
                 "start_seconds": start_seconds,
-                "end_seconds": line["end_seconds"],
+                "end_seconds": window["end_seconds"],
                 "segment_seconds": segment_seconds,
                 "voiced_ratio": voiced_ratio,
-                "line_index": line["line_index"],
-                "line_text": line["text"],
-                "lyric_class": grouping.get("lyric_class"),
-                "melody_class": grouping.get("melody_class"),
-                "parent_index": grouping.get("parent_index"),
-                "transposition_to_representative": grouping.get(
+                "line_index": window["line_index"],
+                "line_start_index": window["line_start_index"],
+                "line_end_index": window["line_end_index"],
+                "line_indices": window["line_indices"],
+                "line_count": window["line_count"],
+                "line_note_counts": window["line_note_counts"],
+                "line_text": window["line_text"],
+                "lyric_class": window["lyric_class"],
+                "melody_class": window["melody_class"],
+                "parent_index": window["parent_index"],
+                "transposition_to_representative": window[
                     "transposition_to_representative"
-                ),
-                "onset_mae_to_representative": grouping.get(
+                ],
+                "onset_mae_to_representative": window[
                     "onset_mae_to_representative"
-                ),
-                "duration_mae_to_representative": grouping.get(
+                ],
+                "duration_mae_to_representative": window[
                     "duration_mae_to_representative"
-                ),
-                "group_quality_flags": grouping.get("quality_flags", []),
+                ],
+                "group_quality_flags": window["group_quality_flags"],
                 "note_count": note_count,
             }
             all_segments.append(segment)
@@ -886,7 +1140,8 @@ def main() -> None:
 
     if not all_segments:
         raise SystemExit(
-            "No eligible DALI line segments found. Check DALI/audio alignment."
+            "No eligible DALI line-window segments found. Check DALI/audio alignment "
+            "and the line/window limits."
         )
 
     track_by_id = {track["dali_id"]: track for track in usable_tracks}
@@ -923,11 +1178,17 @@ def main() -> None:
         "audio_format": args.audio_format,
         "skip_audio_prep": args.skip_audio_prep,
         "sample_rate": args.sample_rate,
-        "segmentation_strategy": "one_dali_line_occurrence_per_segment",
+        "segmentation_strategy": "fixed_consecutive_dali_line_windows",
+        "lines_per_segment": args.lines_per_segment,
+        "segment_stride_lines": args.segment_stride_lines,
         "repeated_line_policy": (
-            "retain_grouped_occurrences_else_keep_first_normalized_text"
-            if repeat_groupings_path is not None
-            else "keep_first_casefolded_nfkc_text"
+            "retain_all_occurrences_for_multi_line_windows"
+            if args.lines_per_segment > 1
+            else (
+                "retain_grouped_occurrences_else_keep_first_normalized_text"
+                if repeat_groupings_path is not None
+                else "keep_first_casefolded_nfkc_text"
+            )
         ),
         "repeat_groupings": (
             manifest_relative_path(repeat_groupings_path, metadata_path.parent)
@@ -946,6 +1207,9 @@ def main() -> None:
             "duration_bins": 24,
             "onset_shift_bins": 24,
         },
+        "max_line_seconds": args.max_segment_seconds,
+        "min_line_notes": args.min_segment_notes,
+        "max_window_seconds": args.max_window_seconds,
         "max_segment_seconds": args.max_segment_seconds,
         "min_segment_notes": args.min_segment_notes,
         "seed": args.seed,

@@ -1,7 +1,7 @@
 Basic contrastive training framework, with transformer-based melody encoder and HuBERT (frozen CNN layer) as audio/waveform encoder.
-Training uses one variable-duration segment per DALI lyric-line occurrence. Repeat
-groupings turn congruent occurrences into positive variants; without grouping metadata,
-only the first occurrence of each normalized lyric line is retained.
+Training uses variable-duration segments made from a configurable number of consecutive
+DALI lyric-line occurrences (one line by default). Repeat groupings turn congruent
+line or multi-line occurrences into positive variants.
 I have used a variant based on the InfoNCE loss: L_{hard negatives} + L_{in-batch}, where hard negatives are other segments from the same song, and in-batch compares with other positive samples in the batch. 
 Evaluation is against hard negatives (only). 
 
@@ -50,21 +50,52 @@ conda run -n try-contrastive python scripts/prepare_dali_dataset.py \
   --repeat-groupings data/repeat_groupings
 ```
 
+Use `--lines-per-segment` to prepare fixed-size consecutive line windows. The default
+stride equals the number of lines, producing non-overlapping windows. For example:
+
+```bash
+# Two-line segments, with every constituent line capped at 5 seconds.
+conda run -n try-contrastive python scripts/prepare_dali_dataset.py \
+  --repeat-groupings data/repeat_groupings \
+  --output-dir data/prepared/dali_seg2 \
+  --lines-per-segment 2 \
+  --max-line-seconds 5
+
+# Four-line segments. The optional whole-window cap rejects the complete window;
+# it never truncates a line.
+conda run -n try-contrastive python scripts/prepare_dali_dataset.py \
+  --repeat-groupings data/repeat_groupings \
+  --output-dir data/prepared/dali_seg4 \
+  --lines-per-segment 4 \
+  --max-line-seconds 5 \
+  --max-window-seconds 25
+```
+
+Set `--segment-stride-lines 1` for sliding overlapping windows. Multi-line preparation
+always retains repeated lyric occurrences so windows remain temporally consecutive;
+an ineligible constituent line breaks a run and is never bridged. Segment-level lyric
+and melody classes are derived from the complete sequence of constituent line classes,
+so repeat-aware positives must match the full window. Without repeat-grouping metadata,
+identical full lyric sequences receive a shared lyric class and are protected from use
+as negatives, but they are not promoted to positives without melody evidence.
+
 To prepare only a specific set of songs, put one DALI id per line in a text
 file and pass `--keep-file path/to/song_ids.txt`. Blank lines and `#` comments
 are ignored.
 
-Preparation discards line segments longer than 10 seconds or containing fewer
+Preparation discards an individual line longer than 10 seconds or containing fewer
 than three overlapping notes by default. Override these gates with
-`--max-segment-seconds` and `--min-segment-notes`; a maximum duration of 0
-disables the duration limit.
+`--max-line-seconds` and `--min-line-notes`; the older names
+`--max-segment-seconds` and `--min-segment-notes` remain aliases. A maximum duration
+of 0 disables that limit. `--max-window-seconds` independently caps the total span
+of a multi-line window.
 
-For songs covered by the grouping results, the manifest retains every line occurrence
-and records its lyric and melody classes. Training never uses another member of the
-anchor's melody class as a negative. By default it chooses a positive occurrence with
-different lyrics when available, then an ordinary repeated occurrence, and finally
-the aligned audio. Songs absent from a partial grouping file retain the older behavior
-of keeping the first normalized lyric occurrence.
+For songs covered by the grouping results, the manifest records segment-level lyric
+and melody classes. Training never uses another member of the anchor's complete
+melody class as a negative. By default it chooses a positive occurrence with different
+lyrics when available, then an ordinary repeated occurrence, and finally the aligned
+audio. In one-line mode, songs absent from a partial grouping file retain the older
+behavior of keeping the first normalized lyric occurrence.
 
 Each melody segment is represented as a note sequence using the 177-dimensional scheme
 from [Wang et al.](https://arxiv.org/html/2508.00123): 129 dimensions for MIDI pitch
@@ -80,12 +111,27 @@ the preparation command after upgrading.
 Contrastive training defaults to `--candidate-window-policy match-positive`. Within
 each retrieval set, every audio candidate is presented at the selected positive's
 duration. A shorter negative is extended with real surrounding song context, while a
-longer negative is cropped inside its annotated line. Training randomizes the context
+longer negative is cropped inside its prepared interval. Training randomizes the context
 placement; validation and evaluation use the center deterministically. Windows that
 would have to cross a known congruent/repeated positive occurrence are excluded. Use
-`--candidate-window-policy line` for the original variable-line-duration behavior.
+`--candidate-window-policy segment` to preserve every complete prepared one- or
+multi-line interval (`line` is retained as a legacy alias).
 Training also selects a reproducible, epoch-specific positive variant and capped
 same-song negative subset; validation and evaluation retain the epoch-zero selection.
+
+Train a prepared multi-line manifest with the same training script:
+
+```bash
+conda run -n try-contrastive python scripts/train_contrastive.py \
+  --manifest data/prepared/dali_seg2/segments_manifest.csv \
+  --output-dir checkpoints/contrastive_seg2 \
+  --candidate-window-policy segment \
+  --batch-size 4
+```
+
+The model and collate path already pad variable note and waveform lengths. Reduce
+`--batch-size` and/or `--max-negatives` for longer windows as needed; keep at least two
+examples per GPU when relying on the local in-batch contrastive loss.
 
 ## Evaluation
 
