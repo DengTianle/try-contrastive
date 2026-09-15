@@ -114,6 +114,22 @@ class MelodyAudioContrastiveModel(nn.Module):
                 "Candidate note onsets, durations, and attention mask must be "
                 "provided together"
             )
+
+        # Collation pads the candidate dimension when groups have different
+        # sizes. HuBERT's feature-mask helper assumes non-empty waveforms, so
+        # exclude those empty slots from both encoding and note pooling.
+        valid_indices = None
+        if flat_audio_mask is not None:
+            indices = flat_audio_mask.any(dim=-1).nonzero(as_tuple=True)[0]
+            if indices.numel() != flat_audio.shape[0]:
+                valid_indices = indices
+                flat_audio = flat_audio.index_select(0, indices)
+                flat_audio_mask = flat_audio_mask.index_select(0, indices)
+                if flat_note_onsets is not None:
+                    flat_note_onsets = flat_note_onsets.index_select(0, indices)
+                    flat_note_durations = flat_note_durations.index_select(0, indices)
+                    flat_note_mask = flat_note_mask.index_select(0, indices)
+
         flat_audio_embeddings = self.encode_audio(
             input_values=flat_audio,
             attention_mask=flat_audio_mask,
@@ -121,5 +137,11 @@ class MelodyAudioContrastiveModel(nn.Module):
             note_durations=flat_note_durations,
             note_attention_mask=flat_note_mask,
         )
+        if valid_indices is not None:
+            # Restore candidate order and keep padding at zero. index_copy
+            # preserves gradients from the grouped loss to the real candidates.
+            flat_audio_embeddings = flat_audio_embeddings.new_zeros(
+                batch_size * num_candidates, flat_audio_embeddings.shape[-1],
+            ).index_copy(0, valid_indices, flat_audio_embeddings)
         candidate_audio_embeddings = flat_audio_embeddings.reshape(batch_size, num_candidates, -1)
         return melody_embeddings, candidate_audio_embeddings
