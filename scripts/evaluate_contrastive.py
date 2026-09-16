@@ -19,6 +19,7 @@ from prosodia.datasets import GroupedContrastiveDataset, grouped_contrastive_col
 from prosodia.training import (
     MelodyAudioContrastiveModel,
     build_contrastive_model_from_checkpoint_args,
+    resolve_checkpoint_audio_pooling,
     checkpoint_arg,
     grouped_info_nce_loss,
     sanitize_json_value,
@@ -516,6 +517,10 @@ def parse_args() -> argparse.Namespace:
         default=argparse.SUPPRESS,
         help="Disable a minimum-offset policy stored in the checkpoint.",
     )
+    parser.add_argument(
+        "--audio-pooling", choices=["note", "mean"], default=None,
+        help="Pooling mode for legacy checkpoints without metadata; must match if saved.",
+    )
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--recall-k", type=parse_recall_k, default=parse_recall_k("1,2,3,5"))
     parser.add_argument("--device", default="auto")
@@ -538,6 +543,7 @@ def main() -> None:
     use_amp = args.amp and device.type == "cuda"
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     checkpoint_args = checkpoint.get("args", {})
+    audio_pooling = resolve_checkpoint_audio_pooling(checkpoint_args, args.audio_pooling)
     temperature = args.temperature
     if temperature is None:
         temperature = checkpoint_arg(checkpoint_args, "temperature", 0.07)
@@ -582,7 +588,9 @@ def main() -> None:
         collate_fn=grouped_contrastive_collate,
     )
 
-    model = build_contrastive_model_from_checkpoint_args(checkpoint_args).to(device)
+    model = build_contrastive_model_from_checkpoint_args(
+        checkpoint_args, audio_pooling=audio_pooling,
+    ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
     metrics, predictions = evaluate_retrieval(
@@ -596,6 +604,7 @@ def main() -> None:
     )
     report = {
         "checkpoint": str(args.checkpoint),
+        "audio_pooling": audio_pooling,
         "manifest": str(args.manifest),
         "split": args.split,
         "max_negatives": args.max_negatives,

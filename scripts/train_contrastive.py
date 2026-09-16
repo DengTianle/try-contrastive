@@ -646,7 +646,7 @@ def save_checkpoint(
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
-        "args": vars(args),
+        "args": {**vars(args), "audio_pooling": model.audio_encoder.pooling},
         "metrics": metrics,
         "melody_representation": MELODY_REPRESENTATION,
     }
@@ -732,6 +732,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, default=Path("data/prepared/dali/segments_manifest.csv"))
     parser.add_argument("--output-dir", type=Path, default=Path("checkpoints/contrastive"))
     parser.add_argument("--hubert-model-name", default="facebook/hubert-base-ls960")
+    parser.add_argument(
+        "--audio-pooling", choices=["note", "mean"], default="note",
+        help="Pool audio by annotated notes (default), or mean-pool HuBERT frames before projection.",
+    )
     parser.add_argument("--projection-dim", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument(
@@ -1105,6 +1109,7 @@ def main() -> None:
     initially_freeze_hubert = args.freeze_hubert or args.hubert_freeze_epochs > 0
     model = MelodyAudioContrastiveModel(
         hubert_model_name=args.hubert_model_name,
+        audio_pooling=args.audio_pooling,
         projection_dim=args.projection_dim,
         freeze_hubert=initially_freeze_hubert,
         melody_d_model=args.melody_d_model,

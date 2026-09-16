@@ -25,6 +25,7 @@ if str(SRC_DIR) not in sys.path:
 from prosodia.datasets import GroupedContrastiveDataset, grouped_contrastive_collate
 from prosodia.training import (
     build_contrastive_model_from_checkpoint_args,
+    resolve_checkpoint_audio_pooling,
     checkpoint_arg,
     positive_audio_embeddings,
     sanitize_json_value,
@@ -492,6 +493,10 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument(
+        "--audio-pooling", choices=["note", "mean"], default=None,
+        help="Pooling mode for legacy checkpoints without metadata; must match if saved.",
+    )
     parser.add_argument("--manifest", type=Path, default=Path("data/prepared/dali/segments_manifest.csv"))
     parser.add_argument("--split", default="test")
     parser.add_argument("--batch-size", type=int, default=4)
@@ -516,6 +521,7 @@ def main() -> None:
 
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     checkpoint_args = checkpoint.get("args", {})
+    audio_pooling = resolve_checkpoint_audio_pooling(checkpoint_args, args.audio_pooling)
     seed = int(args.seed if args.seed is not None else checkpoint_arg(checkpoint_args, "seed", 13))
 
     dataset = GroupedContrastiveDataset(
@@ -548,7 +554,9 @@ def main() -> None:
 
     device = choose_device(args.device)
     use_amp = args.amp and device.type == "cuda"
-    model = build_contrastive_model_from_checkpoint_args(checkpoint_args).to(device)
+    model = build_contrastive_model_from_checkpoint_args(
+        checkpoint_args, audio_pooling=audio_pooling,
+    ).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
 
     extracted = extract_embeddings(
@@ -564,6 +572,7 @@ def main() -> None:
     )
     report = {
         "checkpoint": str(args.checkpoint),
+        "audio_pooling": audio_pooling,
         "manifest": str(args.manifest),
         "split": args.split,
         "metrics": metrics,

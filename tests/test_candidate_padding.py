@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import copy
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,10 +14,16 @@ from transformers import HubertConfig, HubertModel
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from prosodia.datasets import grouped_contrastive_collate
 from prosodia.melody_encoder import MELODY_FEATURE_DIM
-from prosodia.training import MelodyAudioContrastiveModel, grouped_info_nce_loss
+from prosodia.training import (
+    MelodyAudioContrastiveModel,
+    build_contrastive_model_from_checkpoint_args,
+    grouped_info_nce_loss,
+)
+from train_contrastive import save_checkpoint
 
 
 class CandidatePaddingTest(unittest.TestCase):
@@ -41,20 +49,21 @@ class CandidatePaddingTest(unittest.TestCase):
         extractor = SimpleNamespace(
             do_normalize=True, sampling_rate=16000, return_attention_mask=False,
         )
+        self.model_args = dict(
+            hubert_model_name="test-hubert",
+            projection_dim=8,
+            freeze_hubert=True,
+            melody_d_model=8,
+            melody_num_layers=1,
+            melody_num_heads=2,
+            melody_dim_feedforward=16,
+            dropout=0.0,
+        )
         with (
             patch("transformers.AutoModel.from_pretrained", return_value=hubert),
             patch("transformers.AutoFeatureExtractor.from_pretrained", return_value=extractor),
         ):
-            self.model = MelodyAudioContrastiveModel(
-                hubert_model_name="test-hubert",
-                projection_dim=8,
-                freeze_hubert=True,
-                melody_d_model=8,
-                melody_num_layers=1,
-                melody_num_heads=2,
-                melody_dim_feedforward=16,
-                dropout=0.0,
-            )
+            self.model = MelodyAudioContrastiveModel(**self.model_args)
         self.batch = grouped_contrastive_collate([
             self.make_item(7, 1600), self.make_item(8, 1920),
         ])
@@ -152,6 +161,50 @@ class CandidatePaddingTest(unittest.TestCase):
             self.assertTrue(gradients)
             self.assertTrue(all(torch.isfinite(grad).all() for grad in gradients))
             self.assertGreater(sum(float(grad.abs().sum()) for grad in gradients), 0.0)
+
+    def test_mean_pooling_with_candidate_padding_and_trainable_hubert(self) -> None:
+        self.model.audio_encoder.pooling = "mean"
+        with patch.object(
+            self.model.audio_encoder, "_pool_frames_to_notes", side_effect=AssertionError,
+        ):
+            self.test_mixed_candidate_counts_skip_padding_and_preserve_order()
+            self.test_mixed_candidate_counts_preserve_training_gradients()
+
+    def test_checkpoint_round_trip_restores_both_pooling_modes(self) -> None:
+        optimizer = torch.optim.AdamW(self.model.parameters())
+        scheduler = SimpleNamespace(update_step=0, state_dict=lambda: {})
+        scaler = torch.amp.GradScaler("cpu", enabled=False)
+        for mode in ("note", "mean"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as directory:
+                self.model.audio_encoder.pooling = mode
+                self.model.eval()
+                save_checkpoint(
+                    Path(directory), "test.pt", self.model, optimizer, scheduler,
+                    scaler, 1, SimpleNamespace(**self.model_args), {},
+                )
+                checkpoint = torch.load(Path(directory) / "test.pt", weights_only=False)
+                self.assertEqual(checkpoint["args"]["audio_pooling"], mode)
+                with (
+                    patch(
+                        "transformers.AutoModel.from_pretrained",
+                        return_value=copy.deepcopy(self.model.audio_encoder.hubert),
+                    ),
+                    patch(
+                        "transformers.AutoFeatureExtractor.from_pretrained",
+                        return_value=SimpleNamespace(
+                            do_normalize=True, sampling_rate=16000, return_attention_mask=False,
+                        ),
+                    ),
+                ):
+                    restored = build_contrastive_model_from_checkpoint_args(checkpoint["args"])
+                restored.load_state_dict(checkpoint["model_state_dict"], strict=True)
+                restored.eval()
+                self.assertEqual(restored.audio_encoder.pooling, mode)
+                with torch.no_grad():
+                    expected = self.model(**self.inputs)
+                    actual = restored(**self.inputs)
+                for a, b in zip(actual, expected):
+                    torch.testing.assert_close(a, b)
 
 
 if __name__ == "__main__":

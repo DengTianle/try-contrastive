@@ -116,6 +116,26 @@ and shifted when a candidate window is cropped or extended. The audio encoder ca
 return the projected note sequence and its mask with `return_note_embeddings=True` for
 downstream note-level tasks.
 
+Use `--audio-pooling mean` when training to restore the original audio encoding:
+mean-pool valid HuBERT frames, apply the projection head once, then normalize.
+This includes all valid frames, including frames outside annotated notes. It ignores
+candidate note timings; the shared dataset still prepares them. The default,
+`--audio-pooling note`, retains the two-stage note pooling described above.
+`return_note_embeddings=True` is supported only in note mode.
+
+New checkpoints save `audio_pooling` in their training arguments. Evaluation and
+embedding diagnostics restore that setting automatically and include it in their
+JSON reports. An explicit `--audio-pooling` that conflicts with the saved mode is
+rejected. Older checkpoints without this metadata require an explicit choice on
+`scripts/evaluate_contrastive.py` or `scripts/diagnose_embeddings.py`: use
+`--audio-pooling mean` for checkpoints trained before two-stage pooling, or
+`--audio-pooling note` for checkpoints trained with two-stage pooling. Both modes
+have identical parameter names and shapes, so their mode cannot be inferred from
+the weights. State dictionaries are still loaded strictly to catch unrelated
+architecture mismatches. Direct `load_state_dict` calls alone cannot check pooling;
+custom callers should use `build_contrastive_model_from_checkpoint_args`, passing
+`audio_pooling` explicitly for legacy checkpoints.
+
 Contrastive training defaults to `--candidate-window-policy match-positive`. Within
 each retrieval set, every audio candidate is presented at the selected positive's
 duration. A shorter negative is extended with real surrounding song context, while a

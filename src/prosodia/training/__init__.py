@@ -1,4 +1,8 @@
-from .checkpoints import build_contrastive_model_from_checkpoint_args, checkpoint_arg
+from .checkpoints import (
+    build_contrastive_model_from_checkpoint_args,
+    checkpoint_arg,
+    resolve_checkpoint_audio_pooling,
+)
 from .losses import (
     global_in_batch_info_nce_loss,
     grouped_info_nce_loss,
@@ -17,6 +21,7 @@ __all__ = [
     "global_in_batch_info_nce_loss",
     "grouped_info_nce_loss",
     "positive_audio_embeddings",
+    "resolve_checkpoint_audio_pooling",
     "sanitize_json_value",
     "symmetric_global_in_batch_info_nce_loss",
 ]

@@ -75,12 +75,12 @@ class HubertEncoder(nn.Module):
         projection_dim: int = 256,
         dropout: float = 0.1,
         freeze_hubert: bool = False,
-        pooling: str = "mean",
+        pooling: str = "note",
     ) -> None:
         super().__init__()
         from transformers import AutoFeatureExtractor, AutoModel
 
-        if pooling != "mean":
+        if pooling not in {"note", "mean"}:
             raise ValueError(f"Unsupported pooling: {pooling}")
 
         self.model_name = model_name
@@ -377,6 +377,20 @@ class HubertEncoder(nn.Module):
         note_hidden_states = note_hidden_states * pooled_note_mask.unsqueeze(-1)
         return note_hidden_states, pooled_note_mask
 
+    def _pool_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Mean-pool valid HuBERT frames before the projection head."""
+        if attention_mask is None:
+            return hidden_states.mean(dim=1)
+        feature_mask = self.hubert._get_feature_vector_attention_mask(
+            hidden_states.shape[1], attention_mask,
+        ).to(device=hidden_states.device, dtype=torch.bool)
+        mask = feature_mask.unsqueeze(-1)
+        return (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1)
+
     def _default_single_note_timing(
         self,
         input_values: torch.Tensor,
@@ -428,12 +442,14 @@ class HubertEncoder(nn.Module):
         normalize: bool = True,
         return_note_embeddings: bool = False,
     ) -> torch.Tensor | HubertEncoderOutput:
+        if self.pooling == "mean" and return_note_embeddings:
+            raise ValueError("return_note_embeddings requires audio pooling='note'")
         note_inputs = (note_onsets, note_durations, note_attention_mask)
-        if all(value is None for value in note_inputs):
+        if self.pooling == "note" and all(value is None for value in note_inputs):
             note_onsets, note_durations, note_attention_mask = (
                 self._default_single_note_timing(input_values, attention_mask)
             )
-        elif any(value is None for value in note_inputs):
+        elif self.pooling == "note" and any(value is None for value in note_inputs):
             raise ValueError(
                 "note_onsets, note_durations, and note_attention_mask must be "
                 "provided together"
@@ -455,6 +471,12 @@ class HubertEncoder(nn.Module):
                     attention_mask=hubert_attention_mask,
                 )
         hidden_states = self.dropout(outputs.last_hidden_state)
+        if self.pooling == "mean":
+            embeddings = self.projection(
+                self._pool_hidden_states(hidden_states, attention_mask)
+            )
+            return F.normalize(embeddings, dim=-1) if normalize else embeddings
+
         note_hidden_states, pooled_note_mask = self._pool_frames_to_notes(
             hidden_states,
             attention_mask,

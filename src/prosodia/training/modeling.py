@@ -19,6 +19,7 @@ class MelodyAudioContrastiveModel(nn.Module):
         melody_num_heads: int = 4,
         melody_dim_feedforward: int = 1024,
         dropout: float = 0.1,
+        audio_pooling: str = "note",
     ) -> None:
         super().__init__()
         self.melody_encoder = MelodyTransformerEncoder(
@@ -35,6 +36,7 @@ class MelodyAudioContrastiveModel(nn.Module):
             projection_dim=projection_dim,
             dropout=dropout,
             freeze_hubert=freeze_hubert,
+            pooling=audio_pooling,
         )
 
     def encode_melody(
@@ -96,6 +98,8 @@ class MelodyAudioContrastiveModel(nn.Module):
             candidate_note_durations,
             candidate_note_attention_mask,
         )
+        if self.audio_encoder.pooling == "mean":
+            note_inputs = (None, None, None)
         if all(value is not None for value in note_inputs):
             flat_note_onsets = candidate_note_onsets.reshape(
                 batch_size * num_candidates,
