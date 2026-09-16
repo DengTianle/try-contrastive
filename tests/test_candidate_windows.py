@@ -5,6 +5,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import soundfile as sf
@@ -17,6 +18,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 from evaluate_contrastive import segment_length_probe_for_example
 from prosodia.datasets import GroupedContrastiveDataset, grouped_contrastive_collate
+from prosodia.datasets import contrastive_dataset as dataset_module
 
 
 class CandidateWindowTest(unittest.TestCase):
@@ -135,6 +137,63 @@ class CandidateWindowTest(unittest.TestCase):
             sorted(item["candidate_window_seconds"].tolist()),
             [1.0, 2.0, 3.0],
         )
+
+    def test_candidate_timing_cache_keeps_window_clipping_dynamic(self) -> None:
+        dataset = GroupedContrastiveDataset(self.manifest_path, split="train")
+        row = next(row for row in dataset.rows if row["sample_id"] == "long")
+        np.savez_compressed(
+            row["melody_path"],
+            midi_pitches=np.asarray([60, 62, 64], dtype=np.int16),
+            onset_seconds=np.asarray([0.25, 1.25, 2.25], dtype=np.float32),
+            note_duration_seconds=np.full(3, 0.5, dtype=np.float32),
+        )
+        with (
+            patch.object(dataset_module.np, "load", wraps=np.load) as read,
+            patch.object(dataset_module, "encode_note_sequence") as encode,
+        ):
+            onsets, durations = dataset._candidate_note_timing(row, (8000, 16000))
+            torch.testing.assert_close(onsets, torch.tensor([0.0, 0.75]))
+            torch.testing.assert_close(durations, torch.tensor([0.25, 0.25]))
+            onsets.fill_(99)
+            durations.zero_()
+
+            dataset.set_epoch(1)
+            onsets, durations = dataset._candidate_note_timing(row, (16000, 16000))
+            torch.testing.assert_close(onsets, torch.tensor([0.25]))
+            torch.testing.assert_close(durations, torch.tensor([0.5]))
+            onsets, durations = dataset._candidate_note_timing(row, (0, 48000))
+            torch.testing.assert_close(onsets, torch.tensor([0.25, 1.25, 2.25]))
+            torch.testing.assert_close(durations, torch.full((3,), 0.5))
+            self.assertEqual(read.call_count, 1)
+            encode.assert_not_called()
+
+    def test_candidate_timings_reuse_anchor_read_and_survive_item_mutation(self) -> None:
+        dataset = GroupedContrastiveDataset(
+            self.manifest_path, split="train", candidate_window_policy="match-positive",
+        )
+        index = next(
+            i for i, group in enumerate(dataset.groups)
+            if group["anchor"]["sample_id"] == "anchor"
+        )
+        with (
+            patch.object(dataset_module.np, "load", wraps=np.load) as read,
+            patch.object(
+                dataset_module, "encode_note_sequence", wraps=dataset_module.encode_note_sequence,
+            ) as encode,
+        ):
+            item = dataset[index]
+            self.assertEqual(read.call_count, 3)  # One read per distinct segment.
+            self.assertEqual(encode.call_count, 1)  # Only the anchor needs features.
+            item["melody_note_onsets"].fill_(99)
+            item["melody_note_durations"].zero_()
+            repeated = dataset[index]
+            self.assertEqual(read.call_count, 4)  # Only the new anchor read.
+            self.assertEqual(encode.call_count, 2)
+
+        for key in (
+            "candidate_note_onsets", "candidate_note_durations", "candidate_note_attention_mask",
+        ):
+            torch.testing.assert_close(repeated[key], item[key])
 
     def test_negative_is_removed_when_context_would_cross_positive_class(self) -> None:
         repeat = self._row("repeat", 7.5, 9.0, melody_class=2, lyric_class=4)

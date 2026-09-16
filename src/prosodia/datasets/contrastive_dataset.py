@@ -104,7 +104,12 @@ def resolve_manifest_path(path: str, manifest_dir: Path) -> str:
     return str(resolved.resolve(strict=False))
 
 
-def load_melody(path: str | Path, melody_config: MelodyConfig) -> dict[str, torch.Tensor]:
+def _load_note_arrays(
+    path: str | Path,
+    *,
+    include_pitches: bool = True,
+) -> dict[str, np.ndarray]:
+    """Read note metadata without constructing the encoded melody features."""
     with np.load(path) as melody:
         required = {"midi_pitches", "onset_seconds", "note_duration_seconds"}
         missing = required.difference(melody.files)
@@ -114,14 +119,22 @@ def load_melody(path: str | Path, melody_config: MelodyConfig) -> dict[str, torc
                 "rerun scripts/prepare_dali_dataset.py to create note-level features "
                 f"(missing {sorted(missing)})"
             )
-        midi_pitches = melody["midi_pitches"].astype(np.int64)
-        onset_seconds = melody["onset_seconds"].astype(np.float32)
-        duration_seconds = melody["note_duration_seconds"].astype(np.float32)
+        arrays = {
+            "onset_seconds": melody["onset_seconds"].astype(np.float32),
+            "duration_seconds": melody["note_duration_seconds"].astype(np.float32),
+        }
+        if include_pitches:
+            arrays["midi_pitches"] = melody["midi_pitches"].astype(np.int64)
+    return arrays
+
+
+def load_melody(path: str | Path, melody_config: MelodyConfig) -> dict[str, torch.Tensor]:
+    arrays = _load_note_arrays(path)
 
     features = encode_note_sequence(
-        midi_pitches=midi_pitches,
-        onset_seconds=onset_seconds,
-        duration_seconds=duration_seconds,
+        midi_pitches=arrays["midi_pitches"],
+        onset_seconds=arrays["onset_seconds"],
+        duration_seconds=arrays["duration_seconds"],
     )
     if features.shape[1] != melody_config.feature_dim:
         raise ValueError(
@@ -130,9 +143,7 @@ def load_melody(path: str | Path, melody_config: MelodyConfig) -> dict[str, torc
 
     return {
         "features": torch.from_numpy(features),
-        "midi_pitches": torch.from_numpy(midi_pitches),
-        "onset_seconds": torch.from_numpy(onset_seconds),
-        "duration_seconds": torch.from_numpy(duration_seconds),
+        **{key: torch.from_numpy(value) for key, value in arrays.items()},
     }
 
 
@@ -187,6 +198,9 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         self.max_negatives = max_negatives
         self.transform = transform
         self._audio_frames_by_path: dict[str, int] = {}
+        # Dataset-local (and worker-local) cache of small, unmodified timing
+        # tensors. Cropped windows and full melody features are never cached.
+        self._note_timing_by_path: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
 
         with self.manifest_path.open(newline="", encoding="utf-8") as handle:
             rows = list(csv.DictReader(handle))
@@ -447,6 +461,14 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
             target = order.index(0)
             candidate_rows = [candidate_rows[index] for index in order]
         melody = load_melody(anchor["melody_path"], self.melody_config)
+        anchor_path = anchor["melody_path"]
+        if anchor_path not in self._note_timing_by_path:
+            # Reuse the anchor read for aligned positives. Keep independent
+            # storage because item transforms may mutate the returned tensors.
+            self._note_timing_by_path[anchor_path] = (
+                melody["onset_seconds"].clone(),
+                melody["duration_seconds"].clone(),
+            )
         candidate_audio, candidate_windows = self._load_candidate_audio(
             positive=positive,
             candidate_rows=candidate_rows,
@@ -595,12 +617,19 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return the row's annotated notes clipped and shifted into an audio window."""
 
-        melody = load_melody(row["melody_path"], self.melody_config)
+        path = row["melody_path"]
+        if path not in self._note_timing_by_path:
+            arrays = _load_note_arrays(path, include_pitches=False)
+            self._note_timing_by_path[path] = (
+                torch.from_numpy(arrays["onset_seconds"]),
+                torch.from_numpy(arrays["duration_seconds"]),
+            )
+        note_onsets, note_durations = self._note_timing_by_path[path]
         sample_rate = self.audio_config.sample_rate
         window_start_seconds = window[0] / sample_rate
         window_end_seconds = (window[0] + window[1]) / sample_rate
-        note_starts = melody["onset_seconds"] + audio_start_seconds(row)
-        note_ends = note_starts + melody["duration_seconds"]
+        note_starts = note_onsets + audio_start_seconds(row)
+        note_ends = note_starts + note_durations
         clipped_starts = note_starts.clamp(
             min=window_start_seconds,
             max=window_end_seconds,
