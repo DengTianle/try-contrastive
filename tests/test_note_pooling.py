@@ -125,6 +125,55 @@ class NotePoolingTest(unittest.TestCase):
         torch.testing.assert_close(note_hidden, torch.tensor([[[10.0]]]))
         self.assertTrue(note_mask.all())
 
+    def test_sparse_fallback_matches_dense_reference_without_scalar_reads(self) -> None:
+        encoder = make_encoder()
+        torch.manual_seed(21)
+        hidden = torch.randn(3, 5, 2, requires_grad=True)
+        reference_hidden = hidden.detach().clone().requires_grad_()
+        mask = torch.arange(5)[None, :] < torch.tensor([5, 3, 0])[:, None]
+        starts = torch.tensor([
+            [-0.5, 0.4, 1.4, 8.0],
+            [1.5, 2.8, 0.0, 0.1],
+            [0.0, 0.4, 1.0, 3.0],
+        ])
+        durations = torch.tensor([[0.2, 0.2, 0.1, 0.1]]).expand_as(starts)
+        note_mask = torch.ones_like(starts, dtype=torch.bool)
+        note_mask[1, -1] = False
+        centers = torch.arange(5, dtype=torch.float32)
+        membership = (
+            (centers >= starts[..., None])
+            & (centers < (starts + durations)[..., None])
+            & mask[:, None, :] & note_mask[..., None]
+        )
+        missing = note_mask & ~membership.any(dim=-1)
+        distances = (centers - (starts + durations / 2)[..., None]).abs()
+        nearest = distances.masked_fill(~mask[:, None, :], torch.inf).argmin(dim=-1)
+        membership |= (
+            torch.nn.functional.one_hot(nearest, 5).bool()
+            & mask[:, None, :] & missing[..., None]
+        )
+        expected_mask = note_mask & membership.any(dim=-1)
+        weights = membership.float()
+        expected = torch.einsum("bnt,bth->bnh", weights, reference_hidden)
+        expected = expected / weights.sum(dim=-1, keepdim=True).clamp_min(1)
+        with patch.object(torch.Tensor, "__bool__", side_effect=AssertionError("scalar read")):
+            actual, actual_mask = encoder._pool_frames_to_notes(
+                hidden, mask, starts, durations, note_mask, note_inputs_validated=True,
+            )
+        torch.testing.assert_close(actual, expected)
+        torch.testing.assert_close(actual_mask, expected_mask)
+        actual.sum().backward()
+        expected.sum().backward()
+        torch.testing.assert_close(hidden.grad, reference_hidden.grad)
+
+    def test_unvalidated_waveform_without_notes_still_raises(self) -> None:
+        encoder = make_encoder()
+        with self.assertRaisesRegex(ValueError, "must contain an annotated note"):
+            encoder._pool_frames_to_notes(
+                torch.ones(1, 4, 1), torch.ones(1, 4, dtype=torch.bool),
+                torch.zeros(1, 1), torch.zeros(1, 1), torch.zeros(1, 1, dtype=torch.bool),
+            )
+
     def test_padded_waveform_and_note_rows_remain_masked(self) -> None:
         encoder = make_encoder()
         output = encoder(

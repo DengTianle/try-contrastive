@@ -296,6 +296,7 @@ class HubertEncoder(nn.Module):
         note_onsets: torch.Tensor,
         note_durations: torch.Tensor,
         note_attention_mask: torch.Tensor,
+        note_inputs_validated: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if note_onsets.shape != note_durations.shape:
             raise ValueError("note_onsets and note_durations must have equal shapes")
@@ -343,32 +344,34 @@ class HubertEncoder(nn.Module):
             & valid_notes[:, :, None]
         )
 
-        # Very short notes can fall between adjacent HuBERT frame centers. Assign
-        # their closest valid frame so every annotated note contributes once.
-        notes_without_frames = valid_notes & ~frame_membership.any(dim=-1)
-        if bool(notes_without_frames.any()):
-            midpoints = (starts + ends) * (0.5 * self.sampling_rate)
-            distances = (frame_centers[None, None, :] - midpoints[:, :, None]).abs()
-            distances = distances.masked_fill(
-                ~feature_attention_mask[:, None, :],
-                torch.inf,
-            )
-            nearest_frames = distances.argmin(dim=-1)
-            nearest_membership = F.one_hot(
-                nearest_frames,
-                num_classes=hidden_states.shape[1],
-            ).to(dtype=torch.bool)
-            frame_membership = frame_membership | (
-                nearest_membership
-                & feature_attention_mask[:, None, :]
-                & notes_without_frames[:, :, None]
-            )
+        # HuBERT's valid frames form a contiguous prefix. Locate the two frame
+        # centers around each midpoint and choose the closer one (ties go left).
+        # This costs O(notes * log(frames)), without a host sync or a dense
+        # note-by-frame distance/one-hot allocation for the rare short notes.
+        notes_with_frames = frame_membership.any(dim=-1)
+        notes_without_frames = valid_notes & ~notes_with_frames
+        midpoints = (starts + ends) * (0.5 * self.sampling_rate)
+        last_frame = feature_attention_mask.sum(dim=-1, keepdim=True) - 1
+        right = torch.minimum(torch.searchsorted(frame_centers, midpoints), last_frame).clamp_min(0)
+        left = (right - 1).clamp_min(0)
+        nearest_frames = torch.where(
+            (midpoints - frame_centers[left]).abs() <= (frame_centers[right] - midpoints).abs(),
+            left, right,
+        ).unsqueeze(-1)
+        waveform_mask = last_frame.squeeze(-1) >= 0
+        fallback = (notes_without_frames & waveform_mask[:, None]).unsqueeze(-1)
+        frame_membership.scatter_(
+            -1, nearest_frames,
+            frame_membership.gather(-1, nearest_frames) | fallback,
+        )
 
-        pooled_note_mask = valid_notes & frame_membership.any(dim=-1)
-        waveform_mask = feature_attention_mask.any(dim=-1)
-        missing_note_rows = waveform_mask & ~pooled_note_mask.any(dim=-1)
-        if bool(missing_note_rows.any()):
-            raise ValueError("Every non-empty waveform must contain an annotated note")
+        pooled_note_mask = valid_notes & (notes_with_frames | fallback.squeeze(-1))
+        # Normal batches already validate note presence during CPU collation.
+        # Retain validation for direct encoder calls and unvalidated batches.
+        if not note_inputs_validated:
+            missing_note_rows = waveform_mask & ~pooled_note_mask.any(dim=-1)
+            if bool(missing_note_rows.any()):
+                raise ValueError("Every non-empty waveform must contain an annotated note")
 
         weights = frame_membership.to(dtype=hidden_states.dtype)
         note_sums = torch.einsum("bnt,bth->bnh", weights, hidden_states)
@@ -441,6 +444,7 @@ class HubertEncoder(nn.Module):
         note_attention_mask: torch.Tensor | None = None,
         normalize: bool = True,
         return_note_embeddings: bool = False,
+        note_inputs_validated: bool = False,
     ) -> torch.Tensor | HubertEncoderOutput:
         if self.pooling == "mean" and return_note_embeddings:
             raise ValueError("return_note_embeddings requires audio pooling='note'")
@@ -483,6 +487,7 @@ class HubertEncoder(nn.Module):
             note_onsets,
             note_durations,
             note_attention_mask,
+            note_inputs_validated=note_inputs_validated,
         )
         note_embeddings = self.projection(note_hidden_states)
         note_embeddings = note_embeddings * pooled_note_mask.unsqueeze(-1)

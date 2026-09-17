@@ -140,6 +140,18 @@ class CandidatePaddingTest(unittest.TestCase):
             _, unmasked = self.model(**inputs)
         torch.testing.assert_close(masked, unmasked)
 
+    def test_collation_validates_notes_without_trusting_missing_annotations(self) -> None:
+        self.assertTrue(self.batch["candidate_notes_validated"])
+        self.model.eval()
+        with torch.no_grad():
+            _, validated = self.model(**self.inputs, candidate_notes_validated=True)
+            _, unvalidated = self.model(**self.inputs)
+        torch.testing.assert_close(validated, unvalidated)
+        item = self.make_item(7, 1600)
+        item["candidate_note_attention_mask"][0] = False
+        batch = grouped_contrastive_collate([item])
+        self.assertFalse(batch["candidate_notes_validated"])
+
     def test_mixed_candidate_counts_preserve_training_gradients(self) -> None:
         self.model.audio_encoder.set_hubert_trainable_layers(1)
         self.model.train()

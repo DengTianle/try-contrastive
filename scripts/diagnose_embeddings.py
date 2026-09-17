@@ -115,6 +115,7 @@ def extract_embeddings(
                 candidate_note_onsets=batch["candidate_note_onsets"],
                 candidate_note_durations=batch["candidate_note_durations"],
                 candidate_note_attention_mask=batch["candidate_note_attention_mask"],
+                candidate_notes_validated=batch.get("candidate_notes_validated", False),
             )
             batch_audio_embeddings = positive_audio_embeddings(
                 candidate_audio_embeddings=candidate_audio_embeddings,

@@ -205,6 +205,7 @@ def evaluate_retrieval(
                 candidate_note_onsets=batch["candidate_note_onsets"],
                 candidate_note_durations=batch["candidate_note_durations"],
                 candidate_note_attention_mask=batch["candidate_note_attention_mask"],
+                candidate_notes_validated=batch.get("candidate_notes_validated", False),
             )
             loss, logits = grouped_info_nce_loss(
                 melody_embeddings=melody_embeddings,

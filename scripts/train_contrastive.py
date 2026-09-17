@@ -106,11 +106,17 @@ def wrap_distributed_model(model: nn.Module, device: torch.device) -> nn.Module:
     return DistributedDataParallel(model)
 
 
-def distributed_totals(values: list[float], device: torch.device) -> list[float]:
-    totals = torch.tensor(values, dtype=torch.float64, device=device)
+def distributed_totals(totals: torch.Tensor) -> list[float]:
     if dist.is_initialized():
         dist.all_reduce(totals, op=dist.ReduceOp.SUM)
     return totals.cpu().tolist()
+
+
+def metric_totals(size: int, device: torch.device) -> torch.Tensor:
+    # MPS does not support float64. Use double precision elsewhere to retain
+    # the accuracy of the previous Python-float epoch accumulators.
+    dtype = torch.float32 if device.type == "mps" else torch.float64
+    return torch.zeros(size, device=device, dtype=dtype)
 
 
 def maybe_progress(iterable: Any, enabled: bool, **kwargs: Any) -> Any:
@@ -427,18 +433,18 @@ def train_one_epoch(
     scheduler: StagedWarmupCosineScheduler,
     progress: bool,
     desc: str,
+    log_every_steps: int = 50,
 ) -> dict[str, float]:
     model.train()
-    total_loss = 0.0
-    total_hard_loss = 0.0
-    total_global_loss = 0.0
-    total_correct = 0
-    total_global_correct = 0
-    total_global_audio_correct = 0
+    totals = metric_totals(6, device)
+    (
+        total_loss, total_hard_loss, total_global_loss,
+        total_correct, total_global_correct, total_global_audio_correct,
+    ) = totals.unbind()
     total_examples = 0
     total_global_examples = 0
     progress_bar = maybe_progress(loader, enabled=progress, desc=desc, leave=False)
-    for batch in progress_bar:
+    for step, batch in enumerate(progress_bar, start=1):
         batch = move_batch_to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
 
@@ -459,6 +465,7 @@ def train_one_epoch(
                 candidate_note_onsets=batch["candidate_note_onsets"],
                 candidate_note_durations=batch["candidate_note_durations"],
                 candidate_note_attention_mask=batch["candidate_note_attention_mask"],
+                candidate_notes_validated=batch.get("candidate_notes_validated", False),
             )
             hard_loss, hard_logits = grouped_info_nce_loss(
                 melody_embeddings=melody_embeddings,
@@ -501,26 +508,31 @@ def train_one_epoch(
         step_optimizer_and_scheduler(scaler, optimizer, scheduler)
 
         targets = batch["target"].to(dtype=torch.long)
-        total_loss += float(loss.detach().cpu()) * batch_size
-        total_hard_loss += float(hard_loss.detach().cpu()) * batch_size
-        total_correct += int((hard_logits.argmax(dim=-1) == targets).sum().detach().cpu())
+        total_loss.add_(loss.detach(), alpha=batch_size)
+        total_hard_loss.add_(hard_loss.detach(), alpha=batch_size)
+        total_correct.add_((hard_logits.argmax(dim=-1) == targets).sum())
         if global_logits is not None:
-            total_global_loss += float(global_loss.detach().cpu()) * batch_size
+            total_global_loss.add_(global_loss.detach(), alpha=batch_size)
             global_targets = torch.arange(batch_size, device=global_logits.device)
-            total_global_correct += int(
-                (global_logits.argmax(dim=-1) == global_targets).sum().detach().cpu()
+            total_global_correct.add_(
+                (global_logits.argmax(dim=-1) == global_targets).sum()
             )
             if global_audio_logits is not None:
-                total_global_audio_correct += int(
-                    (global_audio_logits.argmax(dim=-1) == global_targets).sum().detach().cpu()
+                total_global_audio_correct.add_(
+                    (global_audio_logits.argmax(dim=-1) == global_targets).sum()
                 )
             total_global_examples += batch_size
         total_examples += batch_size
-        if tqdm is not None and hasattr(progress_bar, "set_postfix"):
+        if (
+            progress and log_every_steps > 0 and step % log_every_steps == 0
+            and hasattr(progress_bar, "set_postfix")
+        ):
+            logged = totals.cpu().tolist()
             progress_bar.set_postfix(
-                loss=total_loss / max(total_examples, 1),
-                hard=total_hard_loss / max(total_examples, 1),
-                acc=total_correct / max(total_examples, 1),
+                loss=logged[0] / max(total_examples, 1),
+                hard=logged[1] / max(total_examples, 1),
+                acc=logged[3] / max(total_examples, 1),
+                refresh=False,
             )
 
     (
@@ -533,17 +545,7 @@ def train_one_epoch(
         total_examples,
         total_global_examples,
     ) = distributed_totals(
-        [
-            total_loss,
-            total_hard_loss,
-            total_global_loss,
-            total_correct,
-            total_global_correct,
-            total_global_audio_correct,
-            total_examples,
-            total_global_examples,
-        ],
-        device,
+        torch.cat((totals, totals.new_tensor([total_examples, total_global_examples]))),
     )
     return {
         "loss": total_loss / max(total_examples, 1),
@@ -564,19 +566,18 @@ def evaluate(
     use_amp: bool,
     progress: bool,
     desc: str,
+    log_every_steps: int = 50,
 ) -> dict[str, float]:
     model.eval()
-    total_loss = 0.0
-    total_correct = 0
-    total_rank = 0.0
-    total_reciprocal_rank = 0.0
-    total_recall_at_2 = 0
-    total_recall_at_3 = 0
-    total_recall_at_5 = 0
+    totals = metric_totals(7, device)
+    (
+        total_loss, total_correct, total_rank, total_reciprocal_rank,
+        total_recall_at_2, total_recall_at_3, total_recall_at_5,
+    ) = totals.unbind()
     total_examples = 0
 
     progress_bar = maybe_progress(loader, enabled=progress, desc=desc, leave=False)
-    for batch in progress_bar:
+    for step, batch in enumerate(progress_bar, start=1):
         batch = move_batch_to_device(batch, device)
         with torch.amp.autocast("cuda", enabled=use_amp):
             melody_embeddings, audio_embeddings = model(
@@ -587,6 +588,7 @@ def evaluate(
                 candidate_note_onsets=batch["candidate_note_onsets"],
                 candidate_note_durations=batch["candidate_note_durations"],
                 candidate_note_attention_mask=batch["candidate_note_attention_mask"],
+                candidate_notes_validated=batch.get("candidate_notes_validated", False),
             )
             loss, logits = grouped_info_nce_loss(
                 melody_embeddings=melody_embeddings,
@@ -600,20 +602,29 @@ def evaluate(
         targets = batch["target"].to(dtype=torch.long)
         target_logits = logits.gather(dim=1, index=targets[:, None])
         ranks = (logits >= target_logits).sum(dim=1)
-        total_loss += float(loss.detach().cpu()) * batch_size
-        total_correct += int((logits.argmax(dim=-1) == targets).sum().detach().cpu())
-        total_rank += float(ranks.sum().detach().cpu())
-        total_reciprocal_rank += float((1.0 / ranks.to(dtype=torch.float32)).sum().detach().cpu())
-        total_recall_at_2 += int((ranks <= 2).sum().detach().cpu())
-        total_recall_at_3 += int((ranks <= 3).sum().detach().cpu())
-        total_recall_at_5 += int((ranks <= 5).sum().detach().cpu())
+        total_loss.add_(loss.detach(), alpha=batch_size)
+        total_correct.add_((logits.argmax(dim=-1) == targets).sum())
+        total_rank.add_(ranks.sum())
+        total_reciprocal_rank.add_((1.0 / ranks.to(dtype=torch.float32)).sum())
+        total_recall_at_2.add_((ranks <= 2).sum())
+        total_recall_at_3.add_((ranks <= 3).sum())
+        total_recall_at_5.add_((ranks <= 5).sum())
         total_examples += batch_size
-        if tqdm is not None and hasattr(progress_bar, "set_postfix"):
+        if (
+            progress and log_every_steps > 0 and step % log_every_steps == 0
+            and hasattr(progress_bar, "set_postfix")
+        ):
+            logged = totals.cpu().tolist()
             progress_bar.set_postfix(
-                loss=total_loss / max(total_examples, 1),
-                acc=total_correct / max(total_examples, 1),
+                loss=logged[0] / max(total_examples, 1),
+                acc=logged[1] / max(total_examples, 1),
+                refresh=False,
             )
 
+    (
+        total_loss, total_correct, total_rank, total_reciprocal_rank,
+        total_recall_at_2, total_recall_at_3, total_recall_at_5,
+    ) = totals.cpu().tolist()
     return {
         "loss": total_loss / max(total_examples, 1),
         "accuracy": total_correct / max(total_examples, 1),
@@ -971,6 +982,10 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars.")
+    parser.add_argument(
+        "--log-every-steps", type=int, default=50,
+        help="Refresh train/validation progress metrics every N batches; 0 logs only epoch results.",
+    )
     parser.add_argument("--seed", type=int, default=13)
     return parser.parse_args()
 
@@ -985,6 +1000,8 @@ def main() -> None:
         raise SystemExit("--global-loss-weight must be non-negative")
     if args.epochs <= 0:
         raise SystemExit("--epochs must be positive")
+    if args.log_every_steps < 0:
+        raise SystemExit("--log-every-steps must be non-negative")
     if args.lr <= 0.0 or args.hubert_lr <= 0.0:
         raise SystemExit("--lr and --hubert-lr must be positive")
     if args.weight_decay < 0.0:
@@ -1257,6 +1274,7 @@ def main() -> None:
             scheduler=scheduler,
             progress=progress,
             desc=f"train epoch {epoch}/{args.epochs}",
+            log_every_steps=args.log_every_steps,
         )
 
         learning_rates = scheduler.learning_rates()
@@ -1298,6 +1316,7 @@ def main() -> None:
                 use_amp=use_amp,
                 progress=progress,
                 desc=f"val epoch {epoch}/{args.epochs}",
+                log_every_steps=args.log_every_steps,
             )
             metrics["val"] = val_metrics
             message += (

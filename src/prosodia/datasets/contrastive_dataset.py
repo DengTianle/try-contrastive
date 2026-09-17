@@ -941,6 +941,14 @@ def grouped_contrastive_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
 
     melody_batch = melody_only_collate(batch)
 
+    # Check the same note-presence invariant as the encoder while tensors are
+    # still on CPU. Invalid batches remain untrusted so note pooling raises its
+    # usual error; mean pooling can still ignore their note annotations.
+    valid_notes = candidate_note_attention_mask & (
+        candidate_note_onsets + candidate_note_durations > candidate_note_onsets
+    )
+    candidate_notes_validated = bool((valid_notes.any(dim=-1) | ~candidate_mask).all())
+
     return {
         "melody_features": melody_batch["melody_features"],
         "melody_attention_mask": melody_batch["melody_attention_mask"],
@@ -952,6 +960,7 @@ def grouped_contrastive_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "candidate_note_onsets": candidate_note_onsets,
         "candidate_note_durations": candidate_note_durations,
         "candidate_note_attention_mask": candidate_note_attention_mask,
+        "candidate_notes_validated": candidate_notes_validated,
         "candidate_mask": candidate_mask,
         "candidate_window_seconds": candidate_window_seconds,
         "target": torch.stack([item["target"] for item in batch]),

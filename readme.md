@@ -5,6 +5,11 @@ line or multi-line occurrences into positive variants.
 I have used a variant based on the InfoNCE loss: L_{hard negatives} + L_{in-batch}, where hard negatives are other segments from the same song, and in-batch compares with other positive samples in the batch. 
 Evaluation is against hard negatives (only). 
 
+Training and validation accumulate metrics on the device and transfer them together
+for progress updates every 50 batches. Set `--log-every-steps N` to change that
+interval, or `--log-every-steps 0` for epoch results only. `--no-progress` also
+avoids intermediate metric transfers. Epoch metrics always include every batch.
+
 ## Training batch planning
 
 Training with the global in-batch loss plans each epoch so that a batch contains at

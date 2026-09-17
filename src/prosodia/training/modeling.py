@@ -57,6 +57,7 @@ class MelodyAudioContrastiveModel(nn.Module):
         note_durations: torch.Tensor | None = None,
         note_attention_mask: torch.Tensor | None = None,
         return_note_embeddings: bool = False,
+        note_inputs_validated: bool = False,
     ) -> torch.Tensor | HubertEncoderOutput:
         return self.audio_encoder(
             input_values=input_values,
@@ -65,6 +66,7 @@ class MelodyAudioContrastiveModel(nn.Module):
             note_durations=note_durations,
             note_attention_mask=note_attention_mask,
             return_note_embeddings=return_note_embeddings,
+            note_inputs_validated=note_inputs_validated,
         )
 
     def forward(
@@ -76,6 +78,7 @@ class MelodyAudioContrastiveModel(nn.Module):
         candidate_note_onsets: torch.Tensor | None = None,
         candidate_note_durations: torch.Tensor | None = None,
         candidate_note_attention_mask: torch.Tensor | None = None,
+        candidate_notes_validated: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         melody_embeddings = self.encode_melody(
             melody_features=melody_features,
@@ -140,6 +143,7 @@ class MelodyAudioContrastiveModel(nn.Module):
             note_onsets=flat_note_onsets,
             note_durations=flat_note_durations,
             note_attention_mask=flat_note_mask,
+            note_inputs_validated=candidate_notes_validated,
         )
         if valid_indices is not None:
             # Restore candidate order and keep padding at zero. index_copy
