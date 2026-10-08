@@ -146,6 +146,8 @@ each retrieval set, every audio candidate is presented at the selected positive'
 duration. A shorter negative is extended with real surrounding song context, while a
 longer negative is cropped inside its prepared interval. Training randomizes the context
 placement; validation and evaluation use the center deterministically. Windows that
+fall entirely in an annotation gap move to the nearest note-centered placement,
+keeping the same duration and staying inside the prepared candidate. Windows that
 would have to cross a known congruent/repeated positive occurrence are excluded. Use
 `--candidate-window-policy segment` to preserve every complete prepared one- or
 multi-line interval (`line` is retained as a legacy alias).

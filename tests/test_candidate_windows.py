@@ -138,6 +138,66 @@ class CandidateWindowTest(unittest.TestCase):
             [1.0, 2.0, 3.0],
         )
 
+    def test_match_positive_crop_avoids_gap_between_annotated_lines(self) -> None:
+        # A one-second positive can fit entirely in the gap of this longer
+        # two-line negative, including at the deterministic center crop.
+        np.savez_compressed(
+            self.root / "long.npz",
+            midi_pitches=np.asarray([60, 64], dtype=np.int16),
+            onset_seconds=np.asarray([0.0, 2.75], dtype=np.float32),
+            note_duration_seconds=np.asarray([0.25, 0.25], dtype=np.float32),
+        )
+        for randomized in (False, True):
+            with self.subTest(randomized=randomized):
+                dataset = GroupedContrastiveDataset(
+                    self.manifest_path,
+                    candidate_window_policy="match-positive",
+                    randomize_candidate_windows=randomized,
+                )
+                index = next(
+                    i for i, group in enumerate(dataset.groups)
+                    if group["anchor"]["sample_id"] == "short"
+                )
+                # Force random training crops into the same gap as evaluation.
+                with patch.object(dataset_module.random, "randint", side_effect=lambda lo, hi: (lo + hi) // 2):
+                    item = dataset[index]
+                self.assertTrue(item["candidate_note_attention_mask"].any(dim=-1).all())
+                self.assertTrue((item["candidate_window_seconds"] == 1.0).all())
+                self.assertTrue(grouped_contrastive_collate([item])["candidate_notes_validated"])
+
+                positive = next(row for row in dataset.rows if row["sample_id"] == "short")
+                candidate = next(row for row in dataset.rows if row["sample_id"] == "long")
+                for offset in (0, 4000, 16000, 28000, 32000):
+                    with self.subTest(offset=offset), patch.object(
+                        dataset, "_select_window_offset", return_value=offset,
+                    ):
+                        window = dataset._candidate_audio_window(
+                            positive, candidate, [positive], 12 * 16000,
+                        )
+                        self.assertEqual(window[1], 16000)
+                        self.assertGreaterEqual(window[0], 0)
+                        self.assertLessEqual(sum(window), 3 * 16000)
+                        onsets, durations = dataset._candidate_note_timing(candidate, window)
+                        self.assertGreater(onsets.numel(), 0)
+                        self.assertTrue((durations > 0).all())
+                        if offset in (0, 32000):
+                            self.assertEqual(window[0], offset)
+
+    def test_match_positive_crop_reports_unannotated_candidate(self) -> None:
+        np.savez_compressed(
+            self.root / "long.npz",
+            midi_pitches=np.asarray([60], dtype=np.int16),
+            onset_seconds=np.asarray([0.0], dtype=np.float32),
+            note_duration_seconds=np.asarray([0.0], dtype=np.float32),
+        )
+        dataset = GroupedContrastiveDataset(
+            self.manifest_path, candidate_window_policy="match-positive",
+        )
+        positive = next(row for row in dataset.rows if row["sample_id"] == "short")
+        candidate = next(row for row in dataset.rows if row["sample_id"] == "long")
+        with self.assertRaisesRegex(ValueError, "No annotated notes.*long"):
+            dataset._candidate_audio_window(positive, candidate, [positive], 12 * 16000)
+
     def test_candidate_timing_cache_keeps_window_clipping_dynamic(self) -> None:
         dataset = GroupedContrastiveDataset(self.manifest_path, split="train")
         row = next(row for row in dataset.rows if row["sample_id"] == "long")

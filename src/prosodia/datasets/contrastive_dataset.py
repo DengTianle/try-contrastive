@@ -660,6 +660,29 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         if candidate_samples >= target_samples:
             maximum_offset = candidate_samples - target_samples
             offset = self._select_window_offset(maximum_offset)
+            window = candidate_start + offset, target_samples
+            if self._candidate_note_timing(candidate, window)[0].numel():
+                return window
+
+            # Multi-line segments can contain long gaps. A random crop (or the
+            # deterministic center crop) may fall wholly between annotated notes.
+            # Move only those empty crops to the nearest note-centered placement,
+            # keeping the duration and staying inside the prepared candidate.
+            onsets, durations = self._candidate_note_timing(
+                candidate, (candidate_start, candidate_samples),
+            )
+            if not onsets.numel():
+                raise ValueError(
+                    "No annotated notes overlap prepared candidate "
+                    f"{audio_sample_id(candidate)} ({candidate['melody_path']})"
+                )
+            note_centers = (
+                onsets.to(torch.float64) + durations.to(torch.float64) / 2
+            ) * self.audio_config.sample_rate
+            note_offsets = (note_centers - target_samples / 2).round().to(torch.long)
+            note_offsets = note_offsets.clamp(min=0, max=maximum_offset)
+            nearest = (note_offsets - offset).abs().argmin()
+            offset = int(note_offsets[nearest])
             return candidate_start + offset, target_samples
 
         lower_sample, upper_sample = self._safe_window_start_sample_bounds(

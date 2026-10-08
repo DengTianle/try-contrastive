@@ -5,8 +5,10 @@ __pycache__/
 data/
 checkpoints/
 tests/*
+docs/
 !tests/test_candidate_padding.py
 !tests/test_candidate_windows.py
+!tests/test_cluster_dl.py
 !tests/test_note_pooling.py
 !tests/test_plan_song_batches.py
 !tests/test_prepare_dali_dataset.py

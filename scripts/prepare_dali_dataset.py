@@ -158,8 +158,14 @@ def read_ground_truth_ids(gt_file: Path) -> set[str]:
     return set(data.keys())
 
 
-def find_audio_file(entry: Any, by_stem: dict[str, Path]) -> Path | None:
+def find_audio_file(
+    entry: Any, by_stem: dict[str, Path], strict_audio_dir: bool = False,
+) -> Path | None:
     dali_id = entry.info["id"]
+    if strict_audio_dir:
+        # A stem-only corpus must never fall back to a mixture in DALI metadata.
+        path = by_stem.get(dali_id)
+        return path.resolve(strict=False) if path is not None else None
     candidates = [dali_id]
 
     audio_path = entry.info.get("audio", {}).get("path")
@@ -793,6 +799,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dali-data-dir", type=Path, default=Path("data/DALI_v1"))
     parser.add_argument("--audio-dir", type=Path, default=Path("data/audio"))
+    parser.add_argument(
+        "--strict-audio-dir", action="store_true",
+        help="Only use <DALI id> audio indexed under --audio-dir; ignore metadata audio paths.",
+    )
     parser.add_argument("--output-dir", type=Path, default=Path("data/prepared/dali"))
     parser.add_argument("--gt-file", type=Path, default=None, help="Optional DALI ground-truth gzip file.")
     parser.add_argument(
@@ -967,7 +977,7 @@ def main() -> None:
     prepared_audio_count = 0
     for entry in entries:
         dali_id = entry.info["id"]
-        audio_path = find_audio_file(entry, by_stem)
+        audio_path = find_audio_file(entry, by_stem, strict_audio_dir=args.strict_audio_dir)
         if audio_path is None:
             skipped["no_audio"] += 1
             continue
