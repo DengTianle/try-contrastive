@@ -18,6 +18,8 @@ from train_contrastive import (
     StagedWarmupCosineScheduler,
     distributed_totals,
     evaluate,
+    parse_args,
+    resolve_amp_settings,
     step_optimizer_and_scheduler,
     train_one_epoch,
 )
@@ -42,6 +44,55 @@ class ProgressBatches(list):
 
     def set_postfix(self, **values):
         self.updates.append(values)
+
+
+class AmpPrecisionTest(unittest.TestCase):
+    def test_cli_preserves_fp16_default_and_accepts_bf16(self) -> None:
+        for flags, enabled, dtype in (
+            ([], False, "fp16"),
+            (["--amp"], True, "fp16"),
+            (["--amp", "--amp-dtype", "bf16"], True, "bf16"),
+        ):
+            with self.subTest(flags=flags), patch.object(sys, "argv", ["train_contrastive.py", *flags]):
+                args = parse_args()
+                self.assertEqual(args.amp, enabled)
+                self.assertEqual(args.amp_dtype, dtype)
+
+    def test_fp16_preserves_cuda_only_amp_behavior(self) -> None:
+        for requested, device_type, expected in (
+            (False, "cuda", False), (True, "cuda", True),
+            (True, "cpu", False), (True, "mps", False),
+        ):
+            with self.subTest(amp=requested, device=device_type):
+                self.assertEqual(
+                    resolve_amp_settings(requested, "fp16", torch.device(device_type)),
+                    (expected, torch.float16),
+                )
+
+    def test_bf16_requires_amp_and_cuda(self) -> None:
+        for requested, device_type, message in (
+            (False, "cuda", "requires --amp"),
+            (True, "cpu", "requires a CUDA device"),
+            (True, "mps", "requires a CUDA device"),
+        ):
+            with self.subTest(amp=requested, device=device_type), self.assertRaisesRegex(SystemExit, message):
+                resolve_amp_settings(requested, "bf16", torch.device(device_type))
+
+    def test_bf16_checks_native_support_on_selected_gpu(self) -> None:
+        device = torch.device("cuda:1")
+        for supported in (True, False):
+            with (
+                self.subTest(supported=supported),
+                patch("train_contrastive.torch.cuda.device") as selected_device,
+                patch("train_contrastive.torch.cuda.is_bf16_supported", return_value=supported) as support,
+            ):
+                if supported:
+                    self.assertEqual(resolve_amp_settings(True, "bf16", device), (True, torch.bfloat16))
+                else:
+                    with self.assertRaisesRegex(SystemExit, "native BF16 support"):
+                        resolve_amp_settings(True, "bf16", device)
+                selected_device.assert_called_once_with(device)
+                support.assert_called_once_with(including_emulation=False)
 
 
 class EpochMetricsTest(unittest.TestCase):

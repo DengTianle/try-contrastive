@@ -67,6 +67,26 @@ def choose_device(requested: str) -> torch.device:
     return torch.device("cpu")
 
 
+def resolve_amp_settings(
+    amp: bool,
+    amp_dtype: str,
+    device: torch.device,
+) -> tuple[bool, torch.dtype]:
+    dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}[amp_dtype]
+    if amp_dtype == "bf16":
+        if not amp:
+            raise SystemExit("--amp-dtype bf16 requires --amp")
+        if device.type != "cuda":
+            raise SystemExit("--amp-dtype bf16 requires a CUDA device")
+        with torch.cuda.device(device):
+            if not torch.cuda.is_bf16_supported(including_emulation=False):
+                raise SystemExit(
+                    "--amp-dtype bf16 requires a GPU with native BF16 support; "
+                    "use --amp-dtype fp16 on this device"
+                )
+    return amp and device.type == "cuda", dtype
+
+
 def initialize_distributed(requested_device: str) -> tuple[torch.device, int, int]:
     """Initialize torchrun's process group and select this process's GPU."""
 
@@ -434,6 +454,7 @@ def train_one_epoch(
     progress: bool,
     desc: str,
     log_every_steps: int = 50,
+    amp_dtype: torch.dtype = torch.float16,
 ) -> dict[str, float]:
     model.train()
     totals = metric_totals(6, device)
@@ -448,7 +469,7 @@ def train_one_epoch(
         batch = move_batch_to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
 
-        with torch.amp.autocast("cuda", enabled=use_amp):
+        with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
             candidate_input_values = augment_candidate_audio(
                 candidate_input_values=batch["candidate_input_values"],
                 candidate_audio_attention_mask=batch["candidate_audio_attention_mask"],
@@ -567,6 +588,7 @@ def evaluate(
     progress: bool,
     desc: str,
     log_every_steps: int = 50,
+    amp_dtype: torch.dtype = torch.float16,
 ) -> dict[str, float]:
     model.eval()
     totals = metric_totals(7, device)
@@ -579,7 +601,7 @@ def evaluate(
     progress_bar = maybe_progress(loader, enabled=progress, desc=desc, leave=False)
     for step, batch in enumerate(progress_bar, start=1):
         batch = move_batch_to_device(batch, device)
-        with torch.amp.autocast("cuda", enabled=use_amp):
+        with torch.amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
             melody_embeddings, audio_embeddings = model(
                 melody_features=batch["melody_features"],
                 melody_attention_mask=batch["melody_attention_mask"],
@@ -930,7 +952,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--device", default="auto")
-    parser.add_argument("--amp", action="store_true", help="Use CUDA mixed precision.")
+    parser.add_argument("--amp", action="store_true", help="Use CUDA mixed precision (FP16 by default).")
+    parser.add_argument(
+        "--amp-dtype", choices=["fp16", "bf16"], default="fp16",
+        help="CUDA mixed-precision dtype used with --amp. BF16 requires native GPU support.",
+    )
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
     parser.add_argument("--melody-d-model", type=int, default=256)
     parser.add_argument("--melody-num-layers", type=int, default=4)
@@ -1040,7 +1066,7 @@ def main() -> None:
     is_main_process = rank == 0
     random.seed(args.seed + rank)
     torch.manual_seed(args.seed + rank)
-    use_amp = args.amp and device.type == "cuda"
+    use_amp, amp_dtype = resolve_amp_settings(args.amp, args.amp_dtype, device)
     progress = not args.no_progress and is_main_process
     if progress and tqdm is None:
         print("tqdm is not installed; continuing without progress bars.")
@@ -1201,7 +1227,9 @@ def main() -> None:
         min_lr_ratio=args.min_lr_ratio,
         enabled=args.lr_scheduler == "warmup-cosine",
     )
-    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler = torch.amp.GradScaler(
+        "cuda", enabled=use_amp and amp_dtype == torch.float16,
+    )
 
     args.steps_per_epoch = steps_per_epoch
     args.total_training_steps = total_training_steps
@@ -1270,6 +1298,7 @@ def main() -> None:
             audio_background_mix_snr_db=args.audio_background_mix_snr_db,
             grad_clip_norm=args.grad_clip_norm,
             use_amp=use_amp,
+            amp_dtype=amp_dtype,
             scaler=scaler,
             scheduler=scheduler,
             progress=progress,
@@ -1314,6 +1343,7 @@ def main() -> None:
                 device=device,
                 temperature=args.temperature,
                 use_amp=use_amp,
+                amp_dtype=amp_dtype,
                 progress=progress,
                 desc=f"val epoch {epoch}/{args.epochs}",
                 log_every_steps=args.log_every_steps,

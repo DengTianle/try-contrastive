@@ -10,6 +10,16 @@ for progress updates every 50 batches. Set `--log-every-steps N` to change that
 interval, or `--log-every-steps 0` for epoch results only. `--no-progress` also
 avoids intermediate metric transfers. Epoch metrics always include every batch.
 
+CUDA mixed precision is optional: `--amp` uses FP16, while
+`--amp --amp-dtype bf16` uses BF16 for training and validation on GPUs with native
+BF16 support, including the H100. BF16 runs without gradient scaling; FP16 retains
+gradient scaling. Without `--amp`, training uses FP32. For example:
+
+```bash
+conda run -n try-contrastive python scripts/train_contrastive.py \
+  --amp --amp-dtype bf16
+```
+
 ## Map YouTube IDs to DALI IDs
 
 Put one YouTube video ID or URL per line in `youtube_ids.txt`, then run:
