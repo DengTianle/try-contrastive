@@ -250,26 +250,37 @@ def split_track_ids(
     seed: int,
     train_ratio: float,
     val_ratio: float,
+    train_exclude_ids: set[str] | None = None,
 ) -> dict[str, str]:
+    """Keep every track, assigning train-ineligible IDs only to val/test."""
     ids = list(track_ids)
     random.Random(seed).shuffle(ids)
+    excluded = train_exclude_ids or set()
     n = len(ids)
     if n == 1:
-        return {ids[0]: "train"}
+        return {ids[0]: "test" if ids[0] in excluded else "train"}
 
     n_train = max(1, int(round(n * train_ratio)))
     n_val = max(1, int(round(n * val_ratio))) if n >= 3 else 0
     if n_train + n_val >= n:
         n_train = max(1, n - n_val - 1)
 
+    eligible_ids = [dali_id for dali_id in ids if dali_id not in excluded]
+    if len(eligible_ids) < n_train:
+        n_train = len(eligible_ids)
+        # If restrictions enlarge the held-out pool, share it according to the
+        # requested val:test proportions while retaining both splits when possible.
+        n_val = int(round((n - n_train) * val_ratio / (1.0 - train_ratio)))
+        if n >= 3 or (val_ratio > 0.0 and n - n_train >= 2):
+            n_val = min(n - n_train - 1, max(1, n_val))
+    train_ids = set(eligible_ids[:n_train])
+    held_out_ids = [dali_id for dali_id in ids if dali_id not in train_ids]
     split_by_id = {}
-    for index, dali_id in enumerate(ids):
-        if index < n_train:
+    for dali_id in ids:
+        if dali_id in train_ids:
             split_by_id[dali_id] = "train"
-        elif index < n_train + n_val:
-            split_by_id[dali_id] = "val"
-        else:
-            split_by_id[dali_id] = "test"
+    for index, dali_id in enumerate(held_out_ids):
+        split_by_id[dali_id] = "val" if index < n_val else "test"
     return split_by_id
 
 
@@ -812,6 +823,19 @@ def parse_args() -> argparse.Namespace:
         help="Prepare only DALI ids listed in this text file (one id per line).",
     )
     parser.add_argument(
+        "--train-exclude-file",
+        "--exclude-file",
+        dest="train_exclude_file",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "Exclude DALI ids in this text file from train only (one id "
+            "per line). Repeat for multiple downstream val/eval lists. "
+            "Listed songs remain available for the prepared val/test splits."
+        ),
+    )
+    parser.add_argument(
         "--ground-truth-only",
         action="store_true",
         help="Use only DALI ids present in --gt-file. Useful for small aligned experiments.",
@@ -903,6 +927,12 @@ def main() -> None:
         args.gt_file = resolve_user_path(args.gt_file)
     if args.keep_file is not None:
         args.keep_file = resolve_user_path(args.keep_file)
+    args.train_exclude_file = [resolve_user_path(path) for path in args.train_exclude_file]
+    train_exclude_ids = {
+        dali_id
+        for path in args.train_exclude_file
+        for dali_id in read_keep_file(path)
+    }
     repeat_groupings_path = None
     repeat_groupings: dict[tuple[str, int], dict[str, Any]] = {}
     grouped_song_ids: set[str] = set()
@@ -968,6 +998,11 @@ def main() -> None:
     print(f"Loaded {len(dali_data)} DALI entries and indexed {len(audio_files)} audio files.")
 
     entries = list(dali_data.values())
+    if args.train_exclude_file:
+        print(
+            f"Loaded {len(train_exclude_ids)} unique train-excluded IDs from "
+            f"{len(args.train_exclude_file)} files; matching songs remain available for val/test."
+        )
     entries.sort(key=lambda entry: entry.info["id"])
     random.Random(args.seed).shuffle(entries)
 
@@ -1056,6 +1091,7 @@ def main() -> None:
         seed=args.seed,
         train_ratio=args.train_ratio,
         val_ratio=args.val_ratio,
+        train_exclude_ids=train_exclude_ids,
     )
 
     all_segments: list[dict[str, Any]] = []
@@ -1184,6 +1220,14 @@ def main() -> None:
             if args.keep_file is not None
             else None
         ),
+        "train_exclude_files": [
+            manifest_relative_path(path, metadata_path.parent)
+            for path in args.train_exclude_file
+        ],
+        "train_exclude_ids": sorted(train_exclude_ids),
+        "num_train_excluded_tracks_prepared": sum(
+            track["dali_id"] in train_exclude_ids for track in usable_tracks
+        ),
         "prepared_audio_dir": manifest_relative_path(args.prepared_audio_dir, metadata_path.parent),
         "audio_format": args.audio_format,
         "skip_audio_prep": args.skip_audio_prep,
@@ -1233,6 +1277,9 @@ def main() -> None:
         "duration_sources": dict(duration_sources),
         "skipped_segments": dict(skipped_segments),
         "split_counts": dict(Counter(row["split"] for row in segment_rows)),
+        "split_track_counts": dict(Counter(
+            split_by_id[dali_id] for dali_id in {row["dali_id"] for row in segment_rows}
+        )),
     }
     with metadata_path.open("w", encoding="utf-8") as handle:
         json.dump(metadata, handle, indent=2, sort_keys=True)

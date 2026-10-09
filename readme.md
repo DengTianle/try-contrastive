@@ -10,6 +10,23 @@ for progress updates every 50 batches. Set `--log-every-steps N` to change that
 interval, or `--log-every-steps 0` for epoch results only. `--no-progress` also
 avoids intermediate metric transfers. Epoch metrics always include every batch.
 
+## Map YouTube IDs to DALI IDs
+
+Put one YouTube video ID or URL per line in `youtube_ids.txt`, then run:
+
+```bash
+conda run -n try-contrastive python youtube_to_dali_ids.py \
+  --youtube-ids-file youtube_ids.txt \
+  --output matched_dali_ids.txt
+```
+
+This searches all local DALI v2 annotations. Add `--ids-file dali_v2_english_ids.txt`
+to search only that subset, or `--dali-data-dir data/DALI_v1` to use DALI v1.
+The script writes a unique DALI ID list, a CSV mapping, and an unmatched YouTube
+ID list beside the output. It preserves every matching DALI entry when a video
+has multiple matches. Matching uses the recorded video ID and does not check
+current YouTube availability or identify other uploads of the same song.
+
 ## Training batch planning
 
 Training with the global in-batch loss plans each epoch so that a batch contains at
@@ -87,6 +104,37 @@ as negatives, but they are not promoted to positives without melody evidence.
 To prepare only a specific set of songs, put one DALI id per line in a text
 file and pass `--keep-file path/to/song_ids.txt`. Blank lines and `#` comments
 are ignored.
+
+To prevent downstream validation/evaluation songs from entering contrastive training,
+export their **DALI IDs** (one per line) and pass each list with `--train-exclude-file`:
+
+```bash
+conda run -n try-contrastive python scripts/prepare_dali_dataset.py \
+  --dali-data-dir data/DALI_v2/annot_tismir \
+  --audio-dir data/audio \
+  --output-dir data/prepared/dali_downstream_safe \
+  --train-exclude-file downstream_val_dali_ids.txt \
+  --train-exclude-file downstream_eval_dali_ids.txt
+```
+
+Listed songs are prepared normally and assigned only to contrastive **val/test**.
+The splitter selects train songs from the remaining eligible IDs, keeping the usual
+split sizes when possible. If there are too few train-eligible songs, train shrinks
+and val/test grow in the requested val:test proportions. Every usable song is retained,
+subject to the existing quality gates and optional track/segment limits. If every
+song is train-excluded, preparation succeeds with val/test only.
+`--exclude-file` is an alias for `--train-exclude-file` with the same train-only behavior.
+
+`--keep-file` still selects the overall prepared pool, rather than assigning every
+listed song to train. `metadata.json` records the train-exclusion files, their combined
+ID list, the number of prepared songs barred from train, and per-split track counts.
+Use a new output directory to keep this manifest separate from earlier preparations,
+and point training at its `segments_manifest.csv`.
+
+If the downstream export contains YouTube IDs, first convert it with
+`youtube_to_dali_ids.py` as described above. Train restrictions only apply to matching
+DALI entries; include every known DALI ID for a held-out song when multiple entries
+or uploads represent that song.
 
 Preparation discards an individual line longer than 10 seconds or containing fewer
 than three overlapping notes by default. Override these gates with

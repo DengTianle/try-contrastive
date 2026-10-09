@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import csv
+import io
+import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -15,9 +21,11 @@ sys.path.insert(0, str(PROJECT_ROOT / "src"))
 from prepare_dali_dataset import (
     build_line_windows,
     extract_segment_note_arrays,
+    main,
     note_coverage_ratio,
     read_keep_file,
     segment_quality_skip_reason,
+    split_track_ids,
 )
 from prosodia.melody_encoder import (
     DURATION_SLICE,
@@ -39,6 +47,127 @@ class KeepFileTest(unittest.TestCase):
             )
 
             self.assertEqual(read_keep_file(keep_file), ["song-a", "song-b", "song-a"])
+
+
+class TrainExcludeFileTest(unittest.TestCase):
+    def test_holdouts_are_prepared_but_never_assigned_to_train(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            annotations = root / "annotations"
+            audio = root / "audio"
+            output = root / "prepared"
+            annotations.mkdir()
+            audio.mkdir()
+            (annotations / "dummy.gz").touch()
+            song_ids = [f"song-{index}" for index in range(8)]
+            for song_id in song_ids:
+                (audio / f"{song_id}.flac").touch()
+            keep = root / "keep.txt"
+            keep.write_text("\n".join(song_ids), encoding="utf-8")
+            val = root / "val.txt"
+            val.write_text("song-0\nsong-0 # duplicate\n\n", encoding="utf-8")
+            evaluation = root / "eval.txt"
+            evaluation.write_text("# holdouts\nsong-1\nnot-downloaded\n", encoding="utf-8")
+            dataset = {
+                song_id: SimpleNamespace(
+                    info={"id": song_id},
+                    annotations={"annot": {
+                        "lines": [{"time": [0.0, 1.0], "text": "a lyric"}],
+                        "notes": [
+                            {"time": [start, start + 0.2], "freq": [440.0]}
+                            for start in (0.0, 0.3, 0.6)
+                        ],
+                    }},
+                )
+                for song_id in song_ids
+            }
+            argv = [
+                "prepare_dali_dataset.py",
+                "--dali-data-dir", str(annotations),
+                "--audio-dir", str(audio),
+                "--output-dir", str(output),
+                "--keep-file", str(keep),
+                "--train-exclude-file", str(val),
+                # The initial option name remains an alias for train exclusion.
+                "--exclude-file", str(evaluation),
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch("prepare_dali_dataset.load_dali", return_value=dataset) as loader,
+                patch("prepare_dali_dataset.audio_duration_seconds", return_value=1.0),
+                patch("prepare_dali_dataset.prepare_audio_file") as prepare_audio,
+                redirect_stdout(io.StringIO()),
+            ):
+                prepare_audio.side_effect = lambda **kwargs: kwargs["input_path"]
+                main()
+
+            self.assertEqual(loader.call_args.kwargs["keep_ids"], set(song_ids))
+            processed = {call.kwargs["dali_id"] for call in prepare_audio.call_args_list}
+            self.assertEqual(processed, set(song_ids))
+            with (output / "segments_manifest.csv").open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual({row["dali_id"] for row in rows}, set(song_ids))
+            self.assertEqual({row["split"] for row in rows}, {"train", "val", "test"})
+            self.assertTrue(all(row["split"] != "train" for row in rows if row["dali_id"] in song_ids[:2]))
+            self.assertEqual(sum(row["split"] == "train" for row in rows), 6)
+            metadata = json.loads((output / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["train_exclude_ids"], ["not-downloaded", "song-0", "song-1"])
+            self.assertEqual(metadata["num_train_excluded_tracks_prepared"], 2)
+            self.assertEqual(metadata["train_exclude_files"], ["../val.txt", "../eval.txt"])
+            self.assertEqual(metadata["split_track_counts"], {"train": 6, "val": 1, "test": 1})
+
+            # Even if every song is train-excluded, preparation retains them all.
+            val.write_text("\n".join(song_ids), encoding="utf-8")
+            with (
+                patch.object(sys, "argv", argv + ["--skip-audio-prep"]),
+                patch("prepare_dali_dataset.load_dali", return_value=dataset),
+                patch("prepare_dali_dataset.audio_duration_seconds", return_value=1.0),
+                redirect_stdout(io.StringIO()),
+            ):
+                main()
+            metadata = json.loads((output / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["num_tracks"], 8)
+            self.assertEqual(metadata["split_track_counts"], {"val": 4, "test": 4})
+            with (output / "segments_manifest.csv").open(newline="", encoding="utf-8") as handle:
+                rows = list(csv.DictReader(handle))
+            self.assertEqual({row["dali_id"] for row in rows}, set(song_ids))
+            self.assertTrue(all(row["split"] != "train" for row in rows))
+
+
+class TrainRestrictedSplitTest(unittest.TestCase):
+    def test_large_exclusion_keeps_all_songs_and_uses_all_eligible_train_ids(self) -> None:
+        ids = [f"song-{index}" for index in range(20)]
+        excluded = set(ids[:15])
+        for seed in range(20):
+            with self.subTest(seed=seed):
+                splits = split_track_ids(ids, seed, 0.8, 0.1, excluded)
+                self.assertEqual(set(splits), set(ids))
+                self.assertEqual({key for key, value in splits.items() if value == "train"}, set(ids[15:]))
+                self.assertTrue(all(splits[key] in {"val", "test"} for key in excluded))
+                counts = [list(splits.values()).count(split) for split in ("val", "test")]
+                self.assertLessEqual(abs(counts[0] - counts[1]), 1)
+                self.assertEqual(splits, split_track_ids(ids, seed, 0.8, 0.1, excluded))
+
+    def test_single_train_excluded_song_is_retained_in_test(self) -> None:
+        self.assertEqual(split_track_ids(["song"], 13, 0.8, 0.1, {"song"}), {"song": "test"})
+        self.assertEqual(split_track_ids(["song"], 13, 0.8, 0.1), {"song": "train"})
+
+    def test_unmatched_exclusions_preserve_the_default_split(self) -> None:
+        ids = [f"song-{index}" for index in range(10)]
+        splits = split_track_ids(ids, 13, 0.8, 0.1)
+        self.assertEqual(splits, split_track_ids(ids, 13, 0.8, 0.1, {"absent"}))
+        self.assertEqual([list(splits.values()).count(split) for split in ("train", "val", "test")], [8, 1, 1])
+
+    def test_two_train_excluded_songs_remain_in_held_out_splits(self) -> None:
+        for train_ratio, val_ratio in [(0.8, 0.1), (0.5, 0.49)]:
+            splits = split_track_ids(["a", "b"], 13, train_ratio, val_ratio, {"a", "b"})
+            self.assertEqual(set(splits), {"a", "b"})
+            self.assertEqual(set(splits.values()), {"val", "test"})
+
+    def test_enlarged_holdout_uses_requested_val_to_test_proportions(self) -> None:
+        ids = [str(index) for index in range(100)]
+        splits = split_track_ids(ids, 13, 0.7, 0.1, set(ids[:60]))
+        self.assertEqual([list(splits.values()).count(split) for split in ("train", "val", "test")], [40, 20, 40])
 
 
 class SegmentQualityTest(unittest.TestCase):
