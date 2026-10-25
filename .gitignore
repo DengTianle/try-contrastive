@@ -21,6 +21,7 @@ docs/
 *.png
 *.pt
 *.csv
+*.flac
 
 test_load.py
 results_10Jun.txt

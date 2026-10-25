@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import sys
 import copy
+import math
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 from transformers import HubertConfig, HubertModel
@@ -23,7 +24,7 @@ from prosodia.training import (
     build_contrastive_model_from_checkpoint_args,
     grouped_info_nce_loss,
 )
-from train_contrastive import save_checkpoint
+from train_contrastive import evaluate, save_checkpoint, train_one_epoch
 
 
 class CandidatePaddingTest(unittest.TestCase):
@@ -181,6 +182,61 @@ class CandidatePaddingTest(unittest.TestCase):
         ):
             self.test_mixed_candidate_counts_skip_padding_and_preserve_order()
             self.test_mixed_candidate_counts_preserve_training_gradients()
+
+    def test_bf16_training_and_validation_with_trainable_hubert(self) -> None:
+        self.model.audio_encoder.set_hubert_trainable_layers(1)
+        optimizer = torch.optim.SGD(self.model.parameters(), lr=0.01)
+        scaler = torch.amp.GradScaler("cpu", enabled=False)
+        scheduler = SimpleNamespace(step=Mock())
+        before = self.model.melody_encoder.input_projection[0].weight.detach().clone()
+        output_dtypes = []
+        hook = self.model.register_forward_hook(
+            lambda module, args, output: output_dtypes.append(tuple(t.dtype for t in output)),
+        )
+        original_autocast = torch.amp.autocast
+        cuda_autocast_calls = []
+
+        def cpu_autocast(device_type, **kwargs):
+            # Exercise actual BF16 math on hosts without CUDA while checking
+            # that both production loops request CUDA autocast with BF16.
+            # HuBERT checkpoint recomputation also restores CPU autocast.
+            if device_type == "cuda":
+                self.assertEqual(kwargs, dict(enabled=True, dtype=torch.bfloat16))
+                cuda_autocast_calls.append(kwargs)
+                device_type = "cpu"
+            return original_autocast(device_type, **kwargs)
+
+        common = dict(
+            model=self.model, loader=[self.batch], device=torch.device("cpu"),
+            temperature=0.07, use_amp=True, amp_dtype=torch.bfloat16,
+            progress=False, desc="test BF16",
+        )
+        try:
+            with patch("train_contrastive.torch.amp.autocast", side_effect=cpu_autocast):
+                train_metrics = train_one_epoch(
+                    **common, optimizer=optimizer, scaler=scaler, scheduler=scheduler,
+                    global_loss_weight=0.5, symmetric_global_loss=True,
+                    audio_noise_snr_db=None, audio_background_mix_prob=0.0,
+                    audio_background_mix_snr_db=35.0, grad_clip_norm=1.0,
+                )
+                val_metrics = evaluate(**common)
+        finally:
+            hook.remove()
+
+        self.assertEqual(len(cuda_autocast_calls), 2)
+        self.assertEqual(output_dtypes, [(torch.bfloat16, torch.bfloat16)] * 2)
+        self.assertTrue(all(math.isfinite(v) for v in (*train_metrics.values(), *val_metrics.values())))
+        self.assertFalse(torch.equal(before, self.model.melody_encoder.input_projection[0].weight))
+        scheduler.step.assert_called_once_with()
+        for module in (
+            self.model.melody_encoder,
+            self.model.audio_encoder.projection,
+            self.model.audio_encoder.hubert.encoder.layers[-1],
+        ):
+            gradients = [p.grad for p in module.parameters() if p.grad is not None]
+            self.assertTrue(gradients)
+            self.assertTrue(all(torch.isfinite(grad).all() for grad in gradients))
+            self.assertGreater(sum(float(grad.abs().sum()) for grad in gradients), 0.0)
 
     def test_checkpoint_round_trip_restores_both_pooling_modes(self) -> None:
         optimizer = torch.optim.AdamW(self.model.parameters())
