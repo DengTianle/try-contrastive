@@ -27,6 +27,7 @@ from prosodia.melody_encoder import (
     MELODY_REPRESENTATION,
     hz_to_midi_pitch,
 )
+from prosodia.datasets.stress_metadata import STRESS_METADATA_VERSION, build_stress_metadata, write_stress_metadata
 
 
 AUDIO_EXTENSIONS = {".wav", ".flac", ".mp3", ".m4a", ".ogg", ".aac"}
@@ -754,6 +755,7 @@ def row_for_segment(
         "audio_path": manifest_relative_path(track_info["audio_path"], manifest_dir),
         "raw_audio_path": manifest_relative_path(track_info["raw_audio_path"], manifest_dir),
         "melody_path": manifest_relative_path(segment["melody_path"], manifest_dir),
+        "stress_metadata_path": manifest_relative_path(segment["stress_metadata_path"], manifest_dir),
         "audio_duration_seconds": f"{track_info['duration']:.6f}",
         "start_seconds": f"{segment['start_seconds']:.6f}",
         "end_seconds": f"{segment['end_seconds']:.6f}",
@@ -1147,10 +1149,15 @@ def main() -> None:
                 start_seconds=start_seconds,
                 segment_seconds=segment_seconds,
             )
+            stress_metadata_path = write_stress_metadata(
+                args.output_dir / "stress_metadata" / f"{sample_id}.npz",
+                build_stress_metadata(track["entry"], track["notes"], start_seconds, segment_seconds),
+            )
             segment = {
                 "sample_id": sample_id,
                 "dali_id": track["dali_id"],
                 "melody_path": melody_path,
+                "stress_metadata_path": stress_metadata_path,
                 "start_seconds": start_seconds,
                 "end_seconds": window["end_seconds"],
                 "segment_seconds": segment_seconds,
@@ -1233,6 +1240,7 @@ def main() -> None:
         "skip_audio_prep": args.skip_audio_prep,
         "sample_rate": args.sample_rate,
         "segmentation_strategy": "fixed_consecutive_dali_line_windows",
+        "stress_metadata_version": STRESS_METADATA_VERSION,
         "lines_per_segment": args.lines_per_segment,
         "segment_stride_lines": args.segment_stride_lines,
         "repeated_line_policy": (

@@ -226,6 +226,92 @@ The model and collate path already pad variable note and waveform lengths. Reduc
 `--batch-size` and/or `--max-negatives` for longer windows as needed; keep at least two
 examples per GPU when relying on the local in-batch contrastive loss.
 
+## Stress hard negatives
+
+Enable `--stress-negatives` to add one synthetic audio candidate to a subset of
+training retrieval sets. The candidate is made from the **selected positive
+occurrence**, including repeated/retexted positives, with identical duration and
+note timings. It reverses strong/weak word-level loudness ranks within lyric
+lines. One gain is applied across each whole word, preserving relative levels
+between its syllables and notes. This targets conventional sung prominence while
+limiting changes to pronunciation; it does not explicitly change lexical stress
+inside words.
+
+Defaults leave **epochs 1–4 completely free of these negatives**. Generation starts
+in epoch 5, and its loss weight increases linearly over epochs 5–6 to 0.25. It then
+stays at 0.25 for **every remaining epoch**. Use
+`--stress-negative-start-epoch 7` to leave six complete warm-up epochs instead.
+`--stress-negative-ramp-epochs 0` applies the final weight immediately at the start.
+There is no automatic end epoch. The feature is opt-in; ordinary training remains
+available without word metadata.
+
+New runs of `scripts/prepare_dali_dataset.py` automatically write small word
+metadata files and a `stress_metadata_path` manifest column. For an existing
+**note-level** manifest, add that metadata without reprocessing audio:
+
+```bash
+conda run -n try-contrastive python scripts/prepare_stress_metadata.py \
+  --manifest data/prepared/dali_seg2/segments_manifest.csv \
+  --dali-data-dir data/DALI_v1
+```
+
+This writes `stress_segments_manifest.csv` beside the source. The source manifest,
+audio, and melody features are preserved. Use the same DALI version and optional
+`--gt-file` as the original preparation: the backfill checks pitches and timings
+before associating words with notes. Obsolete frame-level manifests still need
+fresh note-level preparation. Missing or inconsistent word links are not guessed.
+
+```bash
+conda run -n try-contrastive python scripts/train_contrastive.py \
+  --manifest data/prepared/dali_seg2/stress_segments_manifest.csv \
+  --output-dir checkpoints/contrastive_stress \
+  --stress-negatives \
+  --stress-negative-start-epoch 5 \
+  --stress-negative-ramp-epochs 2 \
+  --stress-negative-weight 0.25 \
+  --audio-noise-snr-db 35
+```
+
+`--stress-negative-prob` defaults to 0.5: half of active training anchors attempt an
+edit. Generation runs in CPU data-loader workers with reproducible sample/epoch
+randomness. Each edit uses robust 20 ms active-frame RMS statistics and a bounded
+search for rank reversals. Default gain limits are ±6 dB with 20 ms smooth boundary
+ramps. An accepted edit must change 60–80% of eligible notes by at least 1.5 dB,
+cover at least 50% of eligible note duration, and reverse the mean loudness rank
+correlation of edited lines to at most −0.25. Short/silent notes, overlapping or
+truncated words, and lines without three usable words and 3 dB of contrast are
+excluded. At least 80% of notes must have trustworthy word links. A bounded
+three-word permutation fallback handles short lines where pair swaps cannot meet
+the requested coverage. Segments still failing the gates produce no negative.
+
+The edited clip is matched to the positive's RMS. Edits requiring peaks above
+0.99 are rejected rather than clipped. Existing quiet-noise/background augmentation
+is applied afterwards with the same settings for all candidate types. Adjust
+`--stress-negative-max-gain-db`, `--stress-negative-min-changed-fraction`, and
+`--stress-negative-max-changed-fraction` to study other strengths/coverage levels.
+
+Only synthetic-negative denominator terms are multiplied by their scheduled
+weight: the positive and ordinary negatives retain weight 1. The in-batch loss
+still uses the original selected positives. Accuracy uses **raw, unweighted**
+similarities. Training logs/checkpoints include acceptance rate/count, positive
+versus synthetic accuracy, cosine score gap, synthetic selection rate, and
+ordinary-candidate accuracy. The complete effective augmentation configuration is
+saved in checkpoint arguments. Normal validation/evaluation uses natural candidates
+only, so those metrics remain comparable across experiments.
+
+Listen to accepted pairs and inspect rejection counts before committing a run:
+
+```bash
+conda run -n try-contrastive python scripts/preview_stress_negatives.py \
+  --manifest data/prepared/dali_seg2/stress_segments_manifest.csv \
+  --output-dir data/stress_preview --num-examples 8
+```
+
+The preview writes floating-point WAV pairs and `report.json` with measured
+coverage/rank changes and rejection reasons. Synthetic discrimination alone does
+not demonstrate better melody note embeddings; evaluate the downstream stress task
+or a frozen note-level probe as well as ordinary retrieval.
+
 ## Evaluation
 
 ```bash

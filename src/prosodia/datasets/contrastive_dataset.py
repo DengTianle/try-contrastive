@@ -13,6 +13,8 @@ import torch
 from torch.utils.data import Dataset
 
 from prosodia.melody_encoder import MELODY_FEATURE_DIM, encode_note_sequence
+from .stress_augmentation import StressNegativeConfig, reverse_word_prominence
+from .stress_metadata import load_stress_metadata
 
 
 POSITIVE_VARIANT_POLICIES = {"self", "any", "retexted", "retexted-first"}
@@ -174,6 +176,7 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         randomize_candidate_windows: bool = False,
         seed: int = 13,
         transform: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
+        stress_negative_config: StressNegativeConfig | None = None,
     ) -> None:
         self.manifest_path = Path(manifest_path).expanduser().resolve(strict=False)
         self.manifest_dir = self.manifest_path.parent
@@ -197,6 +200,8 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         self.epoch = 0
         self.max_negatives = max_negatives
         self.transform = transform
+        self.stress_negative_config = stress_negative_config
+        self._stress_metadata_by_path: dict[str, dict[str, np.ndarray]] = {}
         self._audio_frames_by_path: dict[str, int] = {}
         # Dataset-local (and worker-local) cache of small, unmodified timing
         # tensors. Cropped windows and full melody features are never cached.
@@ -208,6 +213,18 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
 
         if split is not None:
             rows = [row for row in rows if row["split"] == split]
+        if self.stress_negative_config is not None:
+            missing_metadata = [
+                row["sample_id"] for row in rows
+                if not row.get("stress_metadata_path") or not Path(row["stress_metadata_path"]).is_file()
+            ]
+            if missing_metadata:
+                raise ValueError(
+                    f"Stress negatives require word metadata ({len(missing_metadata)} missing, "
+                    f"first: {missing_metadata[0]}). Run scripts/prepare_stress_metadata.py "
+                    "--manifest <manifest> --dali-data-dir <original annotations>, then "
+                    "use its stress_segments_manifest.csv. New preparations include it automatically."
+                )
         if self.candidate_window_policy == "match-positive":
             self._cache_audio_metadata(rows)
         self.rows = rows
@@ -216,7 +233,7 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
 
     def _resolve_row_paths(self, row: dict[str, str]) -> dict[str, str]:
         resolved = dict(row)
-        for key in ("audio_path", "raw_audio_path", "melody_path"):
+        for key in ("audio_path", "raw_audio_path", "melody_path", "stress_metadata_path"):
             if resolved.get(key):
                 resolved[key] = resolve_manifest_path(resolved[key], self.manifest_dir)
         return resolved
@@ -454,12 +471,6 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         positive, negatives = self._select_group_candidates(group)
         candidate_rows = [positive, *negatives]
         target = 0
-        if len(candidate_rows) > 1:
-            order = list(range(len(candidate_rows)))
-            rng = self._selection_rng(f"{group['melody_sample_id']}:candidate_order")
-            rng.shuffle(order)
-            target = order.index(0)
-            candidate_rows = [candidate_rows[index] for index in order]
         melody = load_melody(anchor["melody_path"], self.melody_config)
         anchor_path = anchor["melody_path"]
         if anchor_path not in self._note_timing_by_path:
@@ -474,21 +485,48 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
             candidate_rows=candidate_rows,
             protected_rows=group["protected_rows"],
         )
-        candidate_input_values, candidate_audio_attention_mask = pad_candidate_audio(
-            candidate_audio,
-            minimum_samples=self.audio_config.minimum_input_samples,
-        )
         candidate_note_timings = [
             self._candidate_note_timing(row, window)
             for row, window in zip(candidate_rows, candidate_windows)
         ]
-        (
-            candidate_note_onsets,
-            candidate_note_durations,
-            candidate_note_attention_mask,
-        ) = pad_candidate_notes(candidate_note_timings)
         candidate_ids = self._candidate_ids(anchor, positive, candidate_rows)
         candidate_types = self._candidate_types(anchor, positive, candidate_rows)
+        synthetic_mask = [False] * len(candidate_rows)
+        stress_diagnostics: dict[str, Any] = {"reason": "inactive", "attempted": False}
+        config = self.stress_negative_config
+        if config is not None and config.active(self.epoch):
+            rng = self._selection_rng(f"{group['melody_sample_id']}:stress_negative:{audio_sample_id(positive)}")
+            stress_diagnostics["reason"] = "probability"
+            if rng.random() < config.probability:
+                word_metadata = self._stress_metadata_for_window(positive, candidate_windows[0])
+                augmented, diagnostics = reverse_word_prominence(
+                    candidate_audio[0], *candidate_note_timings[0], word_metadata,
+                    self.audio_config.sample_rate, config, rng,
+                )
+                stress_diagnostics = {**diagnostics, "attempted": True}
+                if augmented is not None:
+                    candidate_audio.append(augmented)
+                    candidate_note_timings.append(tuple(timing.clone() for timing in candidate_note_timings[0]))
+                    candidate_rows.append({**positive, "synthetic_type": "stress_reversal"})
+                    candidate_ids.append(f"{group['melody_sample_id']}__stress_neg_{audio_sample_id(positive)}")
+                    candidate_types.append("hard_negative_stress")
+                    synthetic_mask.append(True)
+
+        # Shuffle the complete retrieval set, including the synthetic candidate.
+        if len(candidate_rows) > 1:
+            order = list(range(len(candidate_rows)))
+            self._selection_rng(f"{group['melody_sample_id']}:candidate_order").shuffle(order)
+            target = order.index(0)
+            candidate_rows = [candidate_rows[i] for i in order]
+            candidate_audio = [candidate_audio[i] for i in order]
+            candidate_note_timings = [candidate_note_timings[i] for i in order]
+            candidate_ids = [candidate_ids[i] for i in order]
+            candidate_types = [candidate_types[i] for i in order]
+            synthetic_mask = [synthetic_mask[i] for i in order]
+        candidate_input_values, candidate_audio_attention_mask = pad_candidate_audio(
+            candidate_audio, minimum_samples=self.audio_config.minimum_input_samples,
+        )
+        candidate_note_onsets, candidate_note_durations, candidate_note_attention_mask = pad_candidate_notes(candidate_note_timings)
 
         item: dict[str, Any] = {
             "melody_features": melody["features"],
@@ -509,6 +547,8 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
                 dtype=torch.float32,
             ),
             "candidate_mask": torch.ones(len(candidate_rows), dtype=torch.bool),
+            "candidate_stress_negative_mask": torch.tensor(synthetic_mask, dtype=torch.bool),
+            "stress_negative_diagnostics": stress_diagnostics,
             "target": torch.tensor(target, dtype=torch.long),
             "melody_sample_id": group["melody_sample_id"],
             "candidate_ids": candidate_ids,
@@ -519,6 +559,31 @@ class GroupedContrastiveDataset(Dataset[dict[str, Any]]):
         if self.transform is not None:
             item = self.transform(item)
         return item
+
+    def _stress_metadata_for_window(
+        self, row: dict[str, str], window: tuple[int, int],
+    ) -> dict[str, np.ndarray]:
+        path = row["stress_metadata_path"]
+        if path not in self._stress_metadata_by_path:
+            self._stress_metadata_by_path[path] = load_stress_metadata(path)
+        source = self._stress_metadata_by_path[path]
+        onsets, durations = self._note_timing_by_path[row["melody_path"]]
+        if source["note_word_ids"].shape != tuple(onsets.shape):
+            raise ValueError(f"Stress metadata has the wrong note count: {path}")
+        window_start = window[0] / self.audio_config.sample_rate
+        window_end = (window[0] + window[1]) / self.audio_config.sample_rate
+        offset = window_start - audio_start_seconds(row)
+        # Match _candidate_note_timing's absolute-time float32 arithmetic exactly;
+        # relative-time comparisons can disagree at a crop boundary late in a song.
+        starts = onsets + audio_start_seconds(row)
+        ends = starts + durations
+        valid = ends.clamp(min=window_start, max=window_end) > starts.clamp(min=window_start, max=window_end)
+        return {
+            "note_word_ids": source["note_word_ids"][valid.numpy()].copy(),
+            "word_onset_seconds": source["word_onset_seconds"] - offset,
+            "word_duration_seconds": source["word_duration_seconds"],
+            "word_line_ids": source["word_line_ids"],
+        }
 
     def _candidate_ids(
         self,
@@ -910,6 +975,7 @@ def grouped_contrastive_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         dtype=torch.bool,
     )
     candidate_mask = torch.zeros(batch_size, max_candidates, dtype=torch.bool)
+    candidate_stress_negative_mask = torch.zeros_like(candidate_mask)
     candidate_window_seconds = torch.zeros(batch_size, max_candidates)
     candidate_note_onsets = torch.zeros(
         batch_size,
@@ -942,6 +1008,8 @@ def grouped_contrastive_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         candidate_mask[batch_index, :num_candidates] = item["candidate_mask"].to(
             dtype=torch.bool
         )
+        if "candidate_stress_negative_mask" in item:
+            candidate_stress_negative_mask[batch_index, :num_candidates] = item["candidate_stress_negative_mask"]
         candidate_window_seconds[batch_index, :num_candidates] = item[
             "candidate_window_seconds"
         ]
@@ -985,6 +1053,8 @@ def grouped_contrastive_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         "candidate_note_attention_mask": candidate_note_attention_mask,
         "candidate_notes_validated": candidate_notes_validated,
         "candidate_mask": candidate_mask,
+        "candidate_stress_negative_mask": candidate_stress_negative_mask,
+        "stress_negative_diagnostics": [item.get("stress_negative_diagnostics", {}) for item in batch],
         "candidate_window_seconds": candidate_window_seconds,
         "target": torch.stack([item["target"] for item in batch]),
         "melody_sample_id": [item["melody_sample_id"] for item in batch],

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -10,6 +12,8 @@ def grouped_info_nce_loss(
     candidate_mask: torch.Tensor | None = None,
     targets: torch.Tensor | None = None,
     temperature: float = 0.07,
+    stress_negative_mask: torch.Tensor | None = None,
+    stress_negative_weight: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Compute one-way melody-to-audio InfoNCE over explicit candidates.
 
@@ -19,10 +23,14 @@ def grouped_info_nce_loss(
     targets: [batch], positive candidate index for each melody
 
     Candidate index 0 is assumed to be the positive audio when targets is not supplied.
+    Stress-negative weight scales only their denominator terms. Returned logits
+    are unweighted so accuracy cannot improve just because a class was discounted.
     """
 
     if temperature <= 0:
         raise ValueError("temperature must be positive")
+    if not math.isfinite(stress_negative_weight) or not 0 <= stress_negative_weight <= 1:
+        raise ValueError("stress_negative_weight must be finite and in [0, 1]")
     if melody_embeddings.ndim != 2:
         raise ValueError(f"Expected melody_embeddings [B, D], got {melody_embeddings.shape}")
     if candidate_audio_embeddings.ndim != 3:
@@ -42,7 +50,18 @@ def grouped_info_nce_loss(
     if candidate_mask is not None:
         logits = logits.masked_fill(~candidate_mask.to(dtype=torch.bool), torch.finfo(logits.dtype).min)
 
-    loss = F.cross_entropy(logits, targets)
+    loss_logits = logits
+    if stress_negative_mask is not None:
+        if stress_negative_mask.shape != logits.shape:
+            raise ValueError("stress_negative_mask must match [batch, candidates]")
+        stress_mask = stress_negative_mask.to(device=logits.device, dtype=torch.bool).clone()
+        # Positive targets are always full weight, even for an untrusted caller.
+        stress_mask.scatter_(1, targets[:, None], False)
+        if stress_negative_weight == 0:
+            loss_logits = logits.masked_fill(stress_mask, torch.finfo(logits.dtype).min)
+        elif stress_negative_weight != 1:
+            loss_logits = logits + stress_mask.to(logits.dtype) * math.log(stress_negative_weight)
+    loss = F.cross_entropy(loss_logits, targets)
     return loss, logits
 
 

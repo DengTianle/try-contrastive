@@ -6,6 +6,7 @@ import math
 import os
 import random
 import sys
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +23,7 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from prosodia.datasets import GroupedContrastiveDataset, grouped_contrastive_collate
+from prosodia.datasets import GroupedContrastiveDataset, StressNegativeConfig, grouped_contrastive_collate
 from prosodia.melody_encoder import MELODY_REPRESENTATION
 from prosodia.training import (
     DifferentSongBatchSampler,
@@ -455,17 +456,30 @@ def train_one_epoch(
     desc: str,
     log_every_steps: int = 50,
     amp_dtype: torch.dtype = torch.float16,
+    stress_negative_config: StressNegativeConfig | None = None,
+    epoch_index: int = 0,
 ) -> dict[str, float]:
     model.train()
-    totals = metric_totals(6, device)
+    totals = metric_totals(12, device)
     (
         total_loss, total_hard_loss, total_global_loss,
         total_correct, total_global_correct, total_global_audio_correct,
+        total_stress_count, total_stress_correct, total_stress_gap,
+        total_stress_selected, total_ordinary_correct, total_stress_attempts,
     ) = totals.unbind()
     total_examples = 0
     total_global_examples = 0
+    stress_weight = 0.0
     progress_bar = maybe_progress(loader, enabled=progress, desc=desc, leave=False)
     for step, batch in enumerate(progress_bar, start=1):
+        total_stress_attempts.add_(sum(
+            bool(diagnostic.get("attempted", False))
+            for diagnostic in batch.get("stress_negative_diagnostics", [])
+        ))
+        stress_weight = (
+            stress_negative_config.loss_weight(epoch_index, step, len(loader))
+            if stress_negative_config is not None else 0.0
+        )
         batch = move_batch_to_device(batch, device)
         optimizer.zero_grad(set_to_none=True)
 
@@ -494,6 +508,8 @@ def train_one_epoch(
                 candidate_mask=batch["candidate_mask"],
                 targets=batch["target"],
                 temperature=temperature,
+                stress_negative_mask=batch.get("candidate_stress_negative_mask"),
+                stress_negative_weight=stress_weight,
             )
             global_loss = hard_loss.new_zeros(())
             global_logits = None
@@ -532,6 +548,23 @@ def train_one_epoch(
         total_loss.add_(loss.detach(), alpha=batch_size)
         total_hard_loss.add_(hard_loss.detach(), alpha=batch_size)
         total_correct.add_((hard_logits.argmax(dim=-1) == targets).sum())
+        with torch.no_grad():
+            stress_mask = batch.get("candidate_stress_negative_mask")
+            if stress_mask is not None:
+                stress_mask = stress_mask & batch["candidate_mask"]
+                has_stress = stress_mask.any(dim=-1)
+                raw = hard_logits.detach().float()
+                positive_scores = raw.gather(1, targets[:, None]).squeeze(1)
+                stress_scores = raw.masked_fill(~stress_mask, -torch.inf).max(dim=-1).values
+                total_stress_count.add_(has_stress.sum())
+                wins = (positive_scores > stress_scores).float() + 0.5 * (positive_scores == stress_scores).float()
+                total_stress_correct.add_((wins * has_stress).sum())
+                total_stress_gap.add_(torch.where(has_stress, positive_scores - stress_scores, 0).sum() * temperature)
+                total_stress_selected.add_(stress_mask.gather(1, raw.argmax(dim=-1)[:, None]).sum())
+                ordinary_top = raw.masked_fill(stress_mask, -torch.inf).argmax(dim=-1)
+                total_ordinary_correct.add_((ordinary_top == targets).sum())
+            else:
+                total_ordinary_correct.add_((hard_logits.argmax(dim=-1) == targets).sum())
         if global_logits is not None:
             total_global_loss.add_(global_loss.detach(), alpha=batch_size)
             global_targets = torch.arange(batch_size, device=global_logits.device)
@@ -563,6 +596,12 @@ def train_one_epoch(
         total_correct,
         total_global_correct,
         total_global_audio_correct,
+        total_stress_count,
+        total_stress_correct,
+        total_stress_gap,
+        total_stress_selected,
+        total_ordinary_correct,
+        total_stress_attempts,
         total_examples,
         total_global_examples,
     ) = distributed_totals(
@@ -575,6 +614,14 @@ def train_one_epoch(
         "accuracy": total_correct / max(total_examples, 1),
         "global_accuracy": total_global_correct / max(total_global_examples, 1),
         "global_audio_accuracy": total_global_audio_correct / max(total_global_examples, 1),
+        "ordinary_accuracy": total_ordinary_correct / max(total_examples, 1),
+        "stress_negative_count": total_stress_count,
+        "stress_negative_attempts": total_stress_attempts,
+        "stress_negative_accept_rate": total_stress_count / max(total_stress_attempts, 1),
+        "stress_negative_accuracy": total_stress_correct / max(total_stress_count, 1),
+        "stress_negative_score_gap": total_stress_gap / max(total_stress_count, 1),
+        "stress_negative_selected_rate": total_stress_selected / max(total_stress_count, 1),
+        "stress_negative_weight": stress_weight,
     }
 
 
@@ -865,7 +912,8 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--max-negatives", type=int, default=7, help="Limit negatives per anchor to avoid OOM.")
+    parser.add_argument("--max-negatives", type=int, default=7,
+                        help="Limit natural same-song negatives per anchor. An enabled stress negative is additional.")
     parser.add_argument(
         "--positive-variant-policy",
         choices=["self", "any", "retexted", "retexted-first"],
@@ -981,6 +1029,21 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--stress-negatives", action="store_true",
+        help="Add word-consistent loudness-reversal negatives after a discrimination warm-up; requires word metadata.",
+    )
+    parser.add_argument("--stress-negative-start-epoch", type=int, default=5,
+                        help="First active epoch (one-based). Default 5 leaves epochs 1-4 unmodified; there is no end epoch.")
+    parser.add_argument("--stress-negative-ramp-epochs", type=float, default=2.0,
+                        help="Epochs to ramp the synthetic denominator weight, then hold it for all later epochs.")
+    parser.add_argument("--stress-negative-weight", type=float, default=0.25,
+                        help="Final denominator weight relative to ordinary negatives (0 < weight <= 1).")
+    parser.add_argument("--stress-negative-prob", type=float, default=0.5,
+                        help="Probability of attempting one synthetic negative per active training anchor.")
+    parser.add_argument("--stress-negative-max-gain-db", type=float, default=6.0)
+    parser.add_argument("--stress-negative-min-changed-fraction", type=float, default=0.6)
+    parser.add_argument("--stress-negative-max-changed-fraction", type=float, default=0.8)
+    parser.add_argument(
         "--audio-noise-snr-db",
         type=float,
         default=None,
@@ -1018,6 +1081,19 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    try:
+        stress_negative_config = StressNegativeConfig(
+            start_epoch=args.stress_negative_start_epoch,
+            ramp_epochs=args.stress_negative_ramp_epochs,
+            weight=args.stress_negative_weight,
+            probability=args.stress_negative_prob,
+            max_gain_db=args.stress_negative_max_gain_db,
+            min_changed_fraction=args.stress_negative_min_changed_fraction,
+            max_changed_fraction=args.stress_negative_max_changed_fraction,
+        ) if args.stress_negatives else None
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    args.stress_negative_settings = asdict(stress_negative_config) if stress_negative_config is not None else None
     args.manifest = resolve_user_path(args.manifest)
     args.output_dir = resolve_user_path(args.output_dir)
     if args.melody_pretrained_checkpoint is not None:
@@ -1080,11 +1156,19 @@ def main() -> None:
         candidate_window_policy=args.candidate_window_policy,
         randomize_candidate_windows=args.candidate_window_policy == "match-positive",
         seed=args.seed,
+        stress_negative_config=stress_negative_config,
     )
     if len(train_dataset) == 0:
         raise SystemExit(f"No grouped training examples found for split={args.train_split}")
     if is_main_process:
         print(f"Training positive variants: {train_dataset.positive_variant_counts()}")
+        if stress_negative_config is not None:
+            print(
+                f"Stress negatives: start epoch {stress_negative_config.start_epoch}, "
+                f"ramp {stress_negative_config.ramp_epochs:g} epochs to weight "
+                f"{stress_negative_config.weight:g}, then remain active; "
+                f"attempt probability {stress_negative_config.probability:g}."
+            )
         if world_size > 1:
             print(
                 f"Distributed training on {world_size} processes; "
@@ -1304,6 +1388,8 @@ def main() -> None:
             progress=progress,
             desc=f"train epoch {epoch}/{args.epochs}",
             log_every_steps=args.log_every_steps,
+            stress_negative_config=stress_negative_config,
+            epoch_index=epoch_index,
         )
 
         learning_rates = scheduler.learning_rates()
@@ -1335,6 +1421,15 @@ def main() -> None:
                 message += (
                     f" train_global_audio_acc={train_metrics['global_audio_accuracy']:.4f}"
                 )
+        if stress_negative_config is not None:
+            message += (
+                f" stress_weight={train_metrics['stress_negative_weight']:.3f}"
+                f" stress_count={train_metrics['stress_negative_count']:.0f}"
+                f" stress_accept={train_metrics['stress_negative_accept_rate']:.3f}"
+                f" stress_acc={train_metrics['stress_negative_accuracy']:.3f}"
+                f" stress_gap={train_metrics['stress_negative_score_gap']:.3f}"
+                f" ordinary_acc={train_metrics['ordinary_accuracy']:.3f}"
+            )
 
         if val_loader is not None:
             val_metrics = evaluate(
